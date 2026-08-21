@@ -35,6 +35,8 @@ pub use self::interaction_groups::{Group, InteractionGroups, InteractionTestMode
 pub use self::mesh_converter::{MeshConverter, MeshConverterError};
 #[cfg(feature = "alloc")]
 pub use self::narrow_phase::NarrowPhase;
+#[cfg(all(feature = "alloc", feature = "serde-serialize"))]
+pub use self::compound_baker::BakedCompound;
 #[cfg(feature = "alloc")]
 pub use parry::utils::Array2;
 
@@ -287,6 +289,8 @@ mod broad_phase_pair_event;
 mod collider;
 #[cfg(feature = "alloc")]
 mod collider_set;
+#[cfg(all(feature = "alloc", feature = "serde-serialize"))]
+mod compound_baker;
 #[cfg(feature = "alloc")]
 mod mesh_converter;
 

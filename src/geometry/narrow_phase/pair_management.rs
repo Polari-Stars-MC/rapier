@@ -4,7 +4,7 @@
 
 use super::{
     ColliderGraphIndices, NarrowPhase, PairRemovalMode, assign_pair_solver_color,
-    clear_pair_solver_color,
+    clear_filtered_pair, clear_pair_solver_color,
 };
 use crate::alloc_prelude::*;
 use crate::dynamics::solver::solver_contact_graph::GraphPos;
@@ -570,6 +570,27 @@ impl NarrowPhase {
 
     #[profiling::function]
     fn add_pair(&mut self, colliders: &ColliderSet, pair: &ColliderPair) {
+        // Explicit per-pair collision disabling (Phase B): never create a contact or
+        // intersection edge for a disabled pair, mirroring the joint-based
+        // `contacts_enabled` filter in `pair_update`.
+        if self
+            .disabled_collider_pairs
+            .contains_key(&ColliderPair::new(
+                if pair.collider1.0 <= pair.collider2.0 {
+                    pair.collider1
+                } else {
+                    pair.collider2
+                },
+                if pair.collider1.0 <= pair.collider2.0 {
+                    pair.collider2
+                } else {
+                    pair.collider1
+                },
+            ))
+        {
+            return;
+        }
+
         if let (Some(co1), Some(co2)) =
             (colliders.get(pair.collider1), colliders.get(pair.collider2))
         {
@@ -670,6 +691,36 @@ impl NarrowPhase {
         broad_phase_events: &[BroadPhasePairEvent],
         events: &dyn EventHandler,
     ) {
+        // Phase B: clear any *existing* contact pair whose endpoints were explicitly
+        // disabled, regardless of whether its colliders were user-modified this step.
+        // `compute_contacts` only revisits pairs touching a modified collider, so a
+        // disabled pair between two settled bodies would otherwise keep its stale
+        // manifold forever. This runs over the whole live contact graph every step
+        // (cheap: only existing edges), mirroring the per-step joint `contacts_enabled`
+        // sweep done in `process_pair`.
+        if !self.disabled_collider_pairs.is_empty() {
+            let mut cleared_any = false;
+            for edge in self.contact_graph.graph.edges.iter_mut() {
+                let (c1, c2) = (edge.weight.collider1, edge.weight.collider2);
+                let key = if c1.0 <= c2.0 {
+                    ColliderPair::new(c1, c2)
+                } else {
+                    ColliderPair::new(c2, c1)
+                };
+                if self.disabled_collider_pairs.contains_key(&key) {
+                    clear_filtered_pair(&mut edge.weight);
+                    cleared_any = true;
+                }
+            }
+            if cleared_any {
+                // `clear_filtered_pair` destroys the `graph_pos` back-references the
+                // incremental solver-graph reconcile relies on, so rebuild from scratch
+                // (same as `remove_pair`).
+                self.solver_graph_valid = false;
+                self.force_list_valid = false;
+            }
+        }
+
         for event in broad_phase_events {
             match event {
                 BroadPhasePairEvent::AddPair(pair) => {

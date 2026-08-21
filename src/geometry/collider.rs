@@ -707,6 +707,16 @@ impl ColliderBuilder {
         }
     }
 
+    /// Sets the mass-properties specification of this builder from a [`ColliderMassProps`]
+    /// value (density / mass / explicit props).
+    ///
+    /// This is the builder-facing counterpart of [`Self::mass_properties`] (which takes a
+    /// resolved [`MassProperties`]); it is used by `ColliderBuilder::from_baked_compound` to
+    /// restore the exact mass-properties spec captured at bake time.
+    pub fn set_mass_properties_spec(&mut self, mprops: ColliderMassProps) {
+        self.mass_properties = mprops;
+    }
+
     /// Initialize a new collider builder with a compound shape.
     pub fn compound(shapes: Vec<(Pose, SharedShape)>) -> Self {
         Self::new(SharedShape::compound(shapes))

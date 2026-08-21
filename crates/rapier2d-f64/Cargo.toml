@@ -57,6 +57,7 @@ serde-serialize = [
     "nalgebra/serde-serialize",
     "parry2d-f64/serde-serialize",
     "dep:serde",
+    "dep:bincode",
     "std",
 ]
 enhanced-determinism = ["simba/libm_force", "parry2d-f64/enhanced-determinism"]
@@ -104,6 +105,7 @@ web-time = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 bytemuck = { workspace = true, optional = true }
+bincode = { workspace = true, optional = true }
 
 # Nalgebra is only included on non-spirv targets. On spirv, rapier exposes only the
 # subset of its API that doesn't require nalgebra.

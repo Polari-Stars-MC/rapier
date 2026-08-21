@@ -38,5 +38,7 @@ mod query_pipeline;
 #[cfg(feature = "alloc")]
 mod user_changes;
 
-#[cfg(all(feature = "debug-render", feature = "alloc"))]
-mod debug_render_pipeline;
+#[cfg(all(feature = "alloc", feature = "serde-serialize"))]
+mod recorder;
+#[cfg(all(feature = "alloc", feature = "serde-serialize"))]
+pub use recorder::{WorldFrame, WorldPlayer, WorldRecorder};

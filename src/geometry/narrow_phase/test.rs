@@ -282,3 +282,124 @@ pub fn collider_set_parent_no_self_intersection() {
         "There should be a contact manifold."
     );
 }
+
+/// Phase B: explicit per-pair collision disabling between two specific colliders.
+#[test]
+pub fn disable_collision_between_specific_colliders() {
+    let mut rigid_body_set = RigidBodySet::new();
+    let mut collider_set = ColliderSet::new();
+
+    /* Two overlapping dynamic balls attached to two distinct bodies. */
+    let collider = ColliderBuilder::ball(0.5);
+
+    let rigid_body_1 = RigidBodyBuilder::dynamic()
+        .translation(Vector::new(0.0, 0.0, 0.0))
+        .build();
+    let body_1_handle = rigid_body_set.insert(rigid_body_1);
+    let collider_1_handle =
+        collider_set.insert_with_parent(collider.build(), body_1_handle, &mut rigid_body_set);
+
+    let rigid_body_2 = RigidBodyBuilder::dynamic()
+        .translation(Vector::new(0.2, 0.0, 0.0))
+        .build();
+    let body_2_handle = rigid_body_set.insert(rigid_body_2);
+    let collider_2_handle =
+        collider_set.insert_with_parent(collider.build(), body_2_handle, &mut rigid_body_set);
+
+    let gravity = Vector::new(0.0, -9.81, 0.0);
+    let integration_parameters = IntegrationParameters::default();
+    let mut physics_pipeline = PhysicsPipeline::new();
+    let mut island_manager = IslandManager::new();
+    let mut broad_phase = DefaultBroadPhase::new();
+    let mut narrow_phase = NarrowPhase::new();
+    let mut impulse_joint_set = ImpulseJointSet::new();
+    let mut multibody_joint_set = MultibodyJointSet::new();
+    let mut ccd_solver = CCDSolver::new();
+    let physics_hooks = ();
+    let event_handler = ();
+
+    physics_pipeline.step(
+        gravity,
+        &integration_parameters,
+        &mut island_manager,
+        &mut broad_phase,
+        &mut narrow_phase,
+        &mut rigid_body_set,
+        &mut collider_set,
+        &mut impulse_joint_set,
+        &mut multibody_joint_set,
+        &mut ccd_solver,
+        &physics_hooks,
+        &event_handler,
+    );
+
+    // Collision is active by default between the two overlapping balls.
+    assert!(
+        narrow_phase
+            .contact_pair(collider_1_handle, collider_2_handle)
+            .is_some_and(|pair| pair.manifolds.len() == 1),
+        "Contact should exist before disabling."
+    );
+    assert!(
+        narrow_phase.is_collision_enabled(collider_1_handle, collider_2_handle),
+        "is_collision_enabled must be true by default."
+    );
+
+    // Disable the specific pair.
+    narrow_phase.disable_collision(collider_1_handle, collider_2_handle);
+    assert!(
+        !narrow_phase.is_collision_enabled(collider_1_handle, collider_2_handle),
+        "is_collision_enabled must be false after disable_collision."
+    );
+
+    // Run a few steps: the contact pair must be cleared and never recreated.
+    for _ in 0..10 {
+        physics_pipeline.step(
+            gravity,
+            &integration_parameters,
+            &mut island_manager,
+            &mut broad_phase,
+            &mut narrow_phase,
+            &mut rigid_body_set,
+            &mut collider_set,
+            &mut impulse_joint_set,
+            &mut multibody_joint_set,
+            &mut ccd_solver,
+            &physics_hooks,
+            &event_handler,
+        );
+        assert!(
+            narrow_phase
+                .contact_pair(collider_1_handle, collider_2_handle)
+                .is_none_or(|pair| pair.manifolds.is_empty()),
+            "Disabled contact pair must not produce manifolds."
+        );
+    }
+
+    // Re-enable: the contact pair must reappear.
+    narrow_phase.enable_collision(collider_1_handle, collider_2_handle);
+    assert!(
+        narrow_phase.is_collision_enabled(collider_1_handle, collider_2_handle),
+        "is_collision_enabled must be true after enable_collision."
+    );
+    physics_pipeline.step(
+        gravity,
+        &integration_parameters,
+        &mut island_manager,
+        &mut broad_phase,
+        &mut narrow_phase,
+        &mut rigid_body_set,
+        &mut collider_set,
+        &mut impulse_joint_set,
+        &mut multibody_joint_set,
+        &mut ccd_solver,
+        &physics_hooks,
+        &event_handler,
+    );
+    assert!(
+        narrow_phase
+            .contact_pair(collider_1_handle, collider_2_handle)
+            .is_some_and(|pair| pair.manifolds.len() == 1),
+        "Contact should be recreated after re-enabling."
+    );
+}

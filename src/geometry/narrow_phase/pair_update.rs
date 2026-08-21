@@ -13,9 +13,10 @@ use crate::dynamics::{
     RigidBodyType,
 };
 use crate::geometry::{
-    BoundingVolume, ColliderChanges, ColliderSet, ContactData, ContactManifoldData, ContactPair,
-    SolverContact, SolverFlags,
+    BoundingVolume, ColliderChanges, ColliderPair, ColliderSet, ContactData, ContactManifoldData,
+    ContactPair, SolverContact, SolverFlags,
 };
+use parry::utils::hashmap::HashMap;
 use crate::math::{MAX_MANIFOLD_POINTS, Real};
 use crate::pipeline::{ActiveHooks, ContactModificationContext, PairFilterContext, PhysicsHooks};
 use parry::query::PersistentQueryDispatcher;
@@ -80,6 +81,7 @@ pub(super) fn process_pair(
     query_dispatcher: &dyn PersistentQueryDispatcher<ContactManifoldData, ContactData>,
     awake_body_mask: &[bool],
     hints_ptr: &HintsPtr,
+    disabled_pairs: &HashMap<ColliderPair, ()>,
     #[cfg(not(feature = "parallel"))] transitions: &mut Vec<PairTransition>,
     #[cfg(feature = "parallel")] snd: &std::sync::mpsc::Sender<PairTransition>,
 ) -> u8 {
@@ -231,6 +233,27 @@ pub(super) fn process_pair(
                     }
                 }
             }
+        }
+
+        // Deal with collisions explicitly disabled between two specific colliders
+        // (Phase B), regardless of joints/groups/hooks. Mirrors the joint-based
+        // `contacts_enabled` check above.
+        if disabled_pairs.contains_key(&ColliderPair::new(
+            if pair.collider1.0 <= pair.collider2.0 {
+                pair.collider1
+            } else {
+                pair.collider2
+            },
+            if pair.collider1.0 <= pair.collider2.0 {
+                pair.collider2
+            } else {
+                pair.collider1
+            },
+        )) {
+            if clear_filtered_pair(pair) {
+                outcome = OUTCOME_CLEARED_IN_GRAPH;
+            }
+            break 'emit_events;
         }
 
         // Filter based on the rigid-body types.

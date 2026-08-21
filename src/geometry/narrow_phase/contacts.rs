@@ -99,6 +99,7 @@ impl NarrowPhase {
                 query_dispatcher,
                 &awake_body_mask,
                 hints_ptr,
+                &self.disabled_collider_pairs,
                 &mut transitions,
             )
         };
@@ -125,6 +126,7 @@ impl NarrowPhase {
                 query_dispatcher,
                 &awake_body_mask,
                 hints_ptr,
+                &self.disabled_collider_pairs,
                 &snd,
             )
         };

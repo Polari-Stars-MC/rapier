@@ -20,9 +20,10 @@ use crate::dynamics::solver::solver_contact_graph::{
 };
 use crate::dynamics::{IslandManager, RigidBodySet};
 use crate::geometry::{
-    ColliderGraphIndex, ColliderHandle, ColliderSet, ContactData, ContactManifoldData, ContactPair,
-    InteractionGraph, IntersectionPair, SolverFlags,
+    ColliderGraphIndex, ColliderHandle, ColliderPair, ColliderSet, ContactData, ContactManifoldData,
+    ContactPair, InteractionGraph, IntersectionPair, SolverFlags,
 };
+use parry::utils::hashmap::HashMap;
 use alloc::sync::Arc;
 use parry::query::{DefaultQueryDispatcher, PersistentQueryDispatcher};
 
@@ -402,6 +403,13 @@ pub struct NarrowPhase {
     /// step) skip the buffer reallocation of freshly constructed pairs.
     #[cfg_attr(feature = "serde-serialize", serde(skip))]
     retired_pairs: Vec<ContactPair>,
+    /// Set of collider pairs whose collision is explicitly disabled, regardless of
+    /// collision groups, solver hooks, or joints. Mirrors the joint-based
+    /// `contacts_enabled` filter but applies to any two colliders (e.g. two bodies
+    /// that are not connected by a joint). Populated via
+    /// [`Self::disable_collision`] / [`Self::enable_collision`].
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    disabled_collider_pairs: HashMap<ColliderPair, ()>,
 }
 
 pub(crate) type ContactManifoldIndex = usize;
@@ -444,7 +452,61 @@ impl NarrowPhase {
             force_event_flagged: Vec::new(),
             force_list_valid: false,
             solver_color_todo: Vec::new(),
+            disabled_collider_pairs: HashMap::default(),
         }
+    }
+
+    /// Orders the two collider handles so the disabled-pair map stays order-independent:
+    /// `disable_collision(a, b)` and `disable_collision(b, a)` map to the same key.
+    fn normalized_pair(collider1: ColliderHandle, collider2: ColliderHandle) -> ColliderPair {
+        if collider1.0 <= collider2.0 {
+            ColliderPair::new(collider1, collider2)
+        } else {
+            ColliderPair::new(collider2, collider1)
+        }
+    }
+
+    /// Explicitly disables collision detection between two specific colliders.
+    ///
+    /// Unlike collision groups or the [`PhysicsHooks`](crate::pipeline::PhysicsHooks)
+    /// filter, this does not require the colliders to be attached to the same body or
+    /// connected by a joint: any pair of colliders can be disabled. Once disabled, the
+    /// narrow-phase will neither create nor maintain a contact/intersection pair for the
+    /// two colliders (existing pairs are cleared on the next step). Re-enable with
+    /// [`Self::enable_collision`].
+    ///
+    /// This is symmetric: `disable_collision(a, b)` is equivalent to
+    /// `disable_collision(b, a)`.
+    pub fn disable_collision(
+        &mut self,
+        collider1: ColliderHandle,
+        collider2: ColliderHandle,
+    ) {
+        self.disabled_collider_pairs
+            .insert(Self::normalized_pair(collider1, collider2), ());
+    }
+
+    /// Re-enables collision detection between two specific colliders previously disabled
+    /// via [`Self::disable_collision`].
+    pub fn enable_collision(
+        &mut self,
+        collider1: ColliderHandle,
+        collider2: ColliderHandle,
+    ) {
+        self.disabled_collider_pairs
+            .remove(&Self::normalized_pair(collider1, collider2));
+    }
+
+    /// Returns `true` if collision between the two given colliders is currently *enabled*
+    /// (i.e. not disabled via [`Self::disable_collision`]).
+    pub fn is_collision_enabled(
+        &self,
+        collider1: ColliderHandle,
+        collider2: ColliderHandle,
+    ) -> bool {
+        !self
+            .disabled_collider_pairs
+            .contains_key(&Self::normalized_pair(collider1, collider2))
     }
 
     fn refresh_awake_body_mask(&mut self, islands: &IslandManager) {
