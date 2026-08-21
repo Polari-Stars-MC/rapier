@@ -37,6 +37,12 @@ pub use self::mesh_converter::{MeshConverter, MeshConverterError};
 pub use self::narrow_phase::NarrowPhase;
 #[cfg(all(feature = "alloc", feature = "serde-serialize"))]
 pub use self::compound_baker::BakedCompound;
+/// User-space AABB spatial index (general R-tree over arbitrary `u64` ids).
+#[cfg(feature = "alloc")]
+pub use self::user_index::GenericAabbIndex;
+/// Direction-based convex hulls (k-DOP / FDH) and their preset enum.
+#[cfg(feature = "alloc")]
+pub use self::direction_hull::{build_direction_hull, DirectionHull, FdhHull, KdopHull, KdopPreset};
 #[cfg(feature = "alloc")]
 pub use parry::utils::Array2;
 
@@ -299,3 +305,11 @@ mod manifold_reduction;
 
 #[cfg(all(feature = "dim3", feature = "alloc"))]
 mod contact_clustering;
+
+/// User-space AABB spatial index (general R-tree over arbitrary `u64` ids).
+#[cfg(feature = "alloc")]
+pub mod user_index;
+
+/// Direction-based convex hulls (k-DOP / FDH).
+#[cfg(feature = "alloc")]
+pub mod direction_hull;
