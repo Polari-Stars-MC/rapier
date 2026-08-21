@@ -634,6 +634,40 @@ impl PhysicsWorld {
         self.narrow_phase.contact_pair(collider1, collider2)
     }
 
+    /// Enables or disables collision detection between two specific colliders,
+    /// regardless of their collision groups, solver hooks, or whether they are
+    /// connected by a joint.
+    ///
+    /// This forwards to the narrow-phase's per-pair collision filter. Disabling a
+    /// pair that was never disabled (or enabling a pair that was never disabled) is
+    /// a no-op. The setting persists across `step` calls: an existing contact
+    /// manifold for a disabled pair is cleared on the next step. This is symmetric:
+    /// `set_collision_enabled(a, b, false)` is equivalent to
+    /// `set_collision_enabled(b, a, false)`.
+    pub fn set_collision_enabled(
+        &mut self,
+        collider1: ColliderHandle,
+        collider2: ColliderHandle,
+        enabled: bool,
+    ) {
+        if enabled {
+            self.narrow_phase.enable_collision(collider1, collider2);
+        } else {
+            self.narrow_phase.disable_collision(collider1, collider2);
+        }
+    }
+
+    /// Returns `true` if collision between the two given colliders is currently
+    /// *enabled* (i.e. not disabled via [`Self::set_collision_enabled`]).
+    pub fn is_collision_enabled(
+        &self,
+        collider1: ColliderHandle,
+        collider2: ColliderHandle,
+    ) -> bool {
+        self.narrow_phase.is_collision_enabled(collider1, collider2)
+    }
+
+
     /// Iterate over all contact pairs involving the given collider.
     pub fn contact_pairs_with(
         &self,
