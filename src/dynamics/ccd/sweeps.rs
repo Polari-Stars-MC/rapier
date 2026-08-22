@@ -32,10 +32,13 @@ pub(super) fn is_bullet(rb: &RigidBody) -> bool {
 }
 
 /// The target-selection rule for a fast body `rb1`: a non-bullet fast body only sweeps
-/// against **fixed** targets; a bullet sweeps against every body type except other bullets.
+/// against **fixed** targets; a bullet sweeps against every body type — including other
+/// bullets (issue #984: two fast `ccd_enabled` bodies previously never swept each other and
+/// tunneled straight through). Targets are read at their — possibly already clamped —
+/// `next_position`, so the swept geometry is the solved end-of-step pose.
 fn tier_allows(rb1: &RigidBody, rb2: Option<&RigidBody>) -> bool {
     if is_bullet(rb1) {
-        !rb2.map(is_bullet).unwrap_or(false)
+        true
     } else {
         is_fixed_target(rb2)
     }
@@ -294,6 +297,19 @@ fn cast_collider_pair(
 ) -> Option<Real> {
     let target_pose = target_collider_pose(co2, rb2);
 
+    // The target's swept motion: for a *moving* target body (e.g. another fast bullet, issue
+    // #984) we sweep it along its own start→next pose so the time-of-impact accounts for the
+    // *relative* motion of both bodies. Static/fixed targets have start == next, collapsing to
+    // the previous constant (stationary) sweep.
+    let target_sweep = match (rb2, co2.parent.as_ref()) {
+        (Some(rb2), Some(parent)) if rb2.ccd.ccd_active => Sweep::from_poses(
+            &(rb2.pos.position * parent.pos_wrt_parent),
+            &(rb2.pos.next_position * parent.pos_wrt_parent),
+            co2.shape.mass_properties(1.0).local_com,
+        ),
+        _ => Sweep::constant(&target_pose, Vector::ZERO),
+    };
+
     let sub_shapes: &[FastSubShape] = match &fast.kind {
         FastShapeKind::Convex(sub) => core::slice::from_ref(sub),
         FastShapeKind::Compound(children) => children,
@@ -340,6 +356,7 @@ fn cast_collider_pair(
             &target,
             shape2,
             &target_pose,
+            &target_sweep,
             max_fraction,
             linear_slop,
             is_pseudo,
@@ -358,16 +375,16 @@ fn cast_sub_shape(
     target: &TargetKind,
     shape2: &dyn Shape,
     target_pose: &Pose,
+    target_sweep: &Sweep,
     max_fraction: Real,
     linear_slop: Real,
     is_pseudo: bool,
 ) -> Option<Real> {
     let output = match target {
         TargetKind::Proxy(target_proxy) => {
-            let target_sweep = Sweep::constant(target_pose, Vector::ZERO);
             sweep_time_of_impact(
                 target_proxy,
-                &target_sweep,
+                target_sweep,
                 &sub.proxy,
                 &sub.sweep,
                 max_fraction,
@@ -424,10 +441,9 @@ fn cast_sub_shape(
         // so a body already touching a surface isn't pinned at fraction 0.
         if let TargetKind::Proxy(target_proxy) = target {
             let core = ToiProxy::point(sub.local_centroid, CORE_FRACTION * sub.min_extent);
-            let target_sweep = Sweep::constant(target_pose, Vector::ZERO);
             let output = sweep_time_of_impact(
                 target_proxy,
-                &target_sweep,
+                target_sweep,
                 &core,
                 &sub.sweep,
                 max_fraction,

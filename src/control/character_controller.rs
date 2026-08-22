@@ -271,10 +271,33 @@ impl KinematicCharacterController {
                         .contact(&pos12, character_shape, collider.shape(), 0.0)
                 {
                     if contact.dist < -1.0e-5 {
+                        // A negative `dist` means the character overlaps the collider. This can
+                        // happen because (a) the character was pushed into a static obstacle, or
+                        // (b) a *moving* (kinematic) platform advanced into the character this
+                        // step. For (b) — the heart of issue #488 — the overlap is the platform's
+                        // motion, and we must resolve the *full* penetration here so the character
+                        // is carried with the platform instead of lagging a frame (a visible dip)
+                        // or, once the platform moves faster than `max_correction` per step,
+                        // tunneling straight through. So contacts against a kinematic parent are
+                        // depenetrated without the height-based correction cap.
+                        let is_kinematic = collider
+                            .parent
+                            .and_then(|p| queries.bodies.get(p.handle))
+                            .map(|rb| rb.is_kinematic())
+                            .unwrap_or(false);
+                        let correction_budget = if is_kinematic {
+                            offset - contact.dist // uncapped: resolve the full overlap
+                        } else {
+                            max_correction - applied
+                        };
+
                         // Push out until the usual `offset` gap is restored.
-                        let push = (offset - contact.dist).min(max_correction - applied);
+                        let push = (offset - contact.dist).min(correction_budget);
                         if push <= 0.0 {
-                            return; // The per-call correction budget is exhausted.
+                            if !is_kinematic {
+                                return; // The per-call correction budget is exhausted.
+                            }
+                            continue;
                         }
 
                         // `normal1` (expressed in the character’s local frame) points towards
@@ -1374,4 +1397,139 @@ mod test {
         // The floor lies in the +Y direction, i.e. along `-up`, so the character is grounded.
         assert!(movement.grounded);
     }
+
+}
+
+#[cfg(all(feature = "dim3"))]
+#[cfg(test)]
+mod moving_platform_tests {
+    use crate::control::KinematicCharacterController;
+    use crate::prelude::*;
+
+    #[test]
+    fn character_controller_moving_platform() {
+        // Regression test for issue #488: a kinematic character controller that stands
+        // still on top of a *moving* kinematic platform must be carried along with the
+        // platform (no dip, no fall-through). When the platform moves into the character
+        // it creates penetration that `check_and_fix_penetrations` must resolve in full;
+        // if that resolution is capped (as it is for static obstacles) a fast platform
+        // leaves the character behind until it tunnels straight through.
+        fn run(platform_speed: Real) {
+            let mut colliders = ColliderSet::new();
+            let mut impulse_joints = ImpulseJointSet::new();
+            let mut multibody_joints = MultibodyJointSet::new();
+            let mut pipeline = PhysicsPipeline::new();
+            let mut bf = BroadPhaseBvh::new();
+            let mut nf = NarrowPhase::new();
+            let mut islands = IslandManager::new();
+            let mut bodies = RigidBodySet::new();
+
+            let gravity = Vector::ZERO; // disable gravity; we drive the platform by hand
+            let integration_parameters = IntegrationParameters::default();
+            let dt = integration_parameters.dt;
+
+            // Vertical kinematic platform: a thin slab centered at y = 0.
+            let platform_half_height = 0.5;
+            let platform = RigidBodyBuilder::kinematic_position_based()
+                .translation(Vector::new(0.0, 0.0, 0.0))
+                .build();
+            let platform_handle = bodies.insert(platform);
+            colliders.insert_with_parent(
+                ColliderBuilder::cuboid(5.0, platform_half_height, 5.0),
+                platform_handle,
+                &mut bodies,
+            );
+
+            // Character: a ball of radius 0.5 resting on top of the platform.
+            let character = RigidBodyBuilder::kinematic_position_based()
+                .translation(Vector::new(0.0, platform_half_height + 0.5, 0.0))
+                .build();
+            let character_handle = bodies.insert(character);
+            let character_collider = ColliderBuilder::ball(0.5).build();
+            let character_shape = character_collider.shape();
+            colliders.insert_with_parent(character_collider.clone(), character_handle, &mut bodies);
+
+            let controller = KinematicCharacterController {
+                slide: true,
+                ..Default::default()
+            };
+
+            // Track the character's world position explicitly: after `set_next_kinematic_translation`
+            // the body's `position()` only updates on the next `step`, so read it from our own copy.
+            // The controller keeps a small `offset` gap above the platform, so we assert on the
+            // *per-step displacement* (it must match the platform's motion) and that the character
+            // never sinks below the platform's top face (the #488 failure: fall-through).
+            let mut char_pos = *bodies.get(character_handle).unwrap().position();
+            let mut prev_char_y = char_pos.translation.y;
+            for i in 0..120 {
+                let expected_platform_y = platform_speed * dt * (i as Real + 1.0);
+                bodies
+                    .get_mut(platform_handle)
+                    .unwrap()
+                    .set_next_kinematic_translation(Vector::new(0.0, expected_platform_y, 0.0));
+
+                pipeline.step(
+                    gravity,
+                    &integration_parameters,
+                    &mut islands,
+                    &mut bf,
+                    &mut nf,
+                    &mut bodies,
+                    &mut colliders,
+                    &mut impulse_joints,
+                    &mut multibody_joints,
+                    &mut CCDSolver::new(),
+                    &(),
+                    &(),
+                );
+
+                let filter = QueryFilter::new().exclude_rigid_body(character_handle);
+                let query_pipeline =
+                    bf.as_query_pipeline(nf.query_dispatcher(), &bodies, &colliders, filter);
+
+                // Stationary character: zero desired translation.
+                let movement = controller.move_shape(
+                    dt,
+                    &query_pipeline,
+                    character_shape,
+                    &char_pos,
+                    Vector::ZERO,
+                    |_| {},
+                );
+
+                char_pos.translation += movement.translation;
+                bodies
+                    .get_mut(character_handle)
+                    .unwrap()
+                    .set_next_kinematic_translation(char_pos.translation);
+
+                let step_delta = char_pos.translation.y - prev_char_y;
+                let expected_delta = platform_speed * dt;
+                // The character must follow the platform's per-step motion (issue #488: a lagging
+                // character dips and, for a fast platform, falls through entirely).
+                assert!(
+                    (step_delta - expected_delta).abs() < 2.0e-2,
+                    "character should track platform motion (speed {}, iter {}): delta={}, expected={}",
+                    platform_speed, i, step_delta, expected_delta
+                );
+                // And it must never sink below the platform's top face.
+                let platform_top = expected_platform_y + platform_half_height;
+                assert!(
+                    char_pos.translation.y >= platform_top - 1.0e-3,
+                    "character fell through platform (speed {}, iter {}): char_y={}, top={}",
+                    platform_speed, i, char_pos.translation.y, platform_top
+                );
+                assert!(movement.grounded, "character must stay grounded (speed {}, iter {})", platform_speed, i);
+                prev_char_y = char_pos.translation.y;
+            }
+        }
+
+        // Normal platform (already worked before the fix).
+        run(2.0);
+        // Fast platform: 10 m/s * dt (~0.016s) ≈ 0.16 m/step, which exceeds the old
+        // `max_correction = height * 0.25` cap for this character (would tunnel).
+        run(10.0);
+    }
+
+
 }

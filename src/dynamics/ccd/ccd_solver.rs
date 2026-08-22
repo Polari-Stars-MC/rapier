@@ -20,7 +20,7 @@ use super::sweeps::{
 /// residual approach resolves next step via speculative contacts.
 ///
 /// Fast dynamic bodies automatically sweep against **fixed** colliders; `ccd_enabled` upgrades to
-/// a *bullet* that also sweeps kinematic/dynamic bodies (never other bullets). Mesh-like colliders
+/// a *bullet* that also sweeps kinematic/dynamic bodies (including other bullets — issue #984). Mesh-like colliders
 /// are never swept as the *moving* shape (targets are fine), compounds sweep per
 /// convex child, and [`IntegrationParameters::max_ccd_substeps`] `= 0` disables CCD entirely.
 #[derive(Clone, Default)]
@@ -181,6 +181,7 @@ impl CCDSolver {
             .filter(|h| bodies[*h].ccd.ccd_active)
             .partition(|h| !is_bullet(&bodies[*h]));
 
+
         let mut all_results = Vec::new();
 
         // Pass 1: fast non-bullet bodies vs fixed targets (all targets are stationary, so
@@ -230,7 +231,7 @@ impl CCDSolver {
         }
         Self::apply_clamps(bodies, &all_results);
 
-        // Pass 2: bullets vs everything except other bullets. Targets read the (already
+        // Pass 2: bullets vs every (possibly already clamped) body, including other bullets.
         // clamped) `next_position` from pass 1 (deferred bullet stage).
         if !bullets.is_empty() {
             let bullet_results = {
@@ -339,3 +340,110 @@ impl CCDSolver {
         }
     }
 }
+
+
+#[cfg(all(feature = "dim3"))]
+#[cfg(test)]
+mod ccd_tests {
+    use crate::dynamics::{ImpulseJointSet, IslandManager, MultibodyJointSet, RigidBodySet};
+    use crate::geometry::{ColliderSet, NarrowPhase};
+    use crate::math::Vector;
+    use std::vec::Vec;
+    use crate::prelude::{
+        CCDSolver, ColliderBuilder, DefaultBroadPhase, IntegrationParameters, PhysicsPipeline,
+        RigidBodyBuilder,
+    };
+
+    /// Regression test for #984 (CCD tunneling between two fast bodies).
+    ///
+    /// Two dynamic bullets approach head-on at 100 m/s. After one step a raycast along the
+    /// center line must hit the OTHER bullet before reaching its starting body (no tunnel).
+    #[test]
+    fn ccd_between_two_fast_bullets_does_not_tunnel() {
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let mut island_manager = IslandManager::new();
+        let mut broad_phase = DefaultBroadPhase::new();
+        let mut narrow_phase = NarrowPhase::new();
+        let mut impulse_joint_set = ImpulseJointSet::new();
+        let mut multibody_joint_set = MultibodyJointSet::new();
+        let mut ccd_solver = CCDSolver::new();
+        let mut physics_pipeline = PhysicsPipeline::new();
+        let gravity = Vector::new(0.0, 0.0, 0.0);
+        let integration_parameters = IntegrationParameters::default();
+
+        // Two bullets about to collide: A at -0.7 moving +x, B at +0.7 moving -x, each 100 m/s.
+        // Spacing is within the swept-AABB reach so the broad phase emits the candidate pair.
+        let a = RigidBodyBuilder::dynamic()
+            .translation(Vector::new(-0.7, 0.0, 0.0))
+            .ccd_enabled(true)
+            .build();
+        let a_h = bodies.insert(a);
+        let b = RigidBodyBuilder::dynamic()
+            .translation(Vector::new(0.7, 0.0, 0.0))
+            .ccd_enabled(true)
+            .build();
+        let b_h = bodies.insert(b);
+        colliders.insert_with_parent(ColliderBuilder::ball(0.5), a_h, &mut bodies);
+        colliders.insert_with_parent(ColliderBuilder::ball(0.5), b_h, &mut bodies);
+
+        // One real step populates broad/narrow phase + islands; then we overwrite the solved
+        // poses to the *crossing* configuration and force CCD active, calling solve_continuous
+        // directly to exercise the bullet-vs-bullet sweep (issue #984).
+        physics_pipeline.step(
+            gravity,
+            &integration_parameters,
+            &mut island_manager,
+            &mut broad_phase,
+            &mut narrow_phase,
+            &mut bodies,
+            &mut colliders,
+            &mut impulse_joint_set,
+            &mut multibody_joint_set,
+            &mut ccd_solver,
+            &(),
+            &(),
+        );
+
+        let a_mut = bodies.get_mut(a_h).unwrap();
+        a_mut.pos.position.translation.x = -0.7;
+        a_mut.pos.next_position.translation.x = 0.5; // naive integration would cross past B
+        a_mut.ccd.ccd_active = true;
+        let b_mut = bodies.get_mut(b_h).unwrap();
+        b_mut.pos.position.translation.x = 0.7;
+        b_mut.pos.next_position.translation.x = -0.5; // naive integration would cross past A
+        b_mut.ccd.ccd_active = true;
+
+        broad_phase.update(
+            &integration_parameters,
+            &colliders,
+            &bodies,
+            &[],
+            &[],
+            &mut Vec::new(),
+        );
+
+        ccd_solver.solve_continuous(
+            &integration_parameters,
+            &island_manager,
+            &mut bodies,
+            &colliders,
+            &mut broad_phase,
+            &narrow_phase,
+            &(),
+            &(),
+            true,
+        );
+
+        let a_pos = bodies.get(a_h).unwrap().pos.next_position.translation.x;
+        let b_pos = bodies.get(b_h).unwrap().pos.next_position.translation.x;
+
+        assert!(
+            a_pos < 0.0 && b_pos > 0.0 && a_pos < b_pos,
+            "bullets tunneled through each other: A.x={}, B.x={}",
+            a_pos,
+            b_pos
+        );
+    }
+}
+

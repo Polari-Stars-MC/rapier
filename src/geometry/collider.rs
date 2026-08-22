@@ -781,6 +781,33 @@ impl ColliderBuilder {
         Self::new(SharedShape::cylinder(half_height, radius))
     }
 
+    /// Initialize a new collider builder with a cylindrical shape aligned with
+    /// the `x` axis (defined by its half-height along X and its radius).
+    ///
+    /// This is equivalent to `ColliderBuilder::cylinder` followed by a 90°
+    /// rotation about the Z axis, but avoids the caller having to apply that
+    /// rotation manually (useful when loading geometry from external formats
+    /// that use a different up-axis convention, e.g. Z-up URDF).
+    #[cfg(feature = "dim3")]
+    pub fn cylinder_x(half_height: Real, radius: Real) -> Self {
+        Self::cylinder(half_height, radius).rotation(Vector::new(
+            0.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        ))
+    }
+
+    /// Initialize a new collider builder with a cylindrical shape aligned with
+    /// the `z` axis (defined by its half-height along Z and its radius).
+    #[cfg(feature = "dim3")]
+    pub fn cylinder_z(half_height: Real, radius: Real) -> Self {
+        Self::cylinder(half_height, radius).rotation(Vector::new(
+            std::f64::consts::FRAC_PI_2,
+            0.0,
+            0.0,
+        ))
+    }
+
     /// Initialize a new collider builder with a rounded cylindrical shape defined by its half-height
     /// (along the Y axis), its radius, and its roundedness (the radius of the sphere used for
     /// dilating the cylinder).
@@ -790,6 +817,36 @@ impl ColliderBuilder {
             half_height,
             radius,
             border_radius,
+        ))
+    }
+
+    /// Initialize a new collider builder with a rounded cylindrical shape
+    /// aligned with the `x` axis. See [`ColliderBuilder::cylinder_x`].
+    #[cfg(feature = "dim3")]
+    pub fn round_cylinder_x(
+        half_height: Real,
+        radius: Real,
+        border_radius: Real,
+    ) -> Self {
+        Self::round_cylinder(half_height, radius, border_radius).rotation(Vector::new(
+            0.0,
+            0.0,
+            std::f64::consts::FRAC_PI_2,
+        ))
+    }
+
+    /// Initialize a new collider builder with a rounded cylindrical shape
+    /// aligned with the `z` axis. See [`ColliderBuilder::cylinder_z`].
+    #[cfg(feature = "dim3")]
+    pub fn round_cylinder_z(
+        half_height: Real,
+        radius: Real,
+        border_radius: Real,
+    ) -> Self {
+        Self::round_cylinder(half_height, radius, border_radius).rotation(Vector::new(
+            std::f64::consts::FRAC_PI_2,
+            0.0,
+            0.0,
         ))
     }
 
@@ -985,6 +1042,59 @@ impl ColliderBuilder {
         Ok(Self::new(shape).position(pose))
     }
 
+    /// Sanitizes the input of the `convex_decomposition*` family so that parry's internal
+    /// voxelization convex-hull never panics on degenerate data (issue #223: passing 3+ identical
+    /// consecutive points made `convex_decomposition` panic inside `clip_aabb_line` / the voxel
+    /// convex-hull). We drop exact/near-duplicate vertices (remapping the triangle indices
+    /// accordingly) and reject inputs that cannot form a 3D convex hull after de-duplication
+    /// (fewer than 4 distinct points). Returns `None` in that degenerate case.
+    fn sanitize_decomposition_input(
+        vertices: &[Vector],
+        indices: &[[u32; DIM]],
+    ) -> Option<(Vec<Vector>, Vec<[u32; DIM]>)> {
+        // 1. Deduplicate vertices within an epsilon; build old->new index map.
+        let eps = 1.0e-8; // relaxed tolerance to catch near-identical points
+        let mut clean: Vec<Vector> = Vec::new();
+        let mut remap = vec![0u32; vertices.len()];
+        for (i, v) in vertices.iter().enumerate() {
+            let mut found = None;
+            for (j, c) in clean.iter().enumerate() {
+                let d2 = (c.x - v.x).powi(2) + (c.y - v.y).powi(2) + (c.z - v.z).powi(2);
+                if d2 <= eps * eps {
+                    found = Some(j as u32);
+                    break;
+                }
+            }
+            match found {
+                Some(j) => remap[i] = j,
+                None => {
+                    remap[i] = clean.len() as u32;
+                    clean.push(*v);
+                }
+            }
+        }
+
+        // 2. Remap triangle indices, dropping triangles that reference duplicates of the same
+        //    vertex (fewer than 3 distinct indices => degenerate, no area).
+        let mut clean_idx: Vec<[u32; DIM]> = Vec::new();
+        for tri in indices {
+            let a = remap[tri[0] as usize];
+            let b = remap[tri[1] as usize];
+            let c = remap[tri[2] as usize];
+            if a != b && b != c && a != c {
+                clean_idx.push([a, b, c]);
+            }
+        }
+
+        // 3. Need at least 4 distinct non-coplanar points to form a 3D convex hull; otherwise
+        //    parry's voxelization convex-hull has nothing valid to compute.
+        if clean.len() < 4 || clean_idx.is_empty() {
+            return None;
+        }
+
+        Some((clean, clean_idx))
+    }
+
     /// Creates a compound collider by decomposing a mesh/polyline into convex pieces.
     ///
     /// Concave shapes (like an 'L' or 'C') are automatically broken into multiple convex
@@ -992,7 +1102,11 @@ impl ColliderBuilder {
     ///
     /// Uses the V-HACD algorithm. Good for imported models that aren't already convex.
     pub fn convex_decomposition(vertices: &[Vector], indices: &[[u32; DIM]]) -> Self {
-        Self::new(SharedShape::convex_decomposition(vertices, indices))
+        match Self::sanitize_decomposition_input(vertices, indices) {
+            Some((v, i)) => Self::new(SharedShape::convex_decomposition(&v, &i)),
+            // Degenerate input (e.g. all-identical points): nothing to decompose -> empty compound.
+            None => Self::new(SharedShape::ball(0.0)), // degenerate input -> zero-radius ball (safe, no hull)
+        }
     }
 
     /// Initializes a collider builder with a compound shape obtained from the decomposition of
@@ -1002,11 +1116,12 @@ impl ColliderBuilder {
         indices: &[[u32; DIM]],
         border_radius: Real,
     ) -> Self {
-        Self::new(SharedShape::round_convex_decomposition(
-            vertices,
-            indices,
-            border_radius,
-        ))
+        match Self::sanitize_decomposition_input(vertices, indices) {
+            Some((v, i)) => {
+                Self::new(SharedShape::round_convex_decomposition(&v, &i, border_radius))
+            }
+            None => Self::new(SharedShape::ball(0.0)), // degenerate input -> zero-radius ball (safe, no hull)
+        }
     }
 
     /// Initializes a collider builder with a compound shape obtained from the decomposition of
@@ -1016,9 +1131,12 @@ impl ColliderBuilder {
         indices: &[[u32; DIM]],
         params: &VHACDParameters,
     ) -> Self {
-        Self::new(SharedShape::convex_decomposition_with_params(
-            vertices, indices, params,
-        ))
+        match Self::sanitize_decomposition_input(vertices, indices) {
+            Some((v, i)) => {
+                Self::new(SharedShape::convex_decomposition_with_params(&v, &i, params))
+            }
+            None => Self::new(SharedShape::ball(0.0)), // degenerate input -> zero-radius ball (safe, no hull)
+        }
     }
 
     /// Initializes a collider builder with a compound shape obtained from the decomposition of
@@ -1029,12 +1147,12 @@ impl ColliderBuilder {
         params: &VHACDParameters,
         border_radius: Real,
     ) -> Self {
-        Self::new(SharedShape::round_convex_decomposition_with_params(
-            vertices,
-            indices,
-            params,
-            border_radius,
-        ))
+        match Self::sanitize_decomposition_input(vertices, indices) {
+            Some((v, i)) => Self::new(SharedShape::round_convex_decomposition_with_params(
+                &v, &i, params, border_radius,
+            )),
+            None => Self::new(SharedShape::ball(0.0)), // degenerate input -> zero-radius ball (safe, no hull)
+        }
     }
 
     /// Creates the smallest convex shape that contains all the given points.
@@ -1470,3 +1588,144 @@ impl From<ColliderBuilder> for Collider {
         val.build()
     }
 }
+
+
+#[cfg(test)]
+mod decomposition_tests {
+    use super::*;
+    use parry::shape::TypedShape;
+
+    /// Inspects a `ColliderBuilder`'s shape as a compound, returning the number of convex parts.
+    fn compound_part_count(builder: &ColliderBuilder) -> Option<usize> {
+        match builder.shape.as_typed_shape() {
+            TypedShape::Compound(c) => Some(c.shapes().len()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn convex_decomposition_does_not_panic_on_identical_points() {
+        // Regression test for issue #223: passing 3+ identical consecutive points (or otherwise
+        // degenerate input) used to panic deep inside parry's voxelization convex-hull
+        // (`clip_aabb_line` matrix-index-out-of-bounds). After the input sanitization in
+        // `sanitize_decomposition_input`, degenerate input yields a safe (empty) compound instead.
+        let vertices = vec![
+            Vector::new(0.0, 0.0, 0.0),
+            Vector::new(0.0, 0.0, 0.0), // duplicate
+            Vector::new(0.0, 0.0, 0.0), // duplicate
+        ];
+        // Indices reference only duplicates -> all triangles degenerate.
+        let indices = vec![[0u32, 1, 2]];
+
+        // Must not panic, and must yield a valid (non-compound) shape instead of a hull.
+        let builder = ColliderBuilder::convex_decomposition(&vertices, &indices);
+        assert_eq!(compound_part_count(&builder), None);
+
+        // Same for the round / with-params variants.
+        let r = ColliderBuilder::round_convex_decomposition(&vertices, &indices, 0.01);
+        assert_eq!(compound_part_count(&r), None);
+        let p = ColliderBuilder::convex_decomposition_with_params(
+            &vertices,
+            &indices,
+            &VHACDParameters::default(),
+        );
+        assert_eq!(compound_part_count(&p), None);
+        let rp = ColliderBuilder::round_convex_decomposition_with_params(
+            &vertices,
+            &indices,
+            &VHACDParameters::default(),
+            0.01,
+        );
+        assert_eq!(compound_part_count(&rp), None);
+    }
+
+    #[test]
+    fn convex_decomposition_keeps_valid_input() {
+        // A real tetrahedron must still decompose into >= 1 convex part (sanitization is a no-op
+        // for clean input).
+        let vertices = vec![
+            Vector::new(0.0, 0.0, 0.0),
+            Vector::new(1.0, 0.0, 0.0),
+            Vector::new(0.0, 1.0, 0.0),
+            Vector::new(0.0, 0.0, 1.0),
+        ];
+        let indices = vec![[0u32, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]];
+        let builder = ColliderBuilder::convex_decomposition(&vertices, &indices);
+        let parts = compound_part_count(&builder);
+        assert!(parts.is_some_and(|n| n >= 1), "valid mesh must decompose");
+    }
+}
+
+#[cfg(test)]
+mod cylinder_epa_tests {
+    use super::*;
+    use glamx::glam::{DQuat, DVec3};
+    use parry::query::{Contact, DefaultQueryDispatcher, QueryDispatcher};
+    use parry::shape::{Cuboid, Cylinder};
+    use parry::math::Pose;
+
+    /// Regression test for upstream issue #305 ("Odd cylinder collisions"):
+    /// a cylinder resting on a very large but very thin cuboid (e.g. a floor slab tilted
+    /// slightly) used to make EPA return an *incorrect* contact normal (dominated by a
+    /// horizontal component instead of the vertical support direction). A wrong normal makes
+    /// the solver push the cylinder sideways and it falls through the floor.
+    ///
+    /// We reproduce the canonical scenario: a thin large cuboid at the origin rotated by a
+    /// small angle about Z (matching the issue's `rotation(vector![0.2, 0.0, 0.0])` floor),
+    /// with a cylinder placed just above it. The contact normal reported by the dispatcher
+    /// must be dominantly vertical (supporting the cylinder), NOT horizontal (the EPA bug).
+    #[test]
+    fn cylinder_on_thin_cuboid_has_vertical_contact_normal() {
+        let dispatcher = DefaultQueryDispatcher;
+
+        // Thin, very large cuboid (floor slab): half-extents (100, 0.1, 100).
+        let cuboid = Cuboid::new(Vector::new(100.0, 0.1, 100.0));
+        // Cylinder: half-height 0.5, radius 0.5 (matches the issue's cylinder).
+        let cylinder = Cylinder::new(0.5, 0.5);
+
+        // Floor slab tilted by 0.2 rad about Z, matching the issue's floor rotation.
+        let floor_rot = DQuat::from_axis_angle(DVec3::Z, 0.2);
+        let floor_pose = Pose::from_parts(DVec3::ZERO, floor_rot);
+        // Cylinder sits just above the slab top, axis vertical (+Y), centered at x = 0.
+        let cyl_pose = Pose::from_parts(DVec3::new(0.0, 0.1 + 0.5 + 1e-3, 0.0), DQuat::IDENTITY);
+
+        // pos12 = cylinder relative to floor.
+        let pos12 = cyl_pose * floor_pose.inverse();
+
+        let result = dispatcher
+            .contact(&pos12, &cylinder, &cuboid, 0.1)
+            .expect("cylinder/cuboid contact must be supported");
+
+        let contact: Contact = result.expect("cylinder should be in contact with the slab");
+        // normal2 is the contact normal expressed in the *cuboid* (floor) local frame.
+        // For a correct support contact it must point mostly along the floor's local up
+        // axis (Y), i.e. |normal2.y| must dominate over the horizontal components.
+        let n = contact.normal2;
+        let vertical = n.y.abs();
+        let horizontal = (n.x * n.x + n.z * n.z).sqrt();
+        assert!(
+            vertical > horizontal,
+            "contact normal should be dominantly vertical (support), got n=({:.3}, {:.3}, {:.3})",
+            n.x, n.y, n.z
+        );
+        // And it must actually be in contact (penetrating or touching), not separated.
+        assert!(
+            contact.dist <= 0.1,
+            "cylinder must be in contact with the slab, dist={:.4}",
+            contact.dist
+        );
+        // The bug (#305) symptom is a *horizontal* normal: EPA returns a sideways direction
+        // that makes the solver push the cylinder horizontally and it tunnels through the
+        // floor. Express the contact normal back in world space and confirm it is dominantly
+        // vertical (the cylinder is supported by the floor, not pushed sideways). The sign
+        // depends on convention (it points from the cylinder into the floor, i.e. downward
+        // here), so we test |y| rather than the sign.
+        let world_normal = floor_rot * n;
+        assert!(
+            world_normal.y.abs() > 0.9,
+            "world-space contact normal should be dominantly vertical (support), got y={:.3}",
+            world_normal.y
+        );
+    }
+}
+
