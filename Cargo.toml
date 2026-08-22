@@ -41,7 +41,7 @@ default-members = [
 ]
 # `typescript/` is the JS/Wasm bindings' own Cargo workspace; keep it out of
 # this one so root-level `cargo` commands never try to absorb its crates.
-exclude = ["typescript", "parry"]
+exclude = ["typescript", "parry", "nalgebra"]
 resolver = "2"
 
 [workspace.package]

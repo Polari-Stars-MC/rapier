@@ -1,3 +1,6 @@
 [submodule "parry"]
 	path = parry
 	url = https://github.com/Polari-Stars-MC/parry.git
+[submodule "nalgebra"]
+	path = nalgebra
+	url = https://github.com/Polari-Stars-MC/nalgebra.git
