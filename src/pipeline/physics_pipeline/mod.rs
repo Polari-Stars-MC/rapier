@@ -208,12 +208,28 @@ impl PhysicsPipeline {
         hooks: &dyn PhysicsHooks,
         events: &dyn EventHandler,
     ) {
+        // Build the world gravity container (kind = Gravity, persistent). Its
+        // single entry stores the gravity *acceleration*; `compute_body_effective_forces`
+        // scales it by each body's mass × gravity_scale. This is the self-integrating
+        // gravity container — gravity stays constant without any per-step re-apply.
+        let mut gravity_container = crate::dynamics::force_containers::KindContainer::new(
+            crate::dynamics::force_containers::ForceKind::Gravity,
+            crate::dynamics::force_containers::Persistence::Persistent,
+        );
+        gravity_container.push(crate::dynamics::force_containers::ForceEntry {
+            id: 1,
+            force: gravity,
+            torque: crate::math::AngVector::ZERO,
+            point: None,
+        });
+
         // With a dedicated pool configured, run the whole step inside it.
         #[cfg(all(feature = "parallel", not(feature = "unsync-callbacks")))]
         if let Some(pool) = self.thread_pool.clone() {
             return pool.install(|| {
                 self.step_inner(
                     gravity,
+                    &gravity_container,
                     integration_parameters,
                     islands,
                     broad_phase,
@@ -231,6 +247,7 @@ impl PhysicsPipeline {
 
         self.step_inner(
             gravity,
+            &gravity_container,
             integration_parameters,
             islands,
             broad_phase,

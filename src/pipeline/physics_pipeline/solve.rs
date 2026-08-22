@@ -158,7 +158,8 @@ impl PhysicsPipeline {
 
     pub(super) fn build_islands_and_solve_velocity_constraints(
         &mut self,
-        gravity: Vector,
+        _gravity: Vector,
+        gravity_container: &crate::dynamics::force_containers::KindContainer,
         integration_parameters: &IntegrationParameters,
         islands: &mut IslandManager,
         narrow_phase: &mut NarrowPhase,
@@ -240,9 +241,17 @@ impl PhysicsPipeline {
             for handle in islands.active_bodies() {
                 let rb = bodies.index_mut_internal(handle);
                 IslandManager::update_body_energy(rb, dt, length_unit);
-                let effective_mass = rb.mprops.effective_mass();
-                rb.forces
-                    .compute_effective_force_and_torque(gravity, effective_mass);
+                let _effective_mass = rb.mprops.effective_mass();
+                crate::dynamics::force_containers::compute_body_effective_forces(
+                    rb,
+                    gravity_container,
+                );
+                // Drain transient (per-step) force containers now that their
+                // contributions were summed into `rb.forces`. Persistent
+                // containers keep their entries. Done here (inside the active-body
+                // loop) so we never iterate the whole set — which would bump the
+                // active-set epoch during steady state.
+                crate::dynamics::force_containers::drain_transient_forces(rb);
                 any_extra_iterations |= rb.additional_solver_iterations() > 0;
                 bid(rb, &islands.persistent, &mut split_bid);
                 observe(rb, observations);
@@ -270,9 +279,12 @@ impl PhysicsPipeline {
                     for handle in chunk {
                         let rb = bodies.index_mut_internal(*handle);
                         IslandManager::update_body_energy(rb, dt, length_unit);
-                        let effective_mass = rb.mprops.effective_mass();
-                        rb.forces
-                            .compute_effective_force_and_torque(gravity, effective_mass);
+                        let _effective_mass = rb.mprops.effective_mass();
+                        crate::dynamics::force_containers::compute_body_effective_forces(
+                            rb,
+                            gravity_container,
+                        );
+                        crate::dynamics::force_containers::drain_transient_forces(rb);
                         any_extra |= rb.additional_solver_iterations() > 0;
                         bid(rb, persistent, &mut chunk_bid);
                         observe(rb, &mut observations);

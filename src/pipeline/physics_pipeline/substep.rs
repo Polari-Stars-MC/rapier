@@ -267,6 +267,7 @@ impl PhysicsPipeline {
     pub(super) fn step_inner(
         &mut self,
         gravity: Vector,
+        gravity_container: &crate::dynamics::force_containers::KindContainer,
         integration_parameters: &IntegrationParameters,
         islands: &mut IslandManager,
         broad_phase: &mut BroadPhaseBvh,
@@ -478,6 +479,7 @@ impl PhysicsPipeline {
             self.counters.custom.pause();
             self.build_islands_and_solve_velocity_constraints(
                 gravity,
+                gravity_container,
                 &integration_parameters,
                 islands,
                 narrow_phase,

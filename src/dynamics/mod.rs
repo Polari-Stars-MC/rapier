@@ -30,6 +30,12 @@ pub use self::rigid_body::{RigidBody, RigidBodyBuilder};
 #[cfg(feature = "alloc")]
 pub use self::rigid_body_set::{BodyPair, RigidBodySet};
 
+// Force containers: kind-classified, self-integrating {persistent, transient}
+// force model. Declared AFTER `rigid_body` so the `RigidBody` type it depends
+// on is already visible in this namespace.
+#[cfg(feature = "alloc")]
+pub use self::force_containers::*;
+
 #[cfg(feature = "alloc")]
 mod ccd;
 mod coefficient_combine_rule;
@@ -47,3 +53,6 @@ pub(crate) mod solver;
 mod rigid_body;
 #[cfg(feature = "alloc")]
 mod rigid_body_set;
+
+#[cfg(feature = "alloc")]
+pub mod force_containers;

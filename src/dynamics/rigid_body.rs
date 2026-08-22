@@ -5,9 +5,10 @@ use simba::scalar::ComplexField;
 #[cfg(doc)]
 use super::IntegrationParameters;
 use crate::dynamics::{
-    LockedAxes, MassProperties, RigidBodyActivation, RigidBodyAdditionalMassProps, RigidBodyCcd,
-    RigidBodyChanges, RigidBodyColliders, RigidBodyDamping, RigidBodyDominance, RigidBodyForces,
-    RigidBodyIds, RigidBodyMassProps, RigidBodyPosition, RigidBodyType, RigidBodyVelocity,
+    force_containers::ForceContainer, LockedAxes, MassProperties, RigidBodyActivation,
+    RigidBodyAdditionalMassProps, RigidBodyCcd, RigidBodyChanges, RigidBodyColliders,
+    RigidBodyDamping, RigidBodyDominance, RigidBodyForces, RigidBodyIds, RigidBodyMassProps,
+    RigidBodyPosition, RigidBodyType, RigidBodyVelocity,
 };
 use crate::geometry::{
     ColliderHandle, ColliderMassProps, ColliderParent, ColliderPosition, ColliderSet, ColliderShape,
@@ -51,6 +52,10 @@ pub struct RigidBody {
     pub(crate) damping: RigidBodyDamping<Real>,
     pub(crate) vels: RigidBodyVelocity<Real>,
     pub(crate) forces: RigidBodyForces,
+    /// Force containers, classified by [`ForceKind`]. Each is self-integrating
+    /// and records its own [`Persistence`] (persistent forces survive across
+    /// steps; transient forces drain every step). See `force_containers` module.
+    pub(crate) force_containers: crate::dynamics::force_containers::BodyForceContainers,
     pub(crate) mprops: RigidBodyMassProps,
 
     pub(crate) ccd_vels: RigidBodyVelocity<Real>,
@@ -94,6 +99,8 @@ impl RigidBody {
             vels: RigidBodyVelocity::default(),
             damping: RigidBodyDamping::default(),
             forces: RigidBodyForces::default(),
+            force_containers:
+                crate::dynamics::force_containers::BodyForceContainers::new(),
             ccd: RigidBodyCcd::default(),
             ids: RigidBodyIds::default(),
             colliders: RigidBodyColliders::default(),
@@ -140,6 +147,7 @@ impl RigidBody {
             vels,
             damping,
             forces,
+            force_containers,
             ccd,
             ids: _ids,             // Internal ids must not be overwritten.
             colliders: _colliders, // This function cannot be used to edit collider sets.
@@ -160,6 +168,7 @@ impl RigidBody {
         self.vels = *vels;
         self.damping = *damping;
         self.forces = *forces;
+        self.force_containers = force_containers.clone();
         self.ccd = *ccd;
         self.activation = *activation;
         self.body_type = *body_type;
@@ -1266,6 +1275,99 @@ impl RigidBody {
         }
     }
 
+    // ── Kind-classified, self-integrating force containers ───────────────
+    //
+    // These replace the flat `add_force` + per-step `reset_forces` ritual with a
+    // {persistent, transient} lifecycle. Each force *kind* owns a container that
+    // records its own `Persistence`; persistent forces (gravity, steady thrust)
+    // survive across steps, transient forces (events, contact friction/reaction)
+    // drain automatically. See `crate::dynamics::force_containers`.
+
+    /// Get a reference to this body's force container of the given kind, if any.
+    pub fn force_container(&self, kind: crate::dynamics::force_containers::ForceKind) -> Option<&crate::dynamics::force_containers::KindContainer> {
+        self.force_containers.get(&kind)
+    }
+
+    /// Get a mutable reference to this body's force container of the given kind,
+    /// creating an empty one (with the supplied persistence) on first use.
+    pub fn force_container_mut_with(
+        &mut self,
+        kind: crate::dynamics::force_containers::ForceKind,
+        persistence: crate::dynamics::force_containers::Persistence,
+    ) -> &mut crate::dynamics::force_containers::KindContainer {
+        self.force_containers
+            .entry(kind)
+            .or_insert_with(|| crate::dynamics::force_containers::KindContainer::new(kind, persistence))
+    }
+
+    /// Add a **persistent** thrust force (id-managed, survives across steps until
+    /// removed). Steady thrust/anchors no longer need re-`add_force` every frame.
+    /// Returns the entry id (use it with [`remove_force_by_kind`]).
+    #[profiling::function]
+    pub fn add_thrust(
+        &mut self,
+        id: u64,
+        force: Vector,
+        torque: AngVector,
+        point: Option<Vector>,
+        persistence: crate::dynamics::force_containers::Persistence,
+        wake_up: bool,
+    ) -> u64 {
+        use crate::dynamics::force_containers::{ForceEntry, ForceKind};
+        if self.body_type != RigidBodyType::Dynamic {
+            return 0;
+        }
+        let assigned = self
+            .force_container_mut_with(ForceKind::Thrust, persistence)
+            .push(ForceEntry { id, force, torque, point });
+        if wake_up {
+            self.wake_up(true);
+        }
+        assigned
+    }
+
+    /// Emit a **transient** force (event/one-shot). Valid for the current step
+    /// only; the container drains it at frame end automatically.
+    #[profiling::function]
+    pub fn emit_event_force(
+        &mut self,
+        force: Vector,
+        torque: AngVector,
+        point: Option<Vector>,
+        source: crate::dynamics::force_containers::ForceKind,
+        wake_up: bool,
+    ) -> u64 {
+        use crate::dynamics::force_containers::{ForceEntry, Persistence};
+        if self.body_type != RigidBodyType::Dynamic {
+            return 0;
+        }
+        let assigned = self
+            .force_container_mut_with(source, Persistence::Transient)
+            .push(ForceEntry {
+                id: 0,
+                force,
+                torque,
+                point,
+            });
+        if wake_up {
+            self.wake_up(true);
+        }
+        assigned
+    }
+
+    /// Remove a force entry by kind + id. Returns `true` if it was removed.
+    pub fn remove_force_by_kind(
+        &mut self,
+        kind: crate::dynamics::force_containers::ForceKind,
+        id: u64,
+    ) -> bool {
+        if let Some(c) = self.force_containers.get_mut(&kind) {
+            c.remove(id)
+        } else {
+            false
+        }
+    }
+
     /// Applies a continuous force to this body (like thrust, wind, or magnets).
     ///
     /// Unlike [`apply_impulse()`](Self::apply_impulse) which is instant, a force is applied
@@ -2274,5 +2376,150 @@ mod max_velocity_tests {
             av,
             cap
         );
+    }
+}
+
+#[cfg(feature = "dim3")]
+#[cfg(test)]
+mod force_container_tests {
+    use crate::dynamics::force_containers::{ForceContainer, ForceKind, Persistence};
+    use crate::dynamics::{
+        ImpulseJointSet, IslandManager, MultibodyJointSet, RigidBodySet,
+    };
+    use crate::geometry::{ColliderSet, NarrowPhase};
+    use crate::math::{AngVector, Real, Vector};
+    use crate::prelude::{
+        CCDSolver, ColliderBuilder, DefaultBroadPhase, IntegrationParameters, PhysicsPipeline,
+        RigidBodyBuilder,
+    };
+
+    /// Build a minimal stepping context with no gravity.
+    fn step_context(gravity: Vector) -> (PhysicsPipeline, IslandManager, DefaultBroadPhase, NarrowPhase, ImpulseJointSet, MultibodyJointSet, CCDSolver, IntegrationParameters) {
+        (
+            PhysicsPipeline::new(),
+            IslandManager::new(),
+            DefaultBroadPhase::new(),
+            NarrowPhase::new(),
+            ImpulseJointSet::new(),
+            MultibodyJointSet::new(),
+            CCDSolver::new(),
+            IntegrationParameters::default(),
+        )
+    }
+
+    /// A persistent thrust force keeps acting every step without re-adding.
+    #[test]
+    fn persistent_thrust_survives_across_steps() {
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let (mut pipeline, mut islands, mut bf, mut nf, mut ij, mut mj, mut ccd, params) =
+            step_context(Vector::new(0.0, 0.0, 0.0));
+
+        let rb = RigidBodyBuilder::dynamic().build();
+        let h = bodies.insert(rb);
+        colliders.insert_with_parent(ColliderBuilder::ball(0.5), h, &mut bodies);
+
+        // One persistent thrust along +X. No per-step re-add.
+        bodies[h].add_thrust(1, Vector::new(10.0, 0.0, 0.0), AngVector::new(0.0, 0.0, 0.0), None, Persistence::Persistent, true);
+
+        // Step once: body gains some +X velocity.
+        let v0 = bodies[h].linvel().x;
+        for _ in 0..1 {
+            pipeline.step(Vector::new(0.0, 0.0, 0.0), &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders, &mut ij, &mut mj, &mut ccd, &(), &());
+        }
+        let v1 = bodies[h].linvel().x;
+        assert!(v1 > v0, "persistent thrust should accelerate the body");
+
+        // Step several more times WITHOUT re-adding — thrust must persist.
+        for _ in 0..5 {
+            pipeline.step(Vector::new(0.0, 0.0, 0.0), &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders, &mut ij, &mut mj, &mut ccd, &(), &());
+        }
+        let v2 = bodies[h].linvel().x;
+        assert!(v2 > v1, "persistent thrust must keep acting without re-add");
+
+        // The container is still present and persistent.
+        let c = bodies[h].force_container(ForceKind::Thrust).expect("thrust container exists");
+        assert_eq!(c.persistence(), Persistence::Persistent);
+        assert_eq!(c.len(), 1);
+    }
+
+    /// A transient (event) force applies for exactly one step, then auto-drains.
+    #[test]
+    fn transient_event_force_is_one_step() {
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let (mut pipeline, mut islands, mut bf, mut nf, mut ij, mut mj, mut ccd, params) =
+            step_context(Vector::new(0.0, 0.0, 0.0));
+
+        let rb = RigidBodyBuilder::dynamic().build();
+        let h = bodies.insert(rb);
+        colliders.insert_with_parent(ColliderBuilder::ball(0.5), h, &mut bodies);
+
+        // Emit a transient event force.
+        bodies[h].emit_event_force(Vector::new(10.0, 0.0, 0.0), AngVector::new(0.0, 0.0, 0.0), None, ForceKind::Event, true);
+
+        // Step once — transient force applies this step.
+        pipeline.step(Vector::new(0.0, 0.0, 0.0), &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders, &mut ij, &mut mj, &mut ccd, &(), &());
+        let v1 = bodies[h].linvel().x;
+        assert!(v1 > 0.0, "transient event force should apply on its step");
+
+        // Step again — the event force must be gone (auto-drained), so no further
+        // acceleration from it. Velocity should stay ~constant (no damping here).
+        let v_before = bodies[h].linvel().x;
+        pipeline.step(Vector::new(0.0, 0.0, 0.0), &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders, &mut ij, &mut mj, &mut ccd, &(), &());
+        let v_after = bodies[h].linvel().x;
+        assert!(
+            (v_after - v_before).abs() < 1.0e-6,
+            "transient force must not leak into the next step (dv={})",
+            v_after - v_before
+        );
+
+        // Container drained.
+        assert!(bodies[h].force_container(ForceKind::Event).is_none()
+            || bodies[h].force_container(ForceKind::Event).unwrap().is_empty(),
+            "transient event container should be empty after the step");
+    }
+
+    /// Removing a force entry stops it from acting.
+    #[test]
+    fn remove_force_stops_application() {
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let (mut pipeline, mut islands, mut bf, mut nf, mut ij, mut mj, mut ccd, params) =
+            step_context(Vector::new(0.0, 0.0, 0.0));
+
+        let rb = RigidBodyBuilder::dynamic().build();
+        let h = bodies.insert(rb);
+        colliders.insert_with_parent(ColliderBuilder::ball(0.5), h, &mut bodies);
+
+        let id = bodies[h].add_thrust(7, Vector::new(10.0, 0.0, 0.0), AngVector::new(0.0, 0.0, 0.0), None, Persistence::Persistent, true);
+        bodies[h].remove_force_by_kind(ForceKind::Thrust, id);
+
+        pipeline.step(Vector::new(0.0, 0.0, 0.0), &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders, &mut ij, &mut mj, &mut ccd, &(), &());
+        let v = bodies[h].linvel().x;
+        assert!(v.abs() < 1.0e-6, "removed thrust must not accelerate the body (v={})", v);
+    }
+
+    /// Gravity is applied through the persistent gravity container every step
+    /// without any per-step re-apply, and bodies fall.
+    #[test]
+    fn gravity_persistent_via_container() {
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let gravity = Vector::new(0.0, -9.81, 0.0);
+        let (mut pipeline, mut islands, mut bf, mut nf, mut ij, mut mj, mut ccd, params) =
+            step_context(gravity);
+
+        let rb = RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 10.0, 0.0)).build();
+        let h = bodies.insert(rb);
+        colliders.insert_with_parent(ColliderBuilder::ball(0.5), h, &mut bodies);
+
+        // No manual gravity re-apply; step several times.
+        for _ in 0..5 {
+            pipeline.step(gravity, &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders, &mut ij, &mut mj, &mut ccd, &(), &());
+        }
+        // Body should have fallen (negative Y velocity, lower Y position).
+        assert!(bodies[h].linvel().y < 0.0, "gravity should pull the body down");
+        assert!(bodies[h].translation().y < 10.0, "gravity should lower the body");
     }
 }
