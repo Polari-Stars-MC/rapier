@@ -831,6 +831,9 @@ pub(super) unsafe fn run_worker(ctx: &SharedCtx, worker_id: usize) {
                     angvel: solver_vels.angular,
                 };
                 new_vels = new_vels.apply_damping(base_params.dt, &rb.damping);
+                // Issue #181: clamp the velocity magnitude to the per-body caps (if any) before
+                // it is committed to the body and used by the integrator / CCD sweep.
+                new_vels = new_vels.clamp_magnitude(rb.max_linvel, rb.max_angvel);
                 rb.vels = new_vels;
 
                 // NOTE: if it's a position-based kinematic body, don't writeback as we want

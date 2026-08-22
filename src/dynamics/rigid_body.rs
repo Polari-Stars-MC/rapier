@@ -65,6 +65,16 @@ pub struct RigidBody {
     pub(crate) dominance: RigidBodyDominance,
     pub(crate) enabled: bool,
     pub(crate) additional_solver_iterations: usize,
+    /// Optional maximum linear velocity magnitude (in units/second), issue #181.
+    ///
+    /// When set, the body's linear velocity is clamped to this magnitude during
+    /// the integration step (after forces and the constraint solver have run), so
+    /// no simulation can push it faster. `None` means no limit.
+    pub(crate) max_linvel: Option<Real>,
+    /// Optional maximum angular velocity magnitude (in radians/second), issue #181.
+    ///
+    /// See [`Self::max_linvel`]; applies to the angular velocity magnitude instead.
+    pub(crate) max_angvel: Option<AngVector>,
     /// User-defined data associated to this rigid-body.
     pub user_data: u128,
 }
@@ -94,6 +104,8 @@ impl RigidBody {
             enabled: true,
             user_data: 0,
             additional_solver_iterations: 0,
+            max_linvel: None,
+            max_angvel: None,
         }
     }
 
@@ -138,6 +150,8 @@ impl RigidBody {
             enabled,
             additional_solver_iterations,
             user_data,
+            max_linvel,
+            max_angvel,
         } = other;
 
         self.pos = *pos;
@@ -153,6 +167,8 @@ impl RigidBody {
         self.enabled = *enabled;
         self.additional_solver_iterations = *additional_solver_iterations;
         self.user_data = *user_data;
+        self.max_linvel = *max_linvel;
+        self.max_angvel = *max_angvel;
 
         self.changes = RigidBodyChanges::all();
     }
@@ -954,6 +970,59 @@ impl RigidBody {
         }
     }
 
+    /// The optional maximum linear velocity magnitude (in units/second) of this rigid-body.
+    ///
+    /// Returns `None` if no limit is set. See [`Self::set_max_linvel`] (issue #181).
+    pub fn max_linvel(&self) -> Option<Real> {
+        self.max_linvel
+    }
+
+    /// The optional maximum angular velocity magnitude (in radians/second) of this rigid-body.
+    ///
+    /// Returns `None` if no limit is set. See [`Self::set_max_angvel`] (issue #181).
+    #[cfg(feature = "dim2")]
+    pub fn max_angvel(&self) -> Option<Real> {
+        self.max_angvel.map(|v| v)
+    }
+
+    /// The optional maximum angular velocity magnitude (in radians/second) of this rigid-body.
+    ///
+    /// Returns `None` if no limit is set. See [`Self::set_max_angvel`] (issue #181).
+    #[cfg(feature = "dim3")]
+    pub fn max_angvel(&self) -> Option<AngVector> {
+        self.max_angvel
+    }
+
+    /// Set the maximum linear velocity magnitude (in units/second) of this rigid-body, issue #181.
+    ///
+    /// When `max_linvel` is `Some(limit)`, the body's linear velocity is clamped to magnitude
+    /// `limit` every integration step (after forces and the solver have run), so collisions,
+    /// motors, or gravity can never accelerate it beyond `limit`. Pass `None` to remove the cap.
+    pub fn set_max_linvel(&mut self, max_linvel: Option<Real>) {
+        self.max_linvel = max_linvel;
+        self.changes |= RigidBodyChanges::IN_MODIFIED_SET;
+    }
+
+    /// Set the maximum angular velocity magnitude (in radians/second) of this rigid-body, issue #181.
+    ///
+    /// When `max_angvel` is `Some(limit)`, the body's angular velocity is clamped to magnitude
+    /// `limit` every integration step. Per-axis limits are supported in 3D (the vector's each
+    /// component is the cap on that axis). Pass `None` to remove the cap.
+    #[cfg(feature = "dim2")]
+    pub fn set_max_angvel(&mut self, max_angvel: Option<Real>) {
+        self.max_angvel = max_angvel;
+        self.changes |= RigidBodyChanges::IN_MODIFIED_SET;
+    }
+
+    /// Set the maximum angular velocity magnitude (in radians/second) of this rigid-body, issue #181.
+    ///
+    /// See [`Self::set_max_angvel`] (the 3D variant takes a per-axis [`AngVector`] cap).
+    #[cfg(feature = "dim3")]
+    pub fn set_max_angvel(&mut self, max_angvel: Option<AngVector>) {
+        self.max_angvel = max_angvel;
+        self.changes |= RigidBodyChanges::IN_MODIFIED_SET;
+    }
+
     /// The current position (translation + rotation) of this rigid body in world space.
     ///
     /// Returns an `SimdPose` which combines both translation and rotation.
@@ -1541,6 +1610,14 @@ pub struct RigidBodyBuilder {
     pub additional_solver_iterations: usize,
     /// Are gyroscopic forces enabled for this rigid-body?
     pub gyroscopic_forces_enabled: bool,
+    /// Optional maximum linear velocity magnitude (units/second), issue #181. `None` = no limit.
+    pub max_linvel: Option<Real>,
+    /// Optional maximum angular velocity magnitude (radians/second), issue #181. `None` = no limit.
+    #[cfg(feature = "dim2")]
+    pub max_angvel: Option<Real>,
+    /// Optional maximum angular velocity magnitude (radians/second), issue #181. `None` = no limit.
+    #[cfg(feature = "dim3")]
+    pub max_angvel: Option<AngVector>,
 }
 
 impl Default for RigidBodyBuilder {
@@ -1577,6 +1654,8 @@ impl RigidBodyBuilder {
             user_data: 0,
             additional_solver_iterations: 0,
             gyroscopic_forces_enabled: true,
+            max_linvel: None,
+            max_angvel: None,
         }
     }
 
@@ -1940,6 +2019,29 @@ impl RigidBodyBuilder {
         self
     }
 
+    /// Set the maximum linear velocity magnitude (units/second) of the rigid-body to be built,
+    /// issue #181. `None` removes the cap (default). See [`RigidBody::set_max_linvel`].
+    pub fn max_linvel(mut self, max_linvel: Option<Real>) -> Self {
+        self.max_linvel = max_linvel;
+        self
+    }
+
+    /// Set the maximum angular velocity magnitude (radians/second) of the rigid-body to be built,
+    /// issue #181. `None` removes the cap (default). See [`RigidBody::set_max_angvel`].
+    #[cfg(feature = "dim2")]
+    pub fn max_angvel(mut self, max_angvel: Option<Real>) -> Self {
+        self.max_angvel = max_angvel;
+        self
+    }
+
+    /// Set the maximum angular velocity magnitude (radians/second) of the rigid-body to be built,
+    /// issue #181. `None` removes the cap (default). See [`RigidBody::set_max_angvel`].
+    #[cfg(feature = "dim3")]
+    pub fn max_angvel(mut self, max_angvel: Option<AngVector>) -> Self {
+        self.max_angvel = max_angvel;
+        self
+    }
+
     /// Sets whether the rigid-body is to be created asleep.
     pub fn sleeping(mut self, sleeping: bool) -> Self {
         self.sleeping = sleeping;
@@ -1995,6 +2097,8 @@ impl RigidBodyBuilder {
         rb.enable_ccd(self.ccd_enabled);
         rb.set_soft_ccd_prediction(self.soft_ccd_prediction);
         rb.set_allow_fast_rotation(self.allow_fast_rotation);
+        rb.max_linvel = self.max_linvel;
+        rb.max_angvel = self.max_angvel;
 
         if self.can_sleep && self.sleeping {
             rb.sleep();
@@ -2042,5 +2146,118 @@ pub(crate) fn gyroscopic_corrected_angvel(
         principal_axes * (inv_principal_inertia * capped_momentum)
     } else {
         angvel
+    }
+}
+
+#[cfg(all(feature = "dim3"))]
+#[cfg(test)]
+mod max_velocity_tests {
+    use crate::dynamics::{ImpulseJointSet, IslandManager, MultibodyJointSet, RigidBodySet};
+    use crate::geometry::{ColliderSet, NarrowPhase};
+    use crate::math::{Real, Vector};
+    use crate::prelude::{
+        CCDSolver, ColliderBuilder, DefaultBroadPhase, IntegrationParameters, PhysicsPipeline,
+        RigidBodyBuilder,
+    };
+
+    /// Regression test for issue #181: a dynamic body whose velocity would otherwise
+    /// exceed `max_linvel` must have its linear speed clamped to that cap every step.
+    #[test]
+    fn max_linvel_clamps_speed() {
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let mut islands = IslandManager::new();
+        let mut bf = DefaultBroadPhase::new();
+        let mut nf = NarrowPhase::new();
+        let mut impulse_joints = ImpulseJointSet::new();
+        let mut multibody_joints = MultibodyJointSet::new();
+        let mut ccd = CCDSolver::new();
+        let mut pipeline = PhysicsPipeline::new();
+        let gravity = Vector::new(0.0, 0.0, 0.0); // no gravity; we drive velocity directly
+        let params = IntegrationParameters::default();
+
+        // A body we launch very fast, but cap at 5 units/s.
+        let rb = RigidBodyBuilder::dynamic()
+            .linvel(Vector::new(1000.0, 0.0, 0.0))
+            .max_linvel(Some(5.0))
+            .build();
+        let h = bodies.insert(rb);
+        colliders.insert_with_parent(ColliderBuilder::ball(0.5), h, &mut bodies);
+
+        for _ in 0..10 {
+            pipeline.step(
+                gravity,
+                &params,
+                &mut islands,
+                &mut bf,
+                &mut nf,
+                &mut bodies,
+                &mut colliders,
+                &mut impulse_joints,
+                &mut multibody_joints,
+                &mut ccd,
+                &(),
+                &(),
+            );
+        }
+
+        let speed = bodies[h].linvel().length();
+        assert!(
+            speed <= 5.0 + 1.0e-6,
+            "linear speed {} exceeded max_linvel cap 5.0",
+            speed
+        );
+    }
+
+    /// Regression test for issue #181: a dynamic body whose angular speed would otherwise
+    /// exceed `max_angvel` must have each angular axis clamped to that per-axis cap.
+    #[test]
+    fn max_angvel_clamps_spin() {
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let mut islands = IslandManager::new();
+        let mut bf = DefaultBroadPhase::new();
+        let mut nf = NarrowPhase::new();
+        let mut impulse_joints = ImpulseJointSet::new();
+        let mut multibody_joints = MultibodyJointSet::new();
+        let mut ccd = CCDSolver::new();
+        let mut pipeline = PhysicsPipeline::new();
+        let gravity = Vector::new(0.0, 0.0, 0.0);
+        let params = IntegrationParameters::default();
+
+        let cap: Real = 2.0;
+        let rb = RigidBodyBuilder::dynamic()
+            .angvel(Vector::new(1000.0, 1000.0, 1000.0))
+            .max_angvel(Some(Vector::new(cap, cap, cap)))
+            .build();
+        let h = bodies.insert(rb);
+        colliders.insert_with_parent(ColliderBuilder::ball(0.5), h, &mut bodies);
+
+        for _ in 0..10 {
+            pipeline.step(
+                gravity,
+                &params,
+                &mut islands,
+                &mut bf,
+                &mut nf,
+                &mut bodies,
+                &mut colliders,
+                &mut impulse_joints,
+                &mut multibody_joints,
+                &mut ccd,
+                &(),
+                &(),
+            );
+        }
+
+        let av = bodies[h].angvel();
+        assert!(
+            av.x.abs() <= cap + 1.0e-6
+                && av.y.abs() <= cap + 1.0e-6
+                && av.z.abs() <= cap + 1.0e-6,
+            "angular speed {:?} exceeded max_angvel cap {}",
+            av,
+            cap
+        );
     }
 }

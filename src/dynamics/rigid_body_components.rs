@@ -858,6 +858,57 @@ impl<T: ScalarType> RigidBodyVelocity<T> {
 }
 
 impl RigidBodyVelocity<Real> {
+    /// Clamp the magnitude of this velocity to the given caps (issue #181): the linear part to
+    /// `max_linvel` (its magnitude) and, in 3D, each angular-axis to the per-axis cap in
+    /// `max_angvel`. `None` caps are treated as "no limit" for that component.
+    #[cfg(feature = "dim2")]
+    pub fn clamp_magnitude(
+        &self,
+        max_linvel: Option<Real>,
+        max_angvel: Option<Real>,
+    ) -> Self {
+        let mut linvel = self.linvel;
+        if let Some(max) = max_linvel {
+            let len = linvel.length();
+            if len > max {
+                linvel *= max / len;
+            }
+        }
+        let mut angvel = self.angvel;
+        if let Some(max) = max_angvel {
+            if angvel.abs() > max {
+                angvel = angvel.signum() * max;
+            }
+        }
+        RigidBodyVelocity { linvel, angvel }
+    }
+
+    /// Clamp the magnitude of this velocity to the given caps (issue #181): the linear part to
+    /// `max_linvel` (its magnitude) and each angular axis to the per-axis cap in `max_angvel`.
+    /// `None` caps are treated as "no limit" for that component.
+    #[cfg(feature = "dim3")]
+    pub fn clamp_magnitude(
+        &self,
+        max_linvel: Option<Real>,
+        max_angvel: Option<AngVector>,
+    ) -> Self {
+        let mut linvel = self.linvel;
+        if let Some(max) = max_linvel {
+            let len = linvel.length();
+            if len > max {
+                linvel *= max / len;
+            }
+        }
+        let mut angvel = self.angvel;
+        if let Some(max) = max_angvel {
+            let ax = angvel.x.abs().min(max.x).copysign(angvel.x);
+            let ay = angvel.y.abs().min(max.y).copysign(angvel.y);
+            let az = angvel.z.abs().min(max.z).copysign(angvel.z);
+            angvel = AngVector::new(ax, ay, az);
+        }
+        RigidBodyVelocity { linvel, angvel }
+    }
+
     /// Same as [`Self::integrate`] but with the angular part linearized and the local
     /// center-of-mass assumed to be zero.
     #[inline]
