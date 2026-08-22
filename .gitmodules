@@ -1,0 +1,3 @@
+[submodule "parry"]
+	path = parry
+	url = https://github.com/Polari-Stars-MC/parry.git

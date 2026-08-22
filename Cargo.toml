@@ -41,7 +41,7 @@ default-members = [
 ]
 # `typescript/` is the JS/Wasm bindings' own Cargo workspace; keep it out of
 # this one so root-level `cargo` commands never try to absorb its crates.
-exclude = ["typescript"]
+exclude = ["typescript", "parry"]
 resolver = "2"
 
 [workspace.package]
@@ -72,10 +72,10 @@ num-traits = { version = "0.2", default-features = false }
 approx = { version = "0.5", default-features = false }
 
 # Parry (each crate picks its own variant)
-parry2d = { version = "0.30.2", default-features = false, features = ["required-features"] }
-parry3d = { version = "0.30.2", default-features = false, features = ["required-features"] }
-parry2d-f64 = { version = "0.30.2", default-features = false, features = ["required-features"] }
-parry3d-f64 = { version = "0.30.2", default-features = false, features = ["required-features"] }
+parry2d = { package = "parry2d", path = "parry/crates/parry2d", default-features = false, features = ["required-features"] }
+parry3d = { package = "parry3d", path = "parry/crates/parry3d", default-features = false, features = ["required-features"] }
+parry2d-f64 = { package = "parry2d-f64", path = "parry/crates/parry2d-f64", default-features = false, features = ["required-features"] }
+parry3d-f64 = { package = "parry3d-f64", path = "parry/crates/parry3d-f64", default-features = false, features = ["required-features"] }
 
 # Utilities
 arrayvec = { version = "0.7", default-features = false }
