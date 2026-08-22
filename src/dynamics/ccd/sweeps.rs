@@ -13,8 +13,8 @@ use crate::pipeline::{ActiveHooks, PairFilterContext, PhysicsHooks};
 #[cfg(feature = "dim2")]
 use parry::query::sweep_toi::CORE_FRACTION;
 use parry::query::sweep_toi::{
-    Sweep, SweepCompositeFastShape, SweepToiStatus, ToiProxy, sweep_time_of_impact,
-    sweep_time_of_impact_composite,
+    Sweep, SweepCompositeFastShape, SweepToiOutput, SweepToiStatus, ToiProxy,
+    sweep_time_of_impact, sweep_time_of_impact_composite,
 };
 use parry::query::{NonlinearRigidMotion, QueryDispatcher};
 use parry::shape::{Shape, TypedShape};
@@ -278,6 +278,10 @@ pub(super) struct BodyContinuousResult {
     pub(super) handle: RigidBodyHandle,
     /// The earliest solid impact fraction in `[0, 1]`; `1.0` if the body sweeps freely.
     pub(super) fraction: Real,
+    /// The world-space point and separating normal of the earliest solid impact (issue #548),
+    /// `None` when the body sweeps freely (no CCD hit). `point`/`normal` are taken from the
+    /// `SweepToiOutput` of the earliest-hit candidate.
+    pub(super) toi: Option<SweepToiOutput>,
     pub(super) pseudo_hits: Vec<PseudoHit>,
 }
 
@@ -294,7 +298,7 @@ fn cast_collider_pair(
     dt: Real,
     linear_slop: Real,
     is_pseudo: bool,
-) -> Option<Real> {
+) -> Option<SweepToiOutput> {
     let target_pose = target_collider_pose(co2, rb2);
 
     // The target's swept motion: for a *moving* target body (e.g. another fast bullet, issue
@@ -314,6 +318,8 @@ fn cast_collider_pair(
         FastShapeKind::Convex(sub) => core::slice::from_ref(sub),
         FastShapeKind::Compound(children) => children,
         FastShapeKind::Nonlinear => {
+            // Nonlinear fallback only resolves a fraction (no witness point); wrap it in a
+            // default `SweepToiOutput` so callers still get the impact fraction uniformly.
             return fallback_nonlinear_fraction(
                 dispatcher,
                 fast,
@@ -322,7 +328,13 @@ fn cast_collider_pair(
                 max_fraction,
                 dt,
                 is_pseudo,
-            );
+            )
+            .map(|fraction| SweepToiOutput {
+                status: SweepToiStatus::Hit,
+                fraction,
+                point: Vector::ZERO,
+                normal: Vector::ZERO,
+            });
         }
     };
 
@@ -341,17 +353,24 @@ fn cast_collider_pair(
                 max_fraction,
                 dt,
                 is_pseudo,
-            );
+            )
+            .map(|fraction| SweepToiOutput {
+                status: SweepToiStatus::Hit,
+                fraction,
+                point: Vector::ZERO,
+                normal: Vector::ZERO,
+            });
         }
     };
 
     // Each accepted piece fraction tightens `max_fraction`, so the returned value is the
     // earliest impact across all the pieces (both the solid and pseudo accept conditions
-    // only pass at or below the current bound).
-    let mut best = None;
+    // only pass at or below the current bound). We keep the full `SweepToiOutput` of that
+    // earliest hit so the caller can read its world-space point/normal (issue #548).
+    let mut best: Option<SweepToiOutput> = None;
     let mut max_fraction = max_fraction;
     for sub in sub_shapes {
-        if let Some(fraction) = cast_sub_shape(
+        if let Some(output) = cast_sub_shape(
             sub,
             &target,
             shape2,
@@ -361,8 +380,8 @@ fn cast_collider_pair(
             linear_slop,
             is_pseudo,
         ) {
-            best = Some(fraction);
-            max_fraction = fraction;
+            best = Some(output);
+            max_fraction = output.fraction;
         }
     }
     best
@@ -379,7 +398,7 @@ fn cast_sub_shape(
     max_fraction: Real,
     linear_slop: Real,
     is_pseudo: bool,
-) -> Option<Real> {
+) -> Option<SweepToiOutput> {
     let output = match target {
         TargetKind::Proxy(target_proxy) => {
             sweep_time_of_impact(
@@ -425,14 +444,14 @@ fn cast_sub_shape(
             SweepToiStatus::Hit | SweepToiStatus::Failed | SweepToiStatus::Overlapped
                 if output.fraction <= max_fraction =>
             {
-                Some(output.fraction)
+                Some(output)
             }
             _ => None,
         };
     }
 
     if 0.0 < output.fraction && output.fraction < max_fraction {
-        return Some(output.fraction);
+        return Some(output);
     }
 
     #[cfg(feature = "dim2")]
@@ -450,7 +469,7 @@ fn cast_sub_shape(
                 linear_slop,
             );
             if 0.0 < output.fraction && output.fraction < max_fraction {
-                return Some(output.fraction);
+                return Some(output);
             }
         }
     }
@@ -534,6 +553,7 @@ pub(super) fn sweep_fast_body(
 ) -> BodyContinuousResult {
     let rb1 = &bodies[handle];
     let mut fraction: Real = 1.0;
+    let mut best_toi: Option<SweepToiOutput> = None;
     let mut pseudo_hits = Vec::new();
 
     for ch1 in &rb1.colliders.0 {
@@ -588,7 +608,7 @@ pub(super) fn sweep_fast_body(
                 return;
             }
 
-            if let Some(hit_fraction) = cast_collider_pair(
+            if let Some(hit) = cast_collider_pair(
                 dispatcher,
                 &fast,
                 co2,
@@ -602,10 +622,11 @@ pub(super) fn sweep_fast_body(
                     pseudo_hits.push(PseudoHit {
                         ch1: *ch1,
                         ch2,
-                        fraction: hit_fraction,
+                        fraction: hit.fraction,
                     });
                 } else {
-                    fraction = hit_fraction;
+                    fraction = hit.fraction;
+                    best_toi = Some(hit);
                 }
             }
         };
@@ -629,6 +650,7 @@ pub(super) fn sweep_fast_body(
     BodyContinuousResult {
         handle,
         fraction,
+        toi: best_toi,
         pseudo_hits,
     }
 }

@@ -336,6 +336,11 @@ impl CCDSolver {
                     rb.mprops.local_mprops.local_com,
                 );
                 rb.pos.next_position = sweep.transform_at(result.fraction);
+                // Record the point of impact (issue #548) from the earliest solid hit.
+                if let Some(toi) = &result.toi {
+                    rb.ccd.toi_point = toi.point;
+                    rb.ccd.toi_normal = toi.normal;
+                }
             }
         }
     }
@@ -443,6 +448,118 @@ mod ccd_tests {
             "bullets tunneled through each other: A.x={}, B.x={}",
             a_pos,
             b_pos
+        );
+    }
+
+    /// Regression test for #548 (CCD point of impact).
+    ///
+    /// After the bullet-vs-bullet solve, each body must record a world-space point of impact
+    /// and a separating normal (the relative axis between the two balls, i.e. ∓X here).
+    #[test]
+    fn ccd_records_point_of_impact() {
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let mut island_manager = IslandManager::new();
+        let mut broad_phase = DefaultBroadPhase::new();
+        let mut narrow_phase = NarrowPhase::new();
+        let mut impulse_joint_set = ImpulseJointSet::new();
+        let mut multibody_joint_set = MultibodyJointSet::new();
+        let mut ccd_solver = CCDSolver::new();
+        let mut physics_pipeline = PhysicsPipeline::new();
+        let gravity = Vector::new(0.0, 0.0, 0.0);
+        let integration_parameters = IntegrationParameters::default();
+
+        let a = RigidBodyBuilder::dynamic()
+            .translation(Vector::new(-0.7, 0.0, 0.0))
+            .ccd_enabled(true)
+            .build();
+        let a_h = bodies.insert(a);
+        let b = RigidBodyBuilder::dynamic()
+            .translation(Vector::new(0.7, 0.0, 0.0))
+            .ccd_enabled(true)
+            .build();
+        let b_h = bodies.insert(b);
+        colliders.insert_with_parent(ColliderBuilder::ball(0.5), a_h, &mut bodies);
+        colliders.insert_with_parent(ColliderBuilder::ball(0.5), b_h, &mut bodies);
+
+        physics_pipeline.step(
+            gravity,
+            &integration_parameters,
+            &mut island_manager,
+            &mut broad_phase,
+            &mut narrow_phase,
+            &mut bodies,
+            &mut colliders,
+            &mut impulse_joint_set,
+            &mut multibody_joint_set,
+            &mut ccd_solver,
+            &(),
+            &(),
+        );
+
+        let a_mut = bodies.get_mut(a_h).unwrap();
+        a_mut.pos.position.translation.x = -0.7;
+        a_mut.pos.next_position.translation.x = 0.5;
+        a_mut.ccd.ccd_active = true;
+        let b_mut = bodies.get_mut(b_h).unwrap();
+        b_mut.pos.position.translation.x = 0.7;
+        b_mut.pos.next_position.translation.x = -0.5;
+        b_mut.ccd.ccd_active = true;
+
+        broad_phase.update(
+            &integration_parameters,
+            &colliders,
+            &bodies,
+            &[],
+            &[],
+            &mut Vec::new(),
+        );
+
+        ccd_solver.solve_continuous(
+            &integration_parameters,
+            &island_manager,
+            &mut bodies,
+            &colliders,
+            &mut broad_phase,
+            &narrow_phase,
+            &(),
+            &(),
+            true,
+        );
+
+        let a_toi = bodies.get(a_h).unwrap().ccd_point_of_impact();
+        let b_toi = bodies.get(b_h).unwrap().ccd_point_of_impact();
+        assert!(a_toi.is_some(), "A must record a CCD point of impact");
+        assert!(b_toi.is_some(), "B must record a CCD point of impact");
+
+        let (a_point, a_normal) = a_toi.unwrap();
+        let (b_point, b_normal) = b_toi.unwrap();
+        // The hit point lies on the A-B center line (x-axis), y=z=0.
+        assert!(
+            a_point.y.abs() < 1.0e-6 && a_point.z.abs() < 1.0e-6,
+            "impact point must lie on the A-B center line, got {:?}",
+            a_point
+        );
+        // The separating normals are along ±X (the A↔B axis) and oppose each other: one body
+        // records +X, the other -X, since the normal is the relative separating axis.
+        assert!(
+            a_normal.x.abs() > 0.99 && b_normal.x.abs() > 0.99,
+            "both normals must align with X, got A={:?} B={:?}",
+            a_normal,
+            b_normal
+        );
+        assert!(
+            a_normal.x * b_normal.x < 0.0,
+            "A and B separating normals must oppose, got A={:?} B={:?}",
+            a_normal,
+            b_normal
+        );
+        // The two records describe the same contact point.
+        assert!(
+            (a_point.x - b_point.x).abs() < 1.0e-6,
+            "A and B must agree on the impact x, got {} vs {}",
+            a_point.x,
+            b_point.x
         );
     }
 }

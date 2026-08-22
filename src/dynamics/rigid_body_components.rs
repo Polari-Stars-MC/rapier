@@ -1119,6 +1119,14 @@ pub struct RigidBodyCcd {
     /// By default angular velocity is clamped each substep to ~45°/step to keep CCD reliable;
     /// set `true` for bodies that must spin fast (e.g. wheels).
     pub allow_fast_rotation: bool,
+    /// World-space point of impact recorded by the CCD solver at the last continuous solve
+    /// (issue #548). `Vector::ZERO` when the body swept freely (no CCD hit). The separating
+    /// `normal` is in `Self::toi_normal`.
+    pub toi_point: Vector,
+    /// World-space separating normal recorded by the CCD solver at the last continuous solve
+    /// (issue #548), pointing from this body toward the hit target. `Vector::ZERO` when the
+    /// body swept freely (no CCD hit).
+    pub toi_normal: Vector,
 }
 
 impl Default for RigidBodyCcd {
@@ -1129,6 +1137,8 @@ impl Default for RigidBodyCcd {
             ccd_enabled: false,
             soft_ccd_prediction: 0.0,
             allow_fast_rotation: false,
+            toi_point: Vector::ZERO,
+            toi_normal: Vector::ZERO,
         }
     }
 }

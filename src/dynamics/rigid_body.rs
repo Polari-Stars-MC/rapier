@@ -525,6 +525,21 @@ impl RigidBody {
         self.ccd.ccd_enabled
     }
 
+    /// The world-space point of impact recorded by the CCD solver at the last continuous solve
+    /// (issue #548).
+    ///
+    /// Returns `Some((point, normal))` when this body actually hit something during the last
+    /// `world.step()` CCD pass (i.e. its motion was clamped to avoid tunneling), and `None`
+    /// when it swept freely. The `normal` points from this body toward the hit target.
+    #[must_use]
+    pub fn ccd_point_of_impact(&self) -> Option<(Vector, Vector)> {
+        if self.ccd.toi_normal == Vector::ZERO {
+            None
+        } else {
+            Some((self.ccd.toi_point, self.ccd.toi_normal))
+        }
+    }
+
     /// Sets the maximum prediction distance Soft Continuous Collision-Detection.
     ///
     /// When set to 0, soft-CCD is disabled. Soft-CCD helps prevent tunneling especially of
