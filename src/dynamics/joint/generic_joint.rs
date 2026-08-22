@@ -584,6 +584,34 @@ impl GenericJoint {
         }
     }
 
+    /// Drives the joint's degree of freedom along `axis` with a **constant joint-space force**
+    /// (issue #457), bypassing the spring/position motor model.
+    ///
+    /// This enables a force-based motor (`MotorModel::ForceBased`), sets its maximum deliverable
+    /// force to `force`, and zeroes the position/velocity targets so the motor applies a steady
+    /// push along the axis (a "force actuator") rather than regulating toward a pose. Use
+    /// [`Self::set_motor_force`] for linear axes and [`Self::set_motor_torque`] (the angular
+    /// alias) for rotational axes — both set joint-space force; the name only reflects intent.
+    pub fn set_motor_force(&mut self, axis: JointAxis, force: Real) -> &mut Self {
+        self.motor_axes |= axis.into();
+        let i = axis as usize;
+        self.motors[i].model = MotorModel::ForceBased;
+        self.motors[i].max_force = force;
+        self.motors[i].target_pos = 0.0;
+        self.motors[i].target_vel = 0.0;
+        self.motors[i].stiffness = 0.0;
+        self.motors[i].damping = 0.0;
+        self
+    }
+
+    /// Drives the joint's angular degree of freedom along `axis` with a **constant joint-space
+    /// torque** (issue #457). See [`Self::set_motor_force`] — this is the same force-based motor
+    /// drive, named for the rotational axis it is meant to act on.
+    #[cfg(feature = "dim3")]
+    pub fn set_motor_torque(&mut self, axis: JointAxis, torque: Real) -> &mut Self {
+        self.set_motor_force(axis, torque)
+    }
+
     /// Configure both the target angle and target velocity of the motor.
     pub fn set_motor(
         &mut self,
@@ -633,6 +661,68 @@ impl GenericJoint {
         } else {
             self.local_frame2.translation -= rb2.mprops.local_mprops.local_com;
         }
+    }
+
+    /// The current **position** of this joint along each of its degrees of freedom, expressed in
+    /// the joint's local frame (issue #457).
+    ///
+    /// Returns an array of length [`SPATIAL_DIM`]: the first three entries are the relative
+    /// translation (LinX/LinY/LinZ) between the two attached bodies expressed in `body1`'s joint
+    /// frame, and the remaining entries are the relative rotation decomposed into its
+    /// axis components (AngX/AngY/AngZ — the rotation's scaled axis in 3D, its angle in 2D).
+    ///
+    /// This is the *measured* coordinate (not the motor's target), derived from the bodies' live
+    /// world poses, so it is valid at any point during the simulation.
+    pub fn position(&self, body1: &RigidBody, body2: &RigidBody) -> [Real; SPATIAL_DIM] {
+        let frame1 = body1.pos.position * self.local_frame1;
+        let frame2 = body2.pos.position * self.local_frame2;
+
+        // Relative transform of body2 w.r.t. body1, in body1's joint frame.
+        let rel = frame1.inverse() * frame2;
+
+        let mut out = [0.0; SPATIAL_DIM];
+        out[0] = rel.translation.x;
+        out[1] = rel.translation.y;
+        #[cfg(feature = "dim3")]
+        {
+            out[2] = rel.translation.z;
+        }
+
+        // Relative rotation decomposed into the joint's angular coordinates.
+        let rel_rot = rel.rotation;
+        #[cfg(feature = "dim3")]
+        {
+            // Scaled axis: angle * axis. Each component is the rotation about that joint axis.
+            let scaled = rel_rot.to_scaled_axis();
+            out[3] = scaled.x;
+            out[4] = scaled.y;
+            out[5] = scaled.z;
+        }
+        #[cfg(feature = "dim2")]
+        {
+            out[2] = rel_rot.angle();
+        }
+        out
+    }
+
+    /// The current **angular position** (rotation) of this joint about its free rotational axes,
+    /// expressed in the joint's local frame (issue #457).
+    ///
+    /// In 3D this returns a vector whose `x/y/z` are the rotations about the joint's AngX/AngY/AngZ
+    /// axes (the relative rotation's scaled axis). In 2D it returns the single scalar rotation
+    /// angle about the joint's AngX axis.
+    #[cfg(feature = "dim3")]
+    pub fn angles(&self, body1: &RigidBody, body2: &RigidBody) -> Vector {
+        let p = self.position(body1, body2);
+        Vector::new(p[3], p[4], p[5])
+    }
+
+    /// The current **angular position** (rotation) of this joint about its free rotational axis,
+    /// expressed in the joint's local frame (issue #457). See the 3D [`Self::angles`] for the
+    /// vector variant.
+    #[cfg(feature = "dim2")]
+    pub fn angles(&self, body1: &RigidBody, body2: &RigidBody) -> Real {
+        self.position(body1, body2)[2]
     }
 }
 
@@ -854,5 +944,68 @@ impl GenericJointBuilder {
 impl From<GenericJointBuilder> for GenericJoint {
     fn from(val: GenericJointBuilder) -> GenericJoint {
         val.0
+    }
+}
+
+#[cfg(all(feature = "dim3"))]
+#[cfg(test)]
+mod joint_query_force_tests {
+    use crate::dynamics::{
+        ImpulseJointSet, IslandManager, MultibodyJointSet, RigidBodySet,
+    };
+    use crate::geometry::{ColliderSet, NarrowPhase};
+    use crate::math::{AngVector, Pose, Real, Vector, rotation_from_angle};
+    use crate::prelude::{
+        CCDSolver, DefaultBroadPhase, IntegrationParameters, PhysicsPipeline, RigidBodyBuilder,
+    };
+    use crate::dynamics::joint::{GenericJoint, JointAxis, JointAxesMask, MotorModel};
+
+    /// Issue #457: `set_motor_force` must configure a force-based motor (not a position/spring one).
+    #[test]
+    fn set_motor_force_enables_force_based_motor() {
+        let mut j = GenericJoint::new(JointAxesMask::empty());
+        j.set_motor_force(JointAxis::AngX, 12.5);
+        let m = j.motor(JointAxis::AngX).expect("motor must be enabled");
+        assert_eq!(m.model, MotorModel::ForceBased);
+        assert_eq!(m.max_force, 12.5);
+        // Targets must be cleared so the motor applies a steady push, not a pose regulator.
+        assert_eq!(m.target_pos, 0.0);
+        assert_eq!(m.target_vel, 0.0);
+        assert_eq!(m.stiffness, 0.0);
+    }
+
+    /// Issue #457: `position`/`angles` measure the relative pose of the two attached bodies.
+    #[test]
+    fn joint_position_measures_relative_pose() {
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let mut islands = IslandManager::new();
+        let mut bf = DefaultBroadPhase::new();
+        let mut nf = NarrowPhase::new();
+        let mut impulse_joints = ImpulseJointSet::new();
+        let mut multibody_joints = MultibodyJointSet::new();
+        let mut ccd = CCDSolver::new();
+        let mut pipeline = PhysicsPipeline::new();
+        let gravity = Vector::ZERO;
+        let params = IntegrationParameters::default();
+
+        // Two bodies at the same pose => zero joint coordinates.
+        let b1 = bodies.insert(RigidBodyBuilder::dynamic().build());
+        let b2 = bodies.insert(RigidBodyBuilder::dynamic().build());
+
+        let joint = GenericJoint::new(JointAxesMask::empty());
+        // Coincident anchors, identity frames.
+        let p0 = joint.position(&bodies[b1], &bodies[b2]);
+        assert!(p0.iter().all(|v| v.abs() < 1.0e-9), "coincident bodies => zero position, got {:?}", p0);
+
+        // Now rotate body2 by 90° about Y and step once so its pose is committed.
+        bodies[b2].set_rotation(rotation_from_angle(AngVector::new(0.0, std::f64::consts::FRAC_PI_2, 0.0)), true);
+        pipeline.step(
+            gravity, &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders,
+            &mut impulse_joints, &mut multibody_joints, &mut ccd, &(), &(),
+        );
+        let ang = joint.angles(&bodies[b1], &bodies[b2]);
+        // The relative rotation about Y should be ~ +pi/2.
+        approx::assert_relative_eq!(ang.y, std::f64::consts::FRAC_PI_2, epsilon = 1.0e-6);
     }
 }
