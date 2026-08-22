@@ -954,7 +954,7 @@ mod joint_query_force_tests {
         ImpulseJointSet, IslandManager, MultibodyJointSet, RigidBodySet,
     };
     use crate::geometry::{ColliderSet, NarrowPhase};
-    use crate::math::{AngVector, Pose, Real, Vector, rotation_from_angle};
+    use crate::math::{AngVector, Vector, rotation_from_angle};
     use crate::prelude::{
         CCDSolver, DefaultBroadPhase, IntegrationParameters, PhysicsPipeline, RigidBodyBuilder,
     };

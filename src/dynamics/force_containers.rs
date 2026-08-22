@@ -38,9 +38,15 @@
 use std::collections::HashMap;
 use std::vec::Vec;
 
+#[cfg(feature = "serde-serialize")]
+use serde::{Deserialize, Serialize};
+
 use crate::dynamics::rigid_body::RigidBody;
-use crate::math::{AngVector, Vector};
+use crate::dynamics::RigidBodySet;
+use crate::geometry::NarrowPhase;
+use crate::math::{AngVector, Real, Vector};
 use crate::utils::CrossProduct;
+use crate::utils::OrthonormalBasis;
 
 /// Effective (already-summed) force + torque for one body, consumed by the solver.
 #[derive(Clone, Copy, Debug, Default)]
@@ -55,6 +61,7 @@ pub struct EffectiveForce {
 ///
 /// Recorded **inside** each [`KindContainer`] (see [`ForceContainer::persistence`]),
 /// not as two separate struct types.
+#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Persistence {
     /// Forces persist until explicitly removed (`remove`/`clear`).
@@ -70,6 +77,7 @@ pub enum Persistence {
 /// New force kinds are added here; a container simply stores the matching
 /// `ForceKind` and a [`Persistence`] flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 #[non_exhaustive]
 pub enum ForceKind {
     /// World gravity (always persistent).
@@ -94,6 +102,7 @@ pub enum ForceKind {
 
 /// One force contribution inside a container.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 pub struct ForceEntry {
     /// Caller-managed id (so it can be removed individually).
     pub id: u64,
@@ -174,6 +183,7 @@ pub trait ForceContainer {
 /// the container taxonomy flat and data-driven: adding a force kind is a data
 /// change, not a new type.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 pub struct KindContainer {
     kind: ForceKind,
     persistence: Persistence,
@@ -266,9 +276,18 @@ pub fn compute_body_effective_forces(rb: &mut RigidBody, gravity_container: &Kin
 
     // Body containers, classified by kind. Persistence is not consulted here —
     // both persistent and transient forces act this step; the transient ones are
-    // drained afterward by `drain_transient_forces`.
+    // drained afterward by `drain_transient_forces`. Solver-emergent kinds
+    // (`Friction`, `ContactReaction`) are *observation-only* readouts: the contact
+    // solver already applies their impulses, so if any entry found its way into
+    // these containers we must NOT re-sum them (that would double-apply contact
+    // forces and destabilize the solve). The bridge that fills these containers
+    // (`bridge_solver_contact_forces`) writes them but they are consumed only via
+    // `force_container(ForceKind::Friction/ContactReaction)` queries, never here.
     let world_com = rb.mprops.world_com;
     for container in rb.force_containers.values() {
+        if container.kind() == ForceKind::Friction || container.kind() == ForceKind::ContactReaction {
+            continue;
+        }
         for c in container.contributions() {
             c.accumulate(&mut eff, world_com);
         }
@@ -300,4 +319,116 @@ pub fn drain_transient_forces(rb: &mut RigidBody) {
     // If nothing was actually cleared, avoid leaving a dangling mutable borrow
     // that some callers interpret as a modification.
     let _ = drained_any;
+}
+
+/// Bridge the contact solver's *emergent* normal + friction impulses into the
+/// `Friction` / `ContactReaction` force containers, as an **observation-only**
+/// readout.
+///
+/// These forces are produced by the solver every step and already applied to the
+/// bodies — they are NOT re-summed by [`compute_body_effective_forces`]. Writing
+/// them into dedicated containers lets application code inspect the per-step
+/// contact reaction / friction (e.g. for grip estimation, slip detection, or
+/// `ContactForceEvent`-driven force injection) without disturbing the solve.
+///
+/// Each kind is rebuilt fresh every step (matching the `Transient` lifecycle:
+/// the solver re-emerges them each step), so a sleeping pair that stops touching
+/// simply leaves no entry next step — no manual drain needed.
+///
+/// # Determinism
+///
+/// Must run **after** `build_islands_and_solve_velocity_constraints` on a single
+/// thread (the contact graph is not `Sync` and incremental graph maintenance
+/// assumes no concurrent edge mutation). Callers (the pipeline) already hold the
+/// whole `NarrowPhase` mutably here.
+pub fn bridge_solver_contact_forces(narrow_phase: &NarrowPhase, bodies: &mut RigidBodySet, dt: Real) {
+    let inv_dt = crate::utils::inv(dt);
+
+    for pair in narrow_phase.contact_pairs() {
+        // Reconstruct the per-pair world-space force by summing each contact's
+        // normal impulse (reaction) and tangential impulse (friction), scaled by
+        // inv_dt to convert impulse → force, and using the frozen lever arms
+        // (solver_dp1) for the torque.
+        let mut reaction = Vector::ZERO;
+        let mut friction = Vector::ZERO;
+        let mut r_torque = AngVector::default();
+        let mut f_torque = AngVector::default();
+
+        // Body handles come from each manifold's `ContactManifoldData` (a pair can
+        // span multiple manifolds, but they share the same two bodies).
+        let mut rb1 = None;
+        let mut rb2 = None;
+
+        for manifold in pair.solver_manifolds() {
+            let normal = manifold.data.normal;
+            let tangents = normal.orthonormal_basis();
+            for c in manifold.contacts() {
+                let jn = c.data.impulse * inv_dt;
+                // Physical contact reaction force on `rigid_body1` = `-normal * jn`
+                // (the contact pushes body1 *away* from body2; the solver's `impulse`
+                // is positive for compression). Force on body2 is the opposite.
+                let reaction_force = -normal * jn;
+                reaction += reaction_force;
+                // Friction force on body1 from the tangential impulse vector.
+                let jt = c.data.tangent_impulse;
+                #[cfg(feature = "dim2")]
+                let friction_force = -tangents[0] * jt.x * inv_dt;
+                #[cfg(feature = "dim3")]
+                let friction_force = -(tangents[0] * jt.x + tangents[1] * jt.y) * inv_dt;
+                friction += friction_force;
+
+                // Torque = r × F using the frozen lever arm (solver_dp1).
+                r_torque += c.data.solver_dp1.gcross(reaction_force);
+                f_torque += c.data.solver_dp1.gcross(friction_force);
+            }
+
+            if rb1.is_none() {
+                rb1 = manifold.data.rigid_body1;
+                rb2 = manifold.data.rigid_body2;
+            }
+        }
+
+        let (rb1, rb2) = match (rb1, rb2) {
+            (Some(h1), Some(h2)) => (h1, h2),
+            _ => continue,
+        };
+
+        // Body 1 gets +reaction / +friction; body 2 gets the opposite.
+        if let Some(rb) = bodies.get_mut(rb1) {
+            write_contact_observation(rb, reaction, friction, r_torque, f_torque);
+        }
+        if let Some(rb) = bodies.get_mut(rb2) {
+            write_contact_observation(rb, -reaction, -friction, -r_torque, -f_torque);
+        }
+    }
+}
+
+/// Push one pair's contact reaction + friction into the body's observation-only
+/// containers, rebuilding them each step (Transient lifecycle).
+fn write_contact_observation(
+    rb: &mut RigidBody,
+    reaction: Vector,
+    friction: Vector,
+    r_torque: AngVector,
+    f_torque: AngVector,
+) {
+    // Rebuild fresh: clear previous step's observation (it is solver-emergent,
+    // so it re-emerges from scratch each step).
+    rb.force_containers
+        .insert(ForceKind::ContactReaction, KindContainer::new(ForceKind::ContactReaction, Persistence::Transient));
+    rb.force_containers
+        .insert(ForceKind::Friction, KindContainer::new(ForceKind::Friction, Persistence::Transient));
+
+    if reaction.length_squared() > 0.0 {
+        rb.force_containers
+            .get_mut(&ForceKind::ContactReaction)
+            .unwrap()
+            .push(ForceEntry { id: 1, force: reaction, torque: r_torque, point: None });
+    }
+    if friction.length_squared() > 0.0 {
+        rb.force_containers
+            .get_mut(&ForceKind::Friction)
+            .unwrap()
+            .push(ForceEntry { id: 1, force: friction, torque: f_torque, point: None });
+    }
 }

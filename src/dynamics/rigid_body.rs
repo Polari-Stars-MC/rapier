@@ -55,6 +55,7 @@ pub struct RigidBody {
     /// Force containers, classified by [`ForceKind`]. Each is self-integrating
     /// and records its own [`Persistence`] (persistent forces survive across
     /// steps; transient forces drain every step). See `force_containers` module.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub(crate) force_containers: crate::dynamics::force_containers::BodyForceContainers,
     pub(crate) mprops: RigidBodyMassProps,
 
@@ -2387,14 +2388,14 @@ mod force_container_tests {
         ImpulseJointSet, IslandManager, MultibodyJointSet, RigidBodySet,
     };
     use crate::geometry::{ColliderSet, NarrowPhase};
-    use crate::math::{AngVector, Real, Vector};
+    use crate::math::{AngVector, Vector};
     use crate::prelude::{
         CCDSolver, ColliderBuilder, DefaultBroadPhase, IntegrationParameters, PhysicsPipeline,
         RigidBodyBuilder,
     };
 
     /// Build a minimal stepping context with no gravity.
-    fn step_context(gravity: Vector) -> (PhysicsPipeline, IslandManager, DefaultBroadPhase, NarrowPhase, ImpulseJointSet, MultibodyJointSet, CCDSolver, IntegrationParameters) {
+    fn step_context(_gravity: Vector) -> (PhysicsPipeline, IslandManager, DefaultBroadPhase, NarrowPhase, ImpulseJointSet, MultibodyJointSet, CCDSolver, IntegrationParameters) {
         (
             PhysicsPipeline::new(),
             IslandManager::new(),
@@ -2521,5 +2522,130 @@ mod force_container_tests {
         // Body should have fallen (negative Y velocity, lower Y position).
         assert!(bodies[h].linvel().y < 0.0, "gravity should pull the body down");
         assert!(bodies[h].translation().y < 10.0, "gravity should lower the body");
+    }
+
+    /// Contact reaction + friction are bridged into observation-only containers
+    /// when `bridge_contact_forces` is enabled, and do NOT perturb the physics
+    /// (the solver already applied the impulses — no double application).
+    #[test]
+    fn contact_forces_bridged_not_duplicated() {
+        use crate::dynamics::force_containers::ForceContainer;
+
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let (mut pipeline, mut islands, mut bf, mut nf, mut ij, mut mj, mut ccd, mut params) =
+            step_context(Vector::new(0.0, -9.81, 0.0));
+
+        // A ball resting on a fixed ground.
+        let ground = RigidBodyBuilder::fixed().build();
+        let gh = bodies.insert(ground);
+        colliders.insert_with_parent(ColliderBuilder::cuboid(10.0, 0.1, 10.0), gh, &mut bodies);
+
+        let ball = RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 0.5, 0.0)).build();
+        let bh = bodies.insert(ball);
+        colliders.insert_with_parent(ColliderBuilder::ball(0.5), bh, &mut bodies);
+
+        // Enable the bridge.
+        params.bridge_contact_forces = true;
+
+        // Step until the ball is supported by the ground (contact established).
+        for _ in 0..20 {
+            pipeline.step(Vector::new(0.0, -9.81, 0.0), &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders, &mut ij, &mut mj, &mut ccd, &(), &());
+        }
+
+        // The ball must be essentially stationary (not falling through), proving
+        // contact forces were applied by the SOLVER (not by our container).
+        let y = bodies[bh].translation().y;
+        assert!(y > 0.3 && y < 0.7, "ball should rest on ground, got y={}", y);
+
+        // The observation containers exist on the ball and report a non-zero
+        // contact reaction opposing gravity.
+        let reaction = bodies[bh]
+            .force_container(ForceKind::ContactReaction)
+            .expect("contact reaction container present");
+        assert!(!reaction.is_empty(), "contact reaction container should have an entry");
+        // Reaction on the ball points up (+Y) to counter gravity.
+        let rforce = reaction.contributions().next().unwrap().force();
+        assert!(rforce.y > 0.0, "contact reaction should point up, got {:?}", rforce);
+
+        // Friction container may be present (ball not sliding → small/zero, but
+        // the kind is bridged regardless). Just assert it exists and is transient.
+        let friction = bodies[bh]
+            .force_container(ForceKind::Friction)
+            .expect("friction container present");
+        assert_eq!(friction.persistence(), Persistence::Transient);
+
+        // Critically: these containers are NOT re-summed. If they were, the ball
+        // would be shoved (up by reaction) and fly off. Re-check it stays put.
+        for _ in 0..20 {
+            pipeline.step(Vector::new(0.0, -9.81, 0.0), &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders, &mut ij, &mut mj, &mut ccd, &(), &());
+        }
+        let y2 = bodies[bh].translation().y;
+        assert!((y2 - y).abs() < 0.2, "bridge must not double-apply contact forces (dy={})", y2 - y);
+    }
+
+    /// Without `bridge_contact_forces`, the contact containers are never populated.
+    #[test]
+    fn contact_forces_not_bridged_by_default() {
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let (mut pipeline, mut islands, mut bf, mut nf, mut ij, mut mj, mut ccd, params) =
+            step_context(Vector::new(0.0, -9.81, 0.0));
+
+        let ground = RigidBodyBuilder::fixed().build();
+        let gh = bodies.insert(ground);
+        colliders.insert_with_parent(ColliderBuilder::cuboid(10.0, 0.1, 10.0), gh, &mut bodies);
+
+        let ball = RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 0.5, 0.0)).build();
+        let bh = bodies.insert(ball);
+        colliders.insert_with_parent(ColliderBuilder::ball(0.5), bh, &mut bodies);
+
+        // Default: bridge disabled.
+        assert!(!params.bridge_contact_forces);
+
+        for _ in 0..20 {
+            pipeline.step(Vector::new(0.0, -9.81, 0.0), &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders, &mut ij, &mut mj, &mut ccd, &(), &());
+        }
+
+        assert!(
+            bodies[bh].force_container(ForceKind::ContactReaction).is_none()
+                || bodies[bh].force_container(ForceKind::ContactReaction).unwrap().is_empty(),
+            "contact reaction container must be empty when bridge is off"
+        );
+        // Physics still works (ball rests).
+        let y = bodies[bh].translation().y;
+        assert!(y > 0.3 && y < 0.7, "ball should still rest on ground, got y={}", y);
+    }
+
+    #[cfg(feature = "serde-serialize")]
+    #[test]
+    fn force_containers_serde_round_trip() {
+        use crate::dynamics::force_containers::{ForceContainer, Persistence};
+        use crate::prelude::RigidBodyBuilder;
+        use serde_json;
+
+        let mut rb = RigidBodyBuilder::dynamic().build();
+        // Add a persistent thrust container with one entry.
+        let id = rb.add_thrust(
+            0,
+            Vector::new(0.0, 10.0, 0.0),
+            AngVector::default(),
+            None,
+            Persistence::Persistent,
+            false,
+        );
+        assert!(id != 0);
+
+        let json = serde_json::to_string(&rb).expect("serialize RigidBody with force containers");
+        let rb2: crate::dynamics::RigidBody =
+            serde_json::from_str(&json).expect("deserialize RigidBody with force containers");
+
+        let c = rb2
+            .force_container(ForceKind::Thrust)
+            .expect("thrust container survives round-trip");
+        assert_eq!(c.persistence(), Persistence::Persistent);
+        assert_eq!(c.len(), 1);
+        let entry = c.contributions().next().expect("entry present");
+        assert!((entry.force().y - 10.0).abs() < 1e-9);
     }
 }

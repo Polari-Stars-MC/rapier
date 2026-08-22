@@ -409,6 +409,20 @@ impl PhysicsPipeline {
             events,
         );
 
+        // Bridge the solver-emergent contact normal / friction impulses into the
+        // observation-only `ContactReaction` / `Friction` force containers. Runs
+        // here (single-threaded, after the solve, with the full `NarrowPhase`
+        // still borrowed) so the contact graph is never mutated concurrently and
+        // the impulse data reflects this step's solve. These containers are NOT
+        // re-summed by the force pipeline (see `compute_body_effective_forces`).
+        if integration_parameters.bridge_contact_forces {
+            crate::dynamics::force_containers::bridge_solver_contact_forces(
+                narrow_phase,
+                bodies,
+                integration_parameters.dt,
+            );
+        }
+
         self.counters.stages.solver_time.pause();
     }
 }

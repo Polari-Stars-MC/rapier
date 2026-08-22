@@ -1078,6 +1078,11 @@ impl RigidBodyForces {
 
     /// Adds to `self` the gravitational force that would result in a gravitational acceleration
     /// equal to `gravity`.
+    ///
+    /// NOTE: superseded by the kind-classified force-container model
+    /// (`compute_body_effective_forces` in `force_containers`). Kept for API
+    /// compatibility; no longer called by the pipeline.
+    #[allow(dead_code)]
     pub fn compute_effective_force_and_torque(&mut self, gravity: Vector, mass: Vector) {
         self.force = self.user_force + gravity * mass * self.gravity_scale;
         self.torque = self.user_torque;

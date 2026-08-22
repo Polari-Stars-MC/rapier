@@ -301,6 +301,15 @@ pub struct IntegrationParameters {
     /// The type of friction constraints used in the simulation.
     #[cfg(feature = "dim3")]
     pub friction_model: FrictionModel,
+    /// If `true`, the contact solver's emergent normal + friction impulses are
+    /// bridged into the observation-only `ForceKind::ContactReaction` /
+    /// `ForceKind::Friction` containers each step (default: `false`).
+    ///
+    /// These containers are **never re-summed** into the effective force (the
+    /// solver already applies the impulses), so enabling this only exposes the
+    /// per-step contact reaction / friction for inspection. Disable to keep the
+    /// pre-existing contact behavior fully unchanged.
+    pub bridge_contact_forces: bool,
 }
 
 impl IntegrationParameters {
@@ -403,6 +412,7 @@ impl Default for IntegrationParameters {
             length_unit: 1.0,
             #[cfg(feature = "dim3")]
             friction_model: FrictionModel::default(),
+            bridge_contact_forces: false,
         }
     }
 }
