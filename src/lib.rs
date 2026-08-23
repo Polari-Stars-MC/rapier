@@ -150,10 +150,10 @@ pub mod counters;
 pub mod data;
 pub mod dynamics;
 pub mod geometry;
-pub mod pipeline;
-pub mod utils;
 /// Standalone dynamic linear-algebra layer (nalgebra replacement). See `src/linalg.rs`.
 pub mod linalg;
+pub mod pipeline;
+pub mod utils;
 
 /// Elementary mathematical entities (vectors, matrices, isometries, etc).
 pub mod math {
