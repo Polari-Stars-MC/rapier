@@ -482,7 +482,25 @@ impl PersistentIslands {
 
     /// Feeds one awake body's sleep eligibility into the scan.
     #[inline]
+    #[cfg(not(feature = "parallel"))]
     pub fn observe_body_for_sleep(&mut self, island_id: u32, eligible: bool) {
+        let slot = &mut self.sleep_scan[island_id as usize];
+        if slot.0 != self.sleep_scan_stamp {
+            *slot = (self.sleep_scan_stamp, eligible);
+            self.sleep_scan_touched.push(island_id);
+        } else {
+            slot.1 &= eligible;
+        }
+    }
+
+    /// Applies an already-folded per-island sleep eligibility (the AND of every
+    /// body in that island) into the scan. Used by the parallel observe path:
+    /// each rayon chunk folds its own observations locally, then the folded
+    /// values are merged here serially — this keeps `sleep_scan_touched` (a
+    /// shared `Vec`) free of data races while the fold itself runs in parallel.
+    #[inline]
+    #[cfg(feature = "parallel")]
+    pub fn apply_sleep_eligibility(&mut self, island_id: u32, eligible: bool) {
         let slot = &mut self.sleep_scan[island_id as usize];
         if slot.0 != self.sleep_scan_stamp {
             *slot = (self.sleep_scan_stamp, eligible);

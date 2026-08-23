@@ -51,13 +51,47 @@ impl IslandManager {
                 if sleeping_island {
                     let island = &mut self.persistent.islands[persistent_id as usize];
                     island.sleeping = false;
-                    // The island's bodies normally share one sleeping-chunk
-                    // container, but joint-merged sleeping islands can span
-                    // several: wake each body's chunk.
+                    // Per-body activation reset: each member maps to a distinct
+                    // body slot and `activation.wake_up` has no cross-body side
+                    // effects, so the reset is disjoint and safe to parallelize.
+                    // We borrow `bodies` through a raw pointer wrapped in a Sync
+                    // type — the same discipline as `SharedCtx` in the staged solver.
                     let handles = island.bodies.clone();
-                    for h in &handles {
-                        if let Some(rb) = bodies.get_mut(*h) {
-                            rb.activation.wake_up(true);
+                    #[cfg(feature = "parallel")]
+                    {
+                        // Pointer to the body set, held in an `AtomicPtr` so it
+                        // can cross the `rayon::broadcast` closure (which must be
+                        // `Sync`); raw `*mut` is not. The parallel reset only
+                        // touches disjoint body slots, so access is safe.
+                        let wb = core::sync::atomic::AtomicPtr::new(bodies as *mut RigidBodySet);
+                        let cursor = core::sync::atomic::AtomicUsize::new(0);
+                        const BLOCK: usize = 64;
+                        rayon::broadcast(|_| {
+                            loop {
+                                let start =
+                                    cursor.fetch_add(BLOCK, core::sync::atomic::Ordering::Relaxed);
+                                if start >= handles.len() {
+                                    break;
+                                }
+                                let end = (start + BLOCK).min(handles.len());
+                                for h in &handles[start..end] {
+                                    let ptr = wb.load(core::sync::atomic::Ordering::Relaxed);
+                                    // SAFETY: `handles` are distinct island members,
+                                    // each resolves to a distinct body slot; access is
+                                    // disjoint across worker threads.
+                                    if let Some(rb) = unsafe { (*ptr).get_mut_internal(*h) } {
+                                        rb.activation.wake_up(true);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    #[cfg(not(feature = "parallel"))]
+                    {
+                        for h in &handles {
+                            if let Some(rb) = bodies.get_mut_internal(*h) {
+                                rb.activation.wake_up(true);
+                            }
                         }
                     }
                     for h in handles {

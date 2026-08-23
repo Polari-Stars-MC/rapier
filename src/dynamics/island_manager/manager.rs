@@ -372,9 +372,39 @@ impl IslandManager {
         let mut chunks: Vec<Vec<RigidBodyHandle>> = Vec::new();
         if !sleep_observations.is_empty() {
             self.persistent.begin_sleep_scan();
-            for (island_id, eligible) in sleep_observations {
-                self.persistent
-                    .observe_body_for_sleep(*island_id, *eligible);
+            #[cfg(feature = "parallel")]
+            {
+                // Parallel fold: each chunk AND-folds its own observations into a
+                // per-island local map; the folded values are then merged serially
+                // via `apply_sleep_eligibility`, keeping the shared `sleep_scan_touched`
+                // Vec race-free (same two-pass pattern as `solve.rs`'s active-body loop).
+                use rayon::prelude::*;
+                let folded: Vec<std::collections::HashMap<u32, bool>> = sleep_observations
+                    .par_chunks(256)
+                    .map(|chunk| {
+                        let mut local: std::collections::HashMap<u32, bool> =
+                            std::collections::HashMap::new();
+                        for &(island_id, eligible) in chunk {
+                            local
+                                .entry(island_id)
+                                .and_modify(|e| *e &= eligible)
+                                .or_insert(eligible);
+                        }
+                        local
+                    })
+                    .collect();
+                for map in &folded {
+                    for (&island_id, &eligible) in map {
+                        self.persistent.apply_sleep_eligibility(island_id, eligible);
+                    }
+                }
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                for (island_id, eligible) in sleep_observations {
+                    self.persistent
+                        .observe_body_for_sleep(*island_id, *eligible);
+                }
             }
 
             let sleepable = self.persistent.finish_sleep_scan();
