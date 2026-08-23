@@ -41,8 +41,8 @@ use std::vec::Vec;
 #[cfg(feature = "serde-serialize")]
 use serde::{Deserialize, Serialize};
 
-use crate::dynamics::rigid_body::RigidBody;
 use crate::dynamics::RigidBodySet;
+use crate::dynamics::rigid_body::RigidBody;
 use crate::geometry::NarrowPhase;
 use crate::math::{AngVector, Real, Vector};
 use crate::utils::CrossProduct;
@@ -285,7 +285,8 @@ pub fn compute_body_effective_forces(rb: &mut RigidBody, gravity_container: &Kin
     // `force_container(ForceKind::Friction/ContactReaction)` queries, never here.
     let world_com = rb.mprops.world_com;
     for container in rb.force_containers.values() {
-        if container.kind() == ForceKind::Friction || container.kind() == ForceKind::ContactReaction {
+        if container.kind() == ForceKind::Friction || container.kind() == ForceKind::ContactReaction
+        {
             continue;
         }
         for c in container.contributions() {
@@ -341,7 +342,11 @@ pub fn drain_transient_forces(rb: &mut RigidBody) {
 /// thread (the contact graph is not `Sync` and incremental graph maintenance
 /// assumes no concurrent edge mutation). Callers (the pipeline) already hold the
 /// whole `NarrowPhase` mutably here.
-pub fn bridge_solver_contact_forces(narrow_phase: &NarrowPhase, bodies: &mut RigidBodySet, dt: Real) {
+pub fn bridge_solver_contact_forces(
+    narrow_phase: &NarrowPhase,
+    bodies: &mut RigidBodySet,
+    dt: Real,
+) {
     let inv_dt = crate::utils::inv(dt);
 
     for pair in narrow_phase.contact_pairs() {
@@ -414,21 +419,35 @@ fn write_contact_observation(
 ) {
     // Rebuild fresh: clear previous step's observation (it is solver-emergent,
     // so it re-emerges from scratch each step).
-    rb.force_containers
-        .insert(ForceKind::ContactReaction, KindContainer::new(ForceKind::ContactReaction, Persistence::Transient));
-    rb.force_containers
-        .insert(ForceKind::Friction, KindContainer::new(ForceKind::Friction, Persistence::Transient));
+    rb.force_containers.insert(
+        ForceKind::ContactReaction,
+        KindContainer::new(ForceKind::ContactReaction, Persistence::Transient),
+    );
+    rb.force_containers.insert(
+        ForceKind::Friction,
+        KindContainer::new(ForceKind::Friction, Persistence::Transient),
+    );
 
     if reaction.length_squared() > 0.0 {
         rb.force_containers
             .get_mut(&ForceKind::ContactReaction)
             .unwrap()
-            .push(ForceEntry { id: 1, force: reaction, torque: r_torque, point: None });
+            .push(ForceEntry {
+                id: 1,
+                force: reaction,
+                torque: r_torque,
+                point: None,
+            });
     }
     if friction.length_squared() > 0.0 {
         rb.force_containers
             .get_mut(&ForceKind::Friction)
             .unwrap()
-            .push(ForceEntry { id: 1, force: friction, torque: f_torque, point: None });
+            .push(ForceEntry {
+                id: 1,
+                force: friction,
+                torque: f_torque,
+                point: None,
+            });
     }
 }

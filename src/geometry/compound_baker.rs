@@ -13,9 +13,9 @@
 #![cfg(feature = "serde-serialize")]
 
 use crate::alloc_prelude::*;
+use crate::geometry::SharedShape;
 use crate::geometry::collider::ColliderBuilder;
 use crate::geometry::collider_components::ColliderMassProps;
-use crate::geometry::SharedShape;
 use serde::{Deserialize, Serialize};
 
 /// A serializable snapshot of a baked compound collider.

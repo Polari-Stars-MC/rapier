@@ -5,10 +5,10 @@ use simba::scalar::ComplexField;
 #[cfg(doc)]
 use super::IntegrationParameters;
 use crate::dynamics::{
-    force_containers::ForceContainer, LockedAxes, MassProperties, RigidBodyActivation,
-    RigidBodyAdditionalMassProps, RigidBodyCcd, RigidBodyChanges, RigidBodyColliders,
-    RigidBodyDamping, RigidBodyDominance, RigidBodyForces, RigidBodyIds, RigidBodyMassProps,
-    RigidBodyPosition, RigidBodyType, RigidBodyVelocity,
+    LockedAxes, MassProperties, RigidBodyActivation, RigidBodyAdditionalMassProps, RigidBodyCcd,
+    RigidBodyChanges, RigidBodyColliders, RigidBodyDamping, RigidBodyDominance, RigidBodyForces,
+    RigidBodyIds, RigidBodyMassProps, RigidBodyPosition, RigidBodyType, RigidBodyVelocity,
+    force_containers::ForceContainer,
 };
 use crate::geometry::{
     ColliderHandle, ColliderMassProps, ColliderParent, ColliderPosition, ColliderSet, ColliderShape,
@@ -100,8 +100,7 @@ impl RigidBody {
             vels: RigidBodyVelocity::default(),
             damping: RigidBodyDamping::default(),
             forces: RigidBodyForces::default(),
-            force_containers:
-                crate::dynamics::force_containers::BodyForceContainers::new(),
+            force_containers: crate::dynamics::force_containers::BodyForceContainers::new(),
             ccd: RigidBodyCcd::default(),
             ids: RigidBodyIds::default(),
             colliders: RigidBodyColliders::default(),
@@ -1285,7 +1284,10 @@ impl RigidBody {
     // drain automatically. See `crate::dynamics::force_containers`.
 
     /// Get a reference to this body's force container of the given kind, if any.
-    pub fn force_container(&self, kind: crate::dynamics::force_containers::ForceKind) -> Option<&crate::dynamics::force_containers::KindContainer> {
+    pub fn force_container(
+        &self,
+        kind: crate::dynamics::force_containers::ForceKind,
+    ) -> Option<&crate::dynamics::force_containers::KindContainer> {
         self.force_containers.get(&kind)
     }
 
@@ -1296,9 +1298,9 @@ impl RigidBody {
         kind: crate::dynamics::force_containers::ForceKind,
         persistence: crate::dynamics::force_containers::Persistence,
     ) -> &mut crate::dynamics::force_containers::KindContainer {
-        self.force_containers
-            .entry(kind)
-            .or_insert_with(|| crate::dynamics::force_containers::KindContainer::new(kind, persistence))
+        self.force_containers.entry(kind).or_insert_with(|| {
+            crate::dynamics::force_containers::KindContainer::new(kind, persistence)
+        })
     }
 
     /// Add a **persistent** thrust force (id-managed, survives across steps until
@@ -1320,7 +1322,12 @@ impl RigidBody {
         }
         let assigned = self
             .force_container_mut_with(ForceKind::Thrust, persistence)
-            .push(ForceEntry { id, force, torque, point });
+            .push(ForceEntry {
+                id,
+                force,
+                torque,
+                point,
+            });
         if wake_up {
             self.wake_up(true);
         }
@@ -2267,7 +2274,7 @@ pub(crate) fn gyroscopic_corrected_angvel(
     }
 }
 
-#[cfg(all(feature = "dim3"))]
+#[cfg(feature = "dim3")]
 #[cfg(test)]
 mod max_velocity_tests {
     use crate::dynamics::{ImpulseJointSet, IslandManager, MultibodyJointSet, RigidBodySet};
@@ -2370,9 +2377,7 @@ mod max_velocity_tests {
 
         let av = bodies[h].angvel();
         assert!(
-            av.x.abs() <= cap + 1.0e-6
-                && av.y.abs() <= cap + 1.0e-6
-                && av.z.abs() <= cap + 1.0e-6,
+            av.x.abs() <= cap + 1.0e-6 && av.y.abs() <= cap + 1.0e-6 && av.z.abs() <= cap + 1.0e-6,
             "angular speed {:?} exceeded max_angvel cap {}",
             av,
             cap
@@ -2384,9 +2389,7 @@ mod max_velocity_tests {
 #[cfg(test)]
 mod force_container_tests {
     use crate::dynamics::force_containers::{ForceContainer, ForceKind, Persistence};
-    use crate::dynamics::{
-        ImpulseJointSet, IslandManager, MultibodyJointSet, RigidBodySet,
-    };
+    use crate::dynamics::{ImpulseJointSet, IslandManager, MultibodyJointSet, RigidBodySet};
     use crate::geometry::{ColliderSet, NarrowPhase};
     use crate::math::{AngVector, Vector};
     use crate::prelude::{
@@ -2395,7 +2398,18 @@ mod force_container_tests {
     };
 
     /// Build a minimal stepping context with no gravity.
-    fn step_context(_gravity: Vector) -> (PhysicsPipeline, IslandManager, DefaultBroadPhase, NarrowPhase, ImpulseJointSet, MultibodyJointSet, CCDSolver, IntegrationParameters) {
+    fn step_context(
+        _gravity: Vector,
+    ) -> (
+        PhysicsPipeline,
+        IslandManager,
+        DefaultBroadPhase,
+        NarrowPhase,
+        ImpulseJointSet,
+        MultibodyJointSet,
+        CCDSolver,
+        IntegrationParameters,
+    ) {
         (
             PhysicsPipeline::new(),
             IslandManager::new(),
@@ -2421,25 +2435,60 @@ mod force_container_tests {
         colliders.insert_with_parent(ColliderBuilder::ball(0.5), h, &mut bodies);
 
         // One persistent thrust along +X. No per-step re-add.
-        bodies[h].add_thrust(1, Vector::new(10.0, 0.0, 0.0), AngVector::new(0.0, 0.0, 0.0), None, Persistence::Persistent, true);
+        bodies[h].add_thrust(
+            1,
+            Vector::new(10.0, 0.0, 0.0),
+            AngVector::new(0.0, 0.0, 0.0),
+            None,
+            Persistence::Persistent,
+            true,
+        );
 
         // Step once: body gains some +X velocity.
         let v0 = bodies[h].linvel().x;
         for _ in 0..1 {
-            pipeline.step(Vector::new(0.0, 0.0, 0.0), &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders, &mut ij, &mut mj, &mut ccd, &(), &());
+            pipeline.step(
+                Vector::new(0.0, 0.0, 0.0),
+                &params,
+                &mut islands,
+                &mut bf,
+                &mut nf,
+                &mut bodies,
+                &mut colliders,
+                &mut ij,
+                &mut mj,
+                &mut ccd,
+                &(),
+                &(),
+            );
         }
         let v1 = bodies[h].linvel().x;
         assert!(v1 > v0, "persistent thrust should accelerate the body");
 
         // Step several more times WITHOUT re-adding — thrust must persist.
         for _ in 0..5 {
-            pipeline.step(Vector::new(0.0, 0.0, 0.0), &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders, &mut ij, &mut mj, &mut ccd, &(), &());
+            pipeline.step(
+                Vector::new(0.0, 0.0, 0.0),
+                &params,
+                &mut islands,
+                &mut bf,
+                &mut nf,
+                &mut bodies,
+                &mut colliders,
+                &mut ij,
+                &mut mj,
+                &mut ccd,
+                &(),
+                &(),
+            );
         }
         let v2 = bodies[h].linvel().x;
         assert!(v2 > v1, "persistent thrust must keep acting without re-add");
 
         // The container is still present and persistent.
-        let c = bodies[h].force_container(ForceKind::Thrust).expect("thrust container exists");
+        let c = bodies[h]
+            .force_container(ForceKind::Thrust)
+            .expect("thrust container exists");
         assert_eq!(c.persistence(), Persistence::Persistent);
         assert_eq!(c.len(), 1);
     }
@@ -2457,17 +2506,49 @@ mod force_container_tests {
         colliders.insert_with_parent(ColliderBuilder::ball(0.5), h, &mut bodies);
 
         // Emit a transient event force.
-        bodies[h].emit_event_force(Vector::new(10.0, 0.0, 0.0), AngVector::new(0.0, 0.0, 0.0), None, ForceKind::Event, true);
+        bodies[h].emit_event_force(
+            Vector::new(10.0, 0.0, 0.0),
+            AngVector::new(0.0, 0.0, 0.0),
+            None,
+            ForceKind::Event,
+            true,
+        );
 
         // Step once — transient force applies this step.
-        pipeline.step(Vector::new(0.0, 0.0, 0.0), &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders, &mut ij, &mut mj, &mut ccd, &(), &());
+        pipeline.step(
+            Vector::new(0.0, 0.0, 0.0),
+            &params,
+            &mut islands,
+            &mut bf,
+            &mut nf,
+            &mut bodies,
+            &mut colliders,
+            &mut ij,
+            &mut mj,
+            &mut ccd,
+            &(),
+            &(),
+        );
         let v1 = bodies[h].linvel().x;
         assert!(v1 > 0.0, "transient event force should apply on its step");
 
         // Step again — the event force must be gone (auto-drained), so no further
         // acceleration from it. Velocity should stay ~constant (no damping here).
         let v_before = bodies[h].linvel().x;
-        pipeline.step(Vector::new(0.0, 0.0, 0.0), &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders, &mut ij, &mut mj, &mut ccd, &(), &());
+        pipeline.step(
+            Vector::new(0.0, 0.0, 0.0),
+            &params,
+            &mut islands,
+            &mut bf,
+            &mut nf,
+            &mut bodies,
+            &mut colliders,
+            &mut ij,
+            &mut mj,
+            &mut ccd,
+            &(),
+            &(),
+        );
         let v_after = bodies[h].linvel().x;
         assert!(
             (v_after - v_before).abs() < 1.0e-6,
@@ -2476,9 +2557,14 @@ mod force_container_tests {
         );
 
         // Container drained.
-        assert!(bodies[h].force_container(ForceKind::Event).is_none()
-            || bodies[h].force_container(ForceKind::Event).unwrap().is_empty(),
-            "transient event container should be empty after the step");
+        assert!(
+            bodies[h].force_container(ForceKind::Event).is_none()
+                || bodies[h]
+                    .force_container(ForceKind::Event)
+                    .unwrap()
+                    .is_empty(),
+            "transient event container should be empty after the step"
+        );
     }
 
     /// Removing a force entry stops it from acting.
@@ -2493,12 +2579,36 @@ mod force_container_tests {
         let h = bodies.insert(rb);
         colliders.insert_with_parent(ColliderBuilder::ball(0.5), h, &mut bodies);
 
-        let id = bodies[h].add_thrust(7, Vector::new(10.0, 0.0, 0.0), AngVector::new(0.0, 0.0, 0.0), None, Persistence::Persistent, true);
+        let id = bodies[h].add_thrust(
+            7,
+            Vector::new(10.0, 0.0, 0.0),
+            AngVector::new(0.0, 0.0, 0.0),
+            None,
+            Persistence::Persistent,
+            true,
+        );
         bodies[h].remove_force_by_kind(ForceKind::Thrust, id);
 
-        pipeline.step(Vector::new(0.0, 0.0, 0.0), &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders, &mut ij, &mut mj, &mut ccd, &(), &());
+        pipeline.step(
+            Vector::new(0.0, 0.0, 0.0),
+            &params,
+            &mut islands,
+            &mut bf,
+            &mut nf,
+            &mut bodies,
+            &mut colliders,
+            &mut ij,
+            &mut mj,
+            &mut ccd,
+            &(),
+            &(),
+        );
         let v = bodies[h].linvel().x;
-        assert!(v.abs() < 1.0e-6, "removed thrust must not accelerate the body (v={})", v);
+        assert!(
+            v.abs() < 1.0e-6,
+            "removed thrust must not accelerate the body (v={})",
+            v
+        );
     }
 
     /// Gravity is applied through the persistent gravity container every step
@@ -2511,17 +2621,38 @@ mod force_container_tests {
         let (mut pipeline, mut islands, mut bf, mut nf, mut ij, mut mj, mut ccd, params) =
             step_context(gravity);
 
-        let rb = RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 10.0, 0.0)).build();
+        let rb = RigidBodyBuilder::dynamic()
+            .translation(Vector::new(0.0, 10.0, 0.0))
+            .build();
         let h = bodies.insert(rb);
         colliders.insert_with_parent(ColliderBuilder::ball(0.5), h, &mut bodies);
 
         // No manual gravity re-apply; step several times.
         for _ in 0..5 {
-            pipeline.step(gravity, &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders, &mut ij, &mut mj, &mut ccd, &(), &());
+            pipeline.step(
+                gravity,
+                &params,
+                &mut islands,
+                &mut bf,
+                &mut nf,
+                &mut bodies,
+                &mut colliders,
+                &mut ij,
+                &mut mj,
+                &mut ccd,
+                &(),
+                &(),
+            );
         }
         // Body should have fallen (negative Y velocity, lower Y position).
-        assert!(bodies[h].linvel().y < 0.0, "gravity should pull the body down");
-        assert!(bodies[h].translation().y < 10.0, "gravity should lower the body");
+        assert!(
+            bodies[h].linvel().y < 0.0,
+            "gravity should pull the body down"
+        );
+        assert!(
+            bodies[h].translation().y < 10.0,
+            "gravity should lower the body"
+        );
     }
 
     /// Contact reaction + friction are bridged into observation-only containers
@@ -2541,7 +2672,9 @@ mod force_container_tests {
         let gh = bodies.insert(ground);
         colliders.insert_with_parent(ColliderBuilder::cuboid(10.0, 0.1, 10.0), gh, &mut bodies);
 
-        let ball = RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 0.5, 0.0)).build();
+        let ball = RigidBodyBuilder::dynamic()
+            .translation(Vector::new(0.0, 0.5, 0.0))
+            .build();
         let bh = bodies.insert(ball);
         colliders.insert_with_parent(ColliderBuilder::ball(0.5), bh, &mut bodies);
 
@@ -2550,23 +2683,47 @@ mod force_container_tests {
 
         // Step until the ball is supported by the ground (contact established).
         for _ in 0..20 {
-            pipeline.step(Vector::new(0.0, -9.81, 0.0), &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders, &mut ij, &mut mj, &mut ccd, &(), &());
+            pipeline.step(
+                Vector::new(0.0, -9.81, 0.0),
+                &params,
+                &mut islands,
+                &mut bf,
+                &mut nf,
+                &mut bodies,
+                &mut colliders,
+                &mut ij,
+                &mut mj,
+                &mut ccd,
+                &(),
+                &(),
+            );
         }
 
         // The ball must be essentially stationary (not falling through), proving
         // contact forces were applied by the SOLVER (not by our container).
         let y = bodies[bh].translation().y;
-        assert!(y > 0.3 && y < 0.7, "ball should rest on ground, got y={}", y);
+        assert!(
+            y > 0.3 && y < 0.7,
+            "ball should rest on ground, got y={}",
+            y
+        );
 
         // The observation containers exist on the ball and report a non-zero
         // contact reaction opposing gravity.
         let reaction = bodies[bh]
             .force_container(ForceKind::ContactReaction)
             .expect("contact reaction container present");
-        assert!(!reaction.is_empty(), "contact reaction container should have an entry");
+        assert!(
+            !reaction.is_empty(),
+            "contact reaction container should have an entry"
+        );
         // Reaction on the ball points up (+Y) to counter gravity.
         let rforce = reaction.contributions().next().unwrap().force();
-        assert!(rforce.y > 0.0, "contact reaction should point up, got {:?}", rforce);
+        assert!(
+            rforce.y > 0.0,
+            "contact reaction should point up, got {:?}",
+            rforce
+        );
 
         // Friction container may be present (ball not sliding → small/zero, but
         // the kind is bridged regardless). Just assert it exists and is transient.
@@ -2578,10 +2735,27 @@ mod force_container_tests {
         // Critically: these containers are NOT re-summed. If they were, the ball
         // would be shoved (up by reaction) and fly off. Re-check it stays put.
         for _ in 0..20 {
-            pipeline.step(Vector::new(0.0, -9.81, 0.0), &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders, &mut ij, &mut mj, &mut ccd, &(), &());
+            pipeline.step(
+                Vector::new(0.0, -9.81, 0.0),
+                &params,
+                &mut islands,
+                &mut bf,
+                &mut nf,
+                &mut bodies,
+                &mut colliders,
+                &mut ij,
+                &mut mj,
+                &mut ccd,
+                &(),
+                &(),
+            );
         }
         let y2 = bodies[bh].translation().y;
-        assert!((y2 - y).abs() < 0.2, "bridge must not double-apply contact forces (dy={})", y2 - y);
+        assert!(
+            (y2 - y).abs() < 0.2,
+            "bridge must not double-apply contact forces (dy={})",
+            y2 - y
+        );
     }
 
     /// Without `bridge_contact_forces`, the contact containers are never populated.
@@ -2596,7 +2770,9 @@ mod force_container_tests {
         let gh = bodies.insert(ground);
         colliders.insert_with_parent(ColliderBuilder::cuboid(10.0, 0.1, 10.0), gh, &mut bodies);
 
-        let ball = RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 0.5, 0.0)).build();
+        let ball = RigidBodyBuilder::dynamic()
+            .translation(Vector::new(0.0, 0.5, 0.0))
+            .build();
         let bh = bodies.insert(ball);
         colliders.insert_with_parent(ColliderBuilder::ball(0.5), bh, &mut bodies);
 
@@ -2604,17 +2780,39 @@ mod force_container_tests {
         assert!(!params.bridge_contact_forces);
 
         for _ in 0..20 {
-            pipeline.step(Vector::new(0.0, -9.81, 0.0), &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders, &mut ij, &mut mj, &mut ccd, &(), &());
+            pipeline.step(
+                Vector::new(0.0, -9.81, 0.0),
+                &params,
+                &mut islands,
+                &mut bf,
+                &mut nf,
+                &mut bodies,
+                &mut colliders,
+                &mut ij,
+                &mut mj,
+                &mut ccd,
+                &(),
+                &(),
+            );
         }
 
         assert!(
-            bodies[bh].force_container(ForceKind::ContactReaction).is_none()
-                || bodies[bh].force_container(ForceKind::ContactReaction).unwrap().is_empty(),
+            bodies[bh]
+                .force_container(ForceKind::ContactReaction)
+                .is_none()
+                || bodies[bh]
+                    .force_container(ForceKind::ContactReaction)
+                    .unwrap()
+                    .is_empty(),
             "contact reaction container must be empty when bridge is off"
         );
         // Physics still works (ball rests).
         let y = bodies[bh].translation().y;
-        assert!(y > 0.3 && y < 0.7, "ball should still rest on ground, got y={}", y);
+        assert!(
+            y > 0.3 && y < 0.7,
+            "ball should still rest on ground, got y={}",
+            y
+        );
     }
 
     #[cfg(feature = "serde-serialize")]

@@ -862,11 +862,7 @@ impl RigidBodyVelocity<Real> {
     /// `max_linvel` (its magnitude) and, in 3D, each angular-axis to the per-axis cap in
     /// `max_angvel`. `None` caps are treated as "no limit" for that component.
     #[cfg(feature = "dim2")]
-    pub fn clamp_magnitude(
-        &self,
-        max_linvel: Option<Real>,
-        max_angvel: Option<Real>,
-    ) -> Self {
+    pub fn clamp_magnitude(&self, max_linvel: Option<Real>, max_angvel: Option<Real>) -> Self {
         let mut linvel = self.linvel;
         if let Some(max) = max_linvel {
             let len = linvel.length();
@@ -887,11 +883,7 @@ impl RigidBodyVelocity<Real> {
     /// `max_linvel` (its magnitude) and each angular axis to the per-axis cap in `max_angvel`.
     /// `None` caps are treated as "no limit" for that component.
     #[cfg(feature = "dim3")]
-    pub fn clamp_magnitude(
-        &self,
-        max_linvel: Option<Real>,
-        max_angvel: Option<AngVector>,
-    ) -> Self {
+    pub fn clamp_magnitude(&self, max_linvel: Option<Real>, max_angvel: Option<AngVector>) -> Self {
         let mut linvel = self.linvel;
         if let Some(max) = max_linvel {
             let len = linvel.length();

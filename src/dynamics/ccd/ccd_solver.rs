@@ -181,7 +181,6 @@ impl CCDSolver {
             .filter(|h| bodies[*h].ccd.ccd_active)
             .partition(|h| !is_bullet(&bodies[*h]));
 
-
         let mut all_results = Vec::new();
 
         // Pass 1: fast non-bullet bodies vs fixed targets (all targets are stationary, so
@@ -346,18 +345,17 @@ impl CCDSolver {
     }
 }
 
-
-#[cfg(all(feature = "dim3"))]
+#[cfg(feature = "dim3")]
 #[cfg(test)]
 mod ccd_tests {
     use crate::dynamics::{ImpulseJointSet, IslandManager, MultibodyJointSet, RigidBodySet};
     use crate::geometry::{ColliderSet, NarrowPhase};
     use crate::math::Vector;
-    use std::vec::Vec;
     use crate::prelude::{
         CCDSolver, ColliderBuilder, DefaultBroadPhase, IntegrationParameters, PhysicsPipeline,
         RigidBodyBuilder,
     };
+    use std::vec::Vec;
 
     /// Regression test for #984 (CCD tunneling between two fast bodies).
     ///
@@ -563,4 +561,3 @@ mod ccd_tests {
         );
     }
 }
-

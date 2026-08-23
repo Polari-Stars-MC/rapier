@@ -2,8 +2,8 @@
 
 #![cfg(feature = "dim3")]
 
-use crate::dynamics::joint::{GenericJoint, GenericJointBuilder, JointAxesMask, MotorModel};
 use crate::dynamics::JointAxis;
+use crate::dynamics::joint::{GenericJoint, GenericJointBuilder, JointAxesMask, MotorModel};
 use crate::math::{Real, Vector};
 
 /// A wheel joint connecting two rigid-bodies, used for vehicle suspension and steering.
@@ -117,14 +117,18 @@ impl WheelJoint {
             stiffness,
             damping,
         );
-        self.data.set_motor_model(JointAxis::LinY, MotorModel::ForceBased);
+        self.data
+            .set_motor_model(JointAxis::LinY, MotorModel::ForceBased);
         self
     }
 
     /// Returns `(stiffness, damping)` of the suspension spring.
     #[must_use]
     pub fn suspension(&self) -> (Real, Real) {
-        let m = self.data.motor(JointAxis::LinY).expect("suspension axis is always motorized");
+        let m = self
+            .data
+            .motor(JointAxis::LinY)
+            .expect("suspension axis is always motorized");
         (m.stiffness, m.damping)
     }
 

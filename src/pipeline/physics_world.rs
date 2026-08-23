@@ -667,7 +667,6 @@ impl PhysicsWorld {
         self.narrow_phase.is_collision_enabled(collider1, collider2)
     }
 
-
     /// Iterate over all contact pairs involving the given collider.
     pub fn contact_pairs_with(
         &self,

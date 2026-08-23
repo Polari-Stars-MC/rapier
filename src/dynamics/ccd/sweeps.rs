@@ -13,8 +13,8 @@ use crate::pipeline::{ActiveHooks, PairFilterContext, PhysicsHooks};
 #[cfg(feature = "dim2")]
 use parry::query::sweep_toi::CORE_FRACTION;
 use parry::query::sweep_toi::{
-    Sweep, SweepCompositeFastShape, SweepToiOutput, SweepToiStatus, ToiProxy,
-    sweep_time_of_impact, sweep_time_of_impact_composite,
+    Sweep, SweepCompositeFastShape, SweepToiOutput, SweepToiStatus, ToiProxy, sweep_time_of_impact,
+    sweep_time_of_impact_composite,
 };
 use parry::query::{NonlinearRigidMotion, QueryDispatcher};
 use parry::shape::{Shape, TypedShape};
@@ -400,16 +400,14 @@ fn cast_sub_shape(
     is_pseudo: bool,
 ) -> Option<SweepToiOutput> {
     let output = match target {
-        TargetKind::Proxy(target_proxy) => {
-            sweep_time_of_impact(
-                target_proxy,
-                target_sweep,
-                &sub.proxy,
-                &sub.sweep,
-                max_fraction,
-                linear_slop,
-            )
-        }
+        TargetKind::Proxy(target_proxy) => sweep_time_of_impact(
+            target_proxy,
+            target_sweep,
+            &sub.proxy,
+            &sub.sweep,
+            max_fraction,
+            linear_slop,
+        ),
         TargetKind::Composite => {
             // Heightfields are treated as one-sided in 3D; oriented polylines and
             // oriented meshes enable the one-sided early-outs from their own flags inside

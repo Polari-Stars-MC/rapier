@@ -20,12 +20,12 @@ use crate::dynamics::solver::solver_contact_graph::{
 };
 use crate::dynamics::{IslandManager, RigidBodySet};
 use crate::geometry::{
-    ColliderGraphIndex, ColliderHandle, ColliderPair, ColliderSet, ContactData, ContactManifoldData,
-    ContactPair, InteractionGraph, IntersectionPair, SolverFlags,
+    ColliderGraphIndex, ColliderHandle, ColliderPair, ColliderSet, ContactData,
+    ContactManifoldData, ContactPair, InteractionGraph, IntersectionPair, SolverFlags,
 };
-use parry::utils::hashmap::HashMap;
 use alloc::sync::Arc;
 use parry::query::{DefaultQueryDispatcher, PersistentQueryDispatcher};
+use parry::utils::hashmap::HashMap;
 
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
@@ -477,22 +477,14 @@ impl NarrowPhase {
     ///
     /// This is symmetric: `disable_collision(a, b)` is equivalent to
     /// `disable_collision(b, a)`.
-    pub fn disable_collision(
-        &mut self,
-        collider1: ColliderHandle,
-        collider2: ColliderHandle,
-    ) {
+    pub fn disable_collision(&mut self, collider1: ColliderHandle, collider2: ColliderHandle) {
         self.disabled_collider_pairs
             .insert(Self::normalized_pair(collider1, collider2), ());
     }
 
     /// Re-enables collision detection between two specific colliders previously disabled
     /// via [`Self::disable_collision`].
-    pub fn enable_collision(
-        &mut self,
-        collider1: ColliderHandle,
-        collider2: ColliderHandle,
-    ) {
+    pub fn enable_collision(&mut self, collider1: ColliderHandle, collider2: ColliderHandle) {
         self.disabled_collider_pairs
             .remove(&Self::normalized_pair(collider1, collider2));
     }

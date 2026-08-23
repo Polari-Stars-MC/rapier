@@ -16,11 +16,11 @@ use crate::geometry::{
     BoundingVolume, ColliderChanges, ColliderPair, ColliderSet, ContactData, ContactManifoldData,
     ContactPair, SolverContact, SolverFlags,
 };
-use parry::utils::hashmap::HashMap;
 use crate::math::{MAX_MANIFOLD_POINTS, Real};
 use crate::pipeline::{ActiveHooks, ContactModificationContext, PairFilterContext, PhysicsHooks};
 use parry::query::PersistentQueryDispatcher;
 use parry::utils::PoseOpt;
+use parry::utils::hashmap::HashMap;
 
 /// Raw pointer to the per-pair solver hints, shared across parallel update workers.
 /// Safety: only sound if each thread accesses a disjoint set of hint slots.
@@ -61,6 +61,20 @@ pub(super) const OUTCOME_FULL_COMPOSITE: u8 = 5;
 // graph: `ContactPair::clear` destroys the `graph_pos` back-references the
 // incremental reconcile needs, so the graph must be rebuilt from scratch (rare).
 pub(super) const OUTCOME_CLEARED_IN_GRAPH: u8 = 6;
+
+/// How many of `pair`'s solver manifolds currently hold a solver-graph slot.
+///
+/// A generator that *rebuilds* its manifold list (`manifolds.clear()` then re-push — the
+/// voxel-ball path does this every step) hands back fresh `ContactManifoldData::default()`s,
+/// zeroing `graph_pos`. That orphans the pair's existing graph entries: incremental
+/// reconciliation diffs against `graph_pos`, so it can neither see nor evict them and
+/// inserts duplicates instead. A drop in this count across an update detects the wipe.
+fn num_in_solver_graph(pair: &ContactPair) -> usize {
+    pair.solver_manifolds()
+        .iter()
+        .filter(|m| m.data.graph_pos.is_some())
+        .count()
+}
 
 /// The per-pair contact update shared by `NarrowPhase::compute_contacts`'
 /// single-threaded and parallel dispatch paths; returns an `OUTCOME_*` tag.
@@ -173,6 +187,7 @@ pub(super) fn process_pair(
     }
 
     let had_any_active_contact = pair.has_any_active_contact();
+    let prev_in_graph = num_in_solver_graph(pair);
     let rb_handle1 = co1.parent.map(|p| p.handle);
     let rb_handle2 = co2.parent.map(|p| p.handle);
     let mut outcome = OUTCOME_SKIPPED;
@@ -690,10 +705,16 @@ pub(super) fn process_pair(
         }
     }
 
-    // Composite pairs have unstable manifold ordinals (see `OUTCOME_FULL_COMPOSITE`),
-    // so signal a full rebuild. Must be checked before the `FULL_CLEAN` shortcut: a
-    // surviving manifold can look "clean" while a dropped sibling leaked its graph slot.
-    if outcome == OUTCOME_FULL && pair.workspace.is_some() {
+    // Unstable manifold ordinals force a full solver-graph rebuild, and there are two
+    // sources. Composite pairs (persistent workspace) rebuild in BVH order; workspace-less
+    // generators can still wipe the list wholesale — `contact_manifolds_voxels_ball` does,
+    // every step — which shows up as a drop in the slot count (see `num_in_solver_graph`).
+    // Checked before the `FULL_CLEAN` shortcut: a surviving manifold can look "clean" while
+    // a dropped sibling leaked its graph slot.
+    if outcome == OUTCOME_FULL
+        && (pair.workspace.is_some()
+            || (prev_in_graph != 0 && num_in_solver_graph(pair) < prev_in_graph))
+    {
         return OUTCOME_FULL_COMPOSITE;
     }
     if outcome == OUTCOME_FULL && !membership_changed {

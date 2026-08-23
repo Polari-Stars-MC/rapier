@@ -190,8 +190,7 @@ mod test {
         for _ in 0..steps {
             world.step();
             rec.capture(&world);
-            recorded
-                .push(world.bodies.get(ball).unwrap().translation());
+            recorded.push(world.bodies.get(ball).unwrap().translation());
         }
 
         assert_eq!(rec.len(), steps);

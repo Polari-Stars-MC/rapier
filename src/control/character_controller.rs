@@ -1397,10 +1397,9 @@ mod test {
         // The floor lies in the +Y direction, i.e. along `-up`, so the character is grounded.
         assert!(movement.grounded);
     }
-
 }
 
-#[cfg(all(feature = "dim3"))]
+#[cfg(feature = "dim3")]
 #[cfg(test)]
 mod moving_platform_tests {
     use crate::control::KinematicCharacterController;
@@ -1510,16 +1509,26 @@ mod moving_platform_tests {
                 assert!(
                     (step_delta - expected_delta).abs() < 2.0e-2,
                     "character should track platform motion (speed {}, iter {}): delta={}, expected={}",
-                    platform_speed, i, step_delta, expected_delta
+                    platform_speed,
+                    i,
+                    step_delta,
+                    expected_delta
                 );
                 // And it must never sink below the platform's top face.
                 let platform_top = expected_platform_y + platform_half_height;
                 assert!(
                     char_pos.translation.y >= platform_top - 1.0e-3,
                     "character fell through platform (speed {}, iter {}): char_y={}, top={}",
-                    platform_speed, i, char_pos.translation.y, platform_top
+                    platform_speed,
+                    i,
+                    char_pos.translation.y,
+                    platform_top
                 );
-                assert!(movement.grounded, "character must stay grounded (speed {}, iter {})", platform_speed, i);
+                assert!(
+                    movement.grounded,
+                    "character must stay grounded (speed {}, iter {})",
+                    platform_speed, i
+                );
                 prev_char_y = char_pos.translation.y;
             }
         }
@@ -1530,6 +1539,4 @@ mod moving_platform_tests {
         // `max_correction = height * 0.25` cap for this character (would tunnel).
         run(10.0);
     }
-
-
 }

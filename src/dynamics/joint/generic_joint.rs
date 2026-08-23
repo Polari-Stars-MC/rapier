@@ -947,18 +947,16 @@ impl From<GenericJointBuilder> for GenericJoint {
     }
 }
 
-#[cfg(all(feature = "dim3"))]
+#[cfg(feature = "dim3")]
 #[cfg(test)]
 mod joint_query_force_tests {
-    use crate::dynamics::{
-        ImpulseJointSet, IslandManager, MultibodyJointSet, RigidBodySet,
-    };
+    use crate::dynamics::joint::{GenericJoint, JointAxesMask, JointAxis, MotorModel};
+    use crate::dynamics::{ImpulseJointSet, IslandManager, MultibodyJointSet, RigidBodySet};
     use crate::geometry::{ColliderSet, NarrowPhase};
     use crate::math::{AngVector, Vector, rotation_from_angle};
     use crate::prelude::{
         CCDSolver, DefaultBroadPhase, IntegrationParameters, PhysicsPipeline, RigidBodyBuilder,
     };
-    use crate::dynamics::joint::{GenericJoint, JointAxis, JointAxesMask, MotorModel};
 
     /// Issue #457: `set_motor_force` must configure a force-based motor (not a position/spring one).
     #[test]
@@ -996,13 +994,30 @@ mod joint_query_force_tests {
         let joint = GenericJoint::new(JointAxesMask::empty());
         // Coincident anchors, identity frames.
         let p0 = joint.position(&bodies[b1], &bodies[b2]);
-        assert!(p0.iter().all(|v| v.abs() < 1.0e-9), "coincident bodies => zero position, got {:?}", p0);
+        assert!(
+            p0.iter().all(|v| v.abs() < 1.0e-9),
+            "coincident bodies => zero position, got {:?}",
+            p0
+        );
 
         // Now rotate body2 by 90° about Y and step once so its pose is committed.
-        bodies[b2].set_rotation(rotation_from_angle(AngVector::new(0.0, std::f64::consts::FRAC_PI_2, 0.0)), true);
+        bodies[b2].set_rotation(
+            rotation_from_angle(AngVector::new(0.0, std::f64::consts::FRAC_PI_2, 0.0)),
+            true,
+        );
         pipeline.step(
-            gravity, &params, &mut islands, &mut bf, &mut nf, &mut bodies, &mut colliders,
-            &mut impulse_joints, &mut multibody_joints, &mut ccd, &(), &(),
+            gravity,
+            &params,
+            &mut islands,
+            &mut bf,
+            &mut nf,
+            &mut bodies,
+            &mut colliders,
+            &mut impulse_joints,
+            &mut multibody_joints,
+            &mut ccd,
+            &(),
+            &(),
         );
         let ang = joint.angles(&bodies[b1], &bodies[b2]);
         // The relative rotation about Y should be ~ +pi/2.

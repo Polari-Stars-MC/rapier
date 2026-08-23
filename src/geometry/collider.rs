@@ -823,11 +823,7 @@ impl ColliderBuilder {
     /// Initialize a new collider builder with a rounded cylindrical shape
     /// aligned with the `x` axis. See [`ColliderBuilder::cylinder_x`].
     #[cfg(feature = "dim3")]
-    pub fn round_cylinder_x(
-        half_height: Real,
-        radius: Real,
-        border_radius: Real,
-    ) -> Self {
+    pub fn round_cylinder_x(half_height: Real, radius: Real, border_radius: Real) -> Self {
         Self::round_cylinder(half_height, radius, border_radius).rotation(Vector::new(
             0.0,
             0.0,
@@ -838,11 +834,7 @@ impl ColliderBuilder {
     /// Initialize a new collider builder with a rounded cylindrical shape
     /// aligned with the `z` axis. See [`ColliderBuilder::cylinder_z`].
     #[cfg(feature = "dim3")]
-    pub fn round_cylinder_z(
-        half_height: Real,
-        radius: Real,
-        border_radius: Real,
-    ) -> Self {
+    pub fn round_cylinder_z(half_height: Real, radius: Real, border_radius: Real) -> Self {
         Self::round_cylinder(half_height, radius, border_radius).rotation(Vector::new(
             std::f64::consts::FRAC_PI_2,
             0.0,
@@ -1117,9 +1109,11 @@ impl ColliderBuilder {
         border_radius: Real,
     ) -> Self {
         match Self::sanitize_decomposition_input(vertices, indices) {
-            Some((v, i)) => {
-                Self::new(SharedShape::round_convex_decomposition(&v, &i, border_radius))
-            }
+            Some((v, i)) => Self::new(SharedShape::round_convex_decomposition(
+                &v,
+                &i,
+                border_radius,
+            )),
             None => Self::new(SharedShape::ball(0.0)), // degenerate input -> zero-radius ball (safe, no hull)
         }
     }
@@ -1132,9 +1126,9 @@ impl ColliderBuilder {
         params: &VHACDParameters,
     ) -> Self {
         match Self::sanitize_decomposition_input(vertices, indices) {
-            Some((v, i)) => {
-                Self::new(SharedShape::convex_decomposition_with_params(&v, &i, params))
-            }
+            Some((v, i)) => Self::new(SharedShape::convex_decomposition_with_params(
+                &v, &i, params,
+            )),
             None => Self::new(SharedShape::ball(0.0)), // degenerate input -> zero-radius ball (safe, no hull)
         }
     }
@@ -1149,7 +1143,10 @@ impl ColliderBuilder {
     ) -> Self {
         match Self::sanitize_decomposition_input(vertices, indices) {
             Some((v, i)) => Self::new(SharedShape::round_convex_decomposition_with_params(
-                &v, &i, params, border_radius,
+                &v,
+                &i,
+                params,
+                border_radius,
             )),
             None => Self::new(SharedShape::ball(0.0)), // degenerate input -> zero-radius ball (safe, no hull)
         }
@@ -1589,7 +1586,6 @@ impl From<ColliderBuilder> for Collider {
     }
 }
 
-
 #[cfg(test)]
 mod decomposition_tests {
     use super::*;
@@ -1660,9 +1656,9 @@ mod decomposition_tests {
 mod cylinder_epa_tests {
     use super::*;
     use glamx::glam::{DQuat, DVec3};
+    use parry::math::Pose;
     use parry::query::{Contact, DefaultQueryDispatcher, QueryDispatcher};
     use parry::shape::{Cuboid, Cylinder};
-    use parry::math::Pose;
 
     /// Regression test for upstream issue #305 ("Odd cylinder collisions"):
     /// a cylinder resting on a very large but very thin cuboid (e.g. a floor slab tilted
@@ -1706,7 +1702,9 @@ mod cylinder_epa_tests {
         assert!(
             vertical > horizontal,
             "contact normal should be dominantly vertical (support), got n=({:.3}, {:.3}, {:.3})",
-            n.x, n.y, n.z
+            n.x,
+            n.y,
+            n.z
         );
         // And it must actually be in contact (penetrating or touching), not separated.
         assert!(
@@ -1728,4 +1726,3 @@ mod cylinder_epa_tests {
         );
     }
 }
-

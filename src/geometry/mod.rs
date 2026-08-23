@@ -12,6 +12,8 @@ pub use self::collider_components::*;
 pub use self::collider_handle::ColliderHandle;
 #[cfg(feature = "alloc")]
 pub use self::collider_set::{ColliderSet, ModifiedColliders};
+#[cfg(all(feature = "alloc", feature = "serde-serialize"))]
+pub use self::compound_baker::BakedCompound;
 #[cfg(feature = "alloc")]
 pub(crate) use self::contact_pair::ContactRecycleState;
 #[cfg(feature = "alloc")]
@@ -26,6 +28,11 @@ pub use self::contact_pair::{
     SimdSolverContact, SolverContact, SolverContactGeneric, SolverContacts, SolverFlags, is_bouncy,
     is_bouncy_simd,
 };
+/// Direction-based convex hulls (k-DOP / FDH) and their preset enum.
+#[cfg(feature = "alloc")]
+pub use self::direction_hull::{
+    DirectionHull, FdhHull, KdopHull, KdopPreset, build_direction_hull,
+};
 #[cfg(feature = "alloc")]
 pub use self::interaction_graph::{
     ColliderGraphIndex, InteractionGraph, RigidBodyGraphIndex, TemporaryInteractionIndex,
@@ -35,14 +42,9 @@ pub use self::interaction_groups::{Group, InteractionGroups, InteractionTestMode
 pub use self::mesh_converter::{MeshConverter, MeshConverterError};
 #[cfg(feature = "alloc")]
 pub use self::narrow_phase::NarrowPhase;
-#[cfg(all(feature = "alloc", feature = "serde-serialize"))]
-pub use self::compound_baker::BakedCompound;
 /// User-space AABB spatial index (general R-tree over arbitrary `u64` ids).
 #[cfg(feature = "alloc")]
 pub use self::user_index::GenericAabbIndex;
-/// Direction-based convex hulls (k-DOP / FDH) and their preset enum.
-#[cfg(feature = "alloc")]
-pub use self::direction_hull::{build_direction_hull, DirectionHull, FdhHull, KdopHull, KdopPreset};
 #[cfg(feature = "alloc")]
 pub use parry::utils::Array2;
 
@@ -313,3 +315,6 @@ pub mod user_index;
 /// Direction-based convex hulls (k-DOP / FDH).
 #[cfg(feature = "alloc")]
 pub mod direction_hull;
+
+#[cfg(all(test, feature = "dim3", feature = "alloc"))]
+mod voxel_ball_tests;

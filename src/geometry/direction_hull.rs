@@ -96,10 +96,7 @@ pub fn kdop_directions(preset: KdopPreset) -> Vec<Vector> {
     }
 
     if matches!(preset, KdopPreset::K18 | KdopPreset::K26) {
-        directions.extend([
-            Vector::new(1.0, 1.0, 0.0),
-            Vector::new(1.0, -1.0, 0.0),
-        ]);
+        directions.extend([Vector::new(1.0, 1.0, 0.0), Vector::new(1.0, -1.0, 0.0)]);
     }
 
     if matches!(preset, KdopPreset::K26) {
