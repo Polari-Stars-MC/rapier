@@ -408,6 +408,223 @@ impl<'a, T: ComplexField<RealField = T> + Copy> DVectorViewMut<'a, T> {
     }
 }
 
+/// A dynamically-sized matrix stored **column-major** in a flat `Vec<T>`.
+///
+/// Indexing: element `(i, j)` (row `i`, column `j`) lives at `data[i + j * nrows]`.
+/// This matches `nalgebra`'s `VecStorage` layout so numeric kernels produce identical bits.
+#[derive(Clone, Debug, Default)]
+pub struct DMatrix<T: ComplexField<RealField = T> + Copy> {
+    /// Column-major element storage.
+    pub data: Vec<T>,
+    /// Number of rows.
+    pub nrows: usize,
+    /// Number of columns.
+    pub ncols: usize,
+}
+
+impl<T: ComplexField<RealField = T> + Copy> DMatrix<T> {
+    /// Creates a zero `nrows × ncols` matrix.
+    #[inline]
+    pub fn zeros(nrows: usize, ncols: usize) -> Self {
+        DMatrix {
+            data: vec![T::zero(); nrows * ncols],
+            nrows,
+            ncols,
+        }
+    }
+
+    /// Creates a matrix from row-major data (nalgebra's `from_row_slice` semantics).
+    #[inline]
+    pub fn from_row_slice(nrows: usize, ncols: usize, slice: &[T]) -> Self {
+        let mut data = vec![T::zero(); nrows * ncols];
+        for i in 0..nrows {
+            for j in 0..ncols {
+                data[i + j * nrows] = slice[i * ncols + j];
+            }
+        }
+        DMatrix { data, nrows, ncols }
+    }
+
+    /// Column-major raw pointer (for `matrixmultiply` delegation).
+    #[inline]
+    fn as_ptr(&self) -> *const T {
+        self.data.as_ptr()
+    }
+
+    /// Column-major raw mutable pointer.
+    #[inline]
+    fn as_mut_ptr(&mut self) -> *mut T {
+        self.data.as_mut_ptr()
+    }
+
+    /// Returns a copy of column `j`.
+    #[inline]
+    pub fn column(&self, j: usize) -> DVector<T> {
+        let start = j * self.nrows;
+        DVector {
+            data: self.data[start..start + self.nrows].to_vec(),
+        }
+    }
+
+    /// Returns a mutable view of column `j`.
+    #[inline]
+    pub fn column_mut(&mut self, j: usize) -> DVectorViewMut<'_, T> {
+        let start = j * self.nrows;
+        DVectorViewMut {
+            data: &mut self.data[start..start + self.nrows],
+        }
+    }
+
+    /// Fills every element with `value`.
+    #[inline]
+    pub fn fill(&mut self, value: T) {
+        for e in &mut self.data {
+            *e = value;
+        }
+    }
+
+    /// Copies the content of `other` (same dimensions) into `self`.
+    #[inline]
+    pub fn copy_from(&mut self, other: &DMatrix<T>) {
+        assert_eq!(
+            (self.nrows, self.ncols),
+            (other.nrows, other.ncols),
+            "copy_from dimension mismatch"
+        );
+        self.data.copy_from_slice(&other.data);
+    }
+
+    /// Returns an owned clone.
+    #[inline]
+    pub fn clone_owned(&self) -> DMatrix<T> {
+        DMatrix {
+            data: self.data.clone(),
+            nrows: self.nrows,
+            ncols: self.ncols,
+        }
+    }
+
+    /// Transpose (bit-identical to `nalgebra::Matrix::transpose` for the scalar case).
+    #[inline]
+    pub fn transpose(&self) -> DMatrix<T> {
+        let mut data = vec![T::zero(); self.nrows * self.ncols];
+        for j in 0..self.ncols {
+            for i in 0..self.nrows {
+                data[j + i * self.ncols] = self.data[i + j * self.nrows];
+            }
+        }
+        DMatrix {
+            data,
+            nrows: self.ncols,
+            ncols: self.nrows,
+        }
+    }
+
+    /// Computes `self = alpha * a * b + beta * self`, bit-identical to `nalgebra`'s `gemm`.
+    ///
+    /// Replicates `nalgebra`'s exact dispatch (blas_uninit.rs):
+    /// - large dynamic matrices → `matrixmultiply::dgemm` with column-major strides;
+    /// - otherwise → per-column `gemv`/`axcpy` loop.
+    #[inline]
+    pub fn gemm(&mut self, alpha: T, a: &DMatrix<T>, b: &DMatrix<T>, beta: T) {
+        let nrows1 = self.nrows;
+        let ncols1 = self.ncols;
+        let nrows2 = a.nrows;
+        let ncols2 = a.ncols;
+        let nrows3 = b.nrows;
+        let ncols3 = b.ncols;
+
+        assert_eq!(ncols2, nrows3, "gemm: dimensions mismatch for multiplication.");
+        assert_eq!(
+            (nrows1, ncols1),
+            (nrows2, ncols3),
+            "gemm: dimensions mismatch for addition."
+        );
+
+        const SMALL_DIM: usize = 5;
+
+        let large = nrows1 > SMALL_DIM
+            && ncols1 > SMALL_DIM
+            && nrows2 > SMALL_DIM
+            && ncols2 > SMALL_DIM;
+
+        if large {
+            // matrixmultiply path (identical to nalgebra for f64).
+            unsafe {
+                matrixmultiply::dgemm(
+                    nrows2,
+                    ncols2,
+                    ncols3,
+                    std::mem::transmute_copy(&alpha),
+                    a.as_ptr() as *const f64,
+                    1,
+                    nrows2 as isize,
+                    b.as_ptr() as *const f64,
+                    1,
+                    nrows3 as isize,
+                    std::mem::transmute_copy(&beta),
+                    self.as_mut_ptr() as *mut f64,
+                    1,
+                    nrows1 as isize,
+                );
+            }
+            return;
+        }
+
+        // Small/static fallback: per-column gemv, matching nalgebra's gemv_uninit/axcpy.
+        // NOTE: nalgebra passes the original `beta` to *every* column's gemv_uninit; the
+        // within-column first-iteration special-casing (beta only for j==0 of the inner
+        // loop, `1` thereafter) is handled inside gemv_column.
+        for j1 in 0..ncols1 {
+            let mut y = self.column_mut(j1);
+            let bcol = b.column(j1);
+            gemv_column(&mut y, alpha, a, &bcol, beta);
+        }
+    }
+}
+
+/// `y = alpha * a * x + beta * y`, matching nalgebra's `gemv_uninit`/`axcpy_uninit`.
+#[inline]
+fn gemv_column<T: ComplexField<RealField = T> + Copy>(
+    y: &mut DVectorViewMut<'_, T>,
+    alpha: T,
+    a: &DMatrix<T>,
+    x: &DVector<T>,
+    beta: T,
+) {
+    let ncols2 = a.ncols;
+    assert_eq!(a.nrows, y.data.len(), "gemv: row mismatch");
+    assert_eq!(ncols2, x.data.len(), "gemv: col mismatch");
+
+    for j in 0..ncols2 {
+        let a_col = a.column(j);
+        let c = x.data[j];
+        // y = alpha * a_col * c + (j==0 ? beta : 1) * y   (axcpy semantics)
+        let b = if j == 0 { beta } else { T::one() };
+        axcpy(y, alpha, &a_col, c, b);
+    }
+}
+
+/// `y = a * x * c + b * y`, matching nalgebra's `axcpy_uninit` (array_axcpy / array_axc).
+#[inline]
+fn axcpy<T: ComplexField<RealField = T> + Copy>(
+    y: &mut DVectorViewMut<'_, T>,
+    a: T,
+    x: &DVector<T>,
+    c: T,
+    b: T,
+) {
+    if !b.is_zero() {
+        for i in 0..x.data.len() {
+            y.data[i] = a * x.data[i] * c + b * y.data[i];
+        }
+    } else {
+        for i in 0..x.data.len() {
+            y.data[i] = a * x.data[i] * c;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,5 +689,52 @@ mod tests {
             }
             let _ = &mut s;
         }
+    }
+
+    #[test]
+    fn dmatrix_gemm_bit_identical() {
+        use nalgebra::DMatrix as NaDMatrix;
+
+        // exercise both paths: large (matrixmultiply) and small (gemv loop)
+        for (nr, nc, mk) in [(10usize, 10, 10), (4, 4, 4), (7, 3, 5), (6, 6, 6), (20, 20, 20)] {
+            let a: Vec<f64> = (0..nr * mk).map(|i| (i as f64) * 0.137 + 0.5).collect();
+            let b: Vec<f64> = (0..mk * nc).map(|i| (i as f64) * 0.731 - 0.3).collect();
+
+            for (alpha, beta) in [(1.0, 0.0), (2.0, 1.0), (1.0, 1.0), (0.5, -1.0)] {
+                // C starts zero (beta=0 path) or random (beta!=0 path)
+                let c0: Vec<f64> = (0..nr * nc).map(|i| (i as f64) * 0.21 - 0.7).collect();
+
+                let mut mine = DMatrix::from_row_slice(nr, nc, &c0);
+                let na_a = NaDMatrix::from_row_slice(nr, mk, &a);
+                let na_b = NaDMatrix::from_row_slice(mk, nc, &b);
+                let mut na_c = NaDMatrix::from_row_slice(nr, nc, &c0);
+
+                mine.gemm(alpha, &DMatrix::from_row_slice(nr, mk, &a), &DMatrix::from_row_slice(mk, nc, &b), beta);
+                na_c.gemm(alpha, &na_a, &na_b, beta);
+
+                for (m, n) in mine.data.iter().zip(na_c.iter()) {
+                    assert!(
+                        approx_eq_bits(*m, *n),
+                        "gemm ({},{},{}) alpha={} beta={} mismatch {} vs {}",
+                        nr, nc, mk, alpha, beta, m, n
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dmatrix_transpose_bit_identical() {
+        use nalgebra::DMatrix as NaDMatrix;
+        let r = 6usize;
+        let c = 4usize;
+        let data: Vec<f64> = (0..r * c).map(|i| (i as f64) * 0.37 + 1.1).collect();
+        let mine = DMatrix::from_row_slice(r, c, &data).transpose();
+        let na = NaDMatrix::from_row_slice(r, c, &data).transpose();
+        for (m, n) in mine.data.iter().zip(na.iter()) {
+            assert!(approx_eq_bits(*m, *n), "transpose mismatch {} vs {}", m, n);
+        }
+        assert_eq!(mine.nrows, c);
+        assert_eq!(mine.ncols, r);
     }
 }

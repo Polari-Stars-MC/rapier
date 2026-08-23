@@ -113,6 +113,7 @@ bincode = { workspace = true, optional = true }
 [target.'cfg(not(target_arch = "spirv"))'.dependencies]
 nalgebra = { workspace = true }
 glamx = { workspace = true, features = ["nalgebra"] }
+matrixmultiply = { workspace = true }
 
 [dev-dependencies]
 bincode.workspace = true
