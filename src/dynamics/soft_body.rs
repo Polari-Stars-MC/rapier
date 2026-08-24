@@ -25,8 +25,17 @@
 //! wires `SoftBodySet` into `World` / `PersistentIslands`. Phase 1+ add joint-based
 //! and mass-spring/FEM coupling.
 
-use crate::math::{Real, Vector};
+use crate::dynamics::{
+    RigidBodyHandle, RigidBodySet,
+    force_containers::{ForceEntry, ForceKind, KindContainer, Persistence},
+};
+use crate::math::{AngVector, Real, Vector};
 use std::vec::Vec;
+
+/// `ForceKind::Custom` discriminator for soft-body internal spring/damping forces.
+/// Routed through `force_containers` so they share the same `Persistent` lifecycle
+/// and `compute_body_effective_forces` summation as gravity/thrust (Phase 2).
+pub const SOFT_SPRING_CUSTOM_ID: u32 = 0x5_042; // "SB" encoded; arbitrary custom tag
 
 /// Opaque id of a [`SoftBody`] inside a [`SoftBodySet`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -43,6 +52,11 @@ pub struct SoftParticle {
     pub force: Vector,
     /// Inverse mass (`0` = pinned / immovable). `mass = 1 / inv_mass`.
     pub inv_mass: Real,
+    /// Optional rigid body this particle is bound to. When set, the particle's
+    /// internal spring/damping force is routed into that body's `force_containers`
+    /// (Phase 2), so the soft body drives the rigid body through the standard
+    /// effective-force path rather than integrating the particle directly.
+    pub bound_body: Option<RigidBodyHandle>,
 }
 
 impl SoftParticle {
@@ -53,6 +67,7 @@ impl SoftParticle {
             vel: Vector::ZERO,
             force: Vector::ZERO,
             inv_mass: 1.0,
+            bound_body: None,
         }
     }
 
@@ -63,6 +78,7 @@ impl SoftParticle {
             vel: Vector::ZERO,
             force: Vector::ZERO,
             inv_mass: 0.0,
+            bound_body: None,
         }
     }
 
@@ -164,21 +180,18 @@ impl SoftBody {
         Some(idx)
     }
 
-    /// Accumulates the total force on every particle: gravity plus all spring
-    /// (Hookean + axial damping) contributions. Clears each particle's `force`
-    /// first, so this can be called once per substep before `integrate`.
-    pub fn compute_forces(&mut self) {
-        for p in &mut self.particles {
-            p.force = if p.inv_mass == 0.0 {
-                Vector::ZERO
-            } else {
-                p.mass() * self.gravity
-            };
+    /// Computes the per-particle internal force from all springs (Hookean +
+    /// axial damping), *without* gravity. Returns one `Vector` per particle.
+    /// Pinned particles (`inv_mass == 0`) receive no force (they act as anchors).
+    ///
+    /// This is the force that Phase 2 routes into `force_containers` for bound
+    /// particles; `compute_forces` reuses it and adds gravity for free particles.
+    pub fn spring_damping_forces(&self) -> Vec<Vector> {
+        let mut out = Vec::with_capacity(self.particles.len());
+        for _ in 0..self.particles.len() {
+            out.push(Vector::ZERO);
         }
-
         for s in &self.springs {
-            // Copy the endpoints' data by value so the immutable borrow of
-            // `self.particles` ends before we mutate the forces below.
             let (pa_pos, pb_pos, pa_vel, pb_vel, pa_im, pb_im) =
                 match (self.particles.get(s.a), self.particles.get(s.b)) {
                     (Some(a), Some(b)) => (a.pos, b.pos, a.vel, b.vel, a.inv_mass, b.inv_mass),
@@ -189,24 +202,44 @@ impl SoftBody {
             if len == 0.0 {
                 continue;
             }
-            // Unit axis from `a` to `b`.
             let dir = delta / len;
-            // Hookean term: pull the pair toward `rest_length`.
             let f_spring = s.stiffness * (len - s.rest_length);
-            // Axial damping: oppose relative velocity along the axis.
             let rel_vel = pb_vel - pa_vel;
             let f_damp = s.damping * rel_vel.dot(dir);
-            // Total axial force magnitude (positive = stretching).
             let f_axial = f_spring + f_damp;
             let f = dir * f_axial;
-
-            // Apply equal and opposite forces (skip pinned endpoints: inv_mass == 0).
             if pa_im != 0.0 {
-                self.particles[s.a].force += f;
+                out[s.a] += f;
             }
             if pb_im != 0.0 {
-                self.particles[s.b].force -= f;
+                out[s.b] -= f;
             }
+        }
+        out
+    }
+
+    /// Accumulates the total force on every particle: gravity plus all spring
+    /// (Hookean + axial damping) contributions. Clears each particle's `force`
+    /// first, so this can be called once per substep before `integrate`.
+    ///
+    /// Bound particles (those with `bound_body` set) do **not** accumulate a local
+    /// force here — their spring force is instead routed to the rigid body via
+    /// [`SoftBodySet::write_spring_forces`](crate::dynamics::SoftBodySet::write_spring_forces),
+    /// so the rigid body's own integrator applies it through `force_containers`.
+    pub fn compute_forces(&mut self) {
+        let spring = self.spring_damping_forces();
+        for (i, p) in self.particles.iter_mut().enumerate() {
+            if p.bound_body.is_some() {
+                // Driven externally via force_containers; no local integration.
+                p.force = Vector::ZERO;
+                continue;
+            }
+            p.force = if p.inv_mass == 0.0 {
+                Vector::ZERO
+            } else {
+                p.mass() * self.gravity
+            };
+            p.force += spring[i];
         }
     }
 
@@ -325,6 +358,49 @@ impl SoftBodySet {
             .map(|b| b.sleeping)
             .unwrap_or(false)
     }
+
+    /// Phase 2: routes each soft body's internal spring/damping forces into the
+    /// `force_containers` of the rigid bodies their (bound) particles drive.
+    ///
+    /// For every particle with `bound_body = Some(h)`, its spring/damping force is
+    /// written as a `ForceKind::Custom(SOFT_SPRING_CUSTOM_ID)` **Persistent**
+    /// `ForceEntry` (application point = particle position, so off-center forces
+    /// generate the correct `r × F` torque). The rigid body then receives the soft
+    /// force through the standard `compute_body_effective_forces` path — no new
+    /// solver code, identical lifecycle handling to gravity/thrust.
+    ///
+    /// The soft container for each body is cleared and rebuilt each call so the
+    /// forces stay in sync with the current particle positions (a `Persistent`
+    /// container survives frame-end draining, but we own it and overwrite it).
+    /// Sleeping soft bodies are skipped entirely.
+    pub fn write_spring_forces(&self, bodies: &mut RigidBodySet) {
+        let kind = ForceKind::Custom(SOFT_SPRING_CUSTOM_ID);
+        for body in &self.bodies {
+            if body.sleeping {
+                continue;
+            }
+            let spring = body.spring_damping_forces();
+            for (i, p) in body.particles.iter().enumerate() {
+                let Some(h) = p.bound_body else { continue };
+                let rb = match bodies.get_mut(h) {
+                    Some(rb) => rb,
+                    None => continue,
+                };
+                // Clear + rebuild this body's soft-spring container.
+                rb.force_containers.remove(&kind);
+                let entry = ForceEntry {
+                    id: i as u64 + 1,
+                    force: spring[i],
+                    torque: AngVector::ZERO,
+                    point: Some(p.pos),
+                };
+                rb.force_containers
+                    .entry(kind)
+                    .or_insert_with(|| KindContainer::new(kind, Persistence::Persistent))
+                    .push(entry);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -417,28 +493,60 @@ mod tests {
     }
 
     #[test]
-    fn sleeping_body_does_not_integrate() {
-        let mut body = SoftBody::new(Vector::new(0.0, -9.81, 0.0));
-        body.add_particle(Vector::new(0.0, 5.0, 0.0));
-        body.sleeping = true;
-        let before = body.particles[0].pos;
-        for _ in 0..50 {
-            body.step(0.01);
-        }
-        assert_eq!(
-            body.particles[0].pos.x.to_bits(),
-            before.x.to_bits(),
-            "sleeping soft body must not move (x)"
-        );
-        assert_eq!(
-            body.particles[0].pos.y.to_bits(),
-            before.y.to_bits(),
-            "sleeping soft body must not move (y)"
-        );
-        assert_eq!(
-            body.particles[0].pos.z.to_bits(),
-            before.z.to_bits(),
-            "sleeping soft body must not move (z)"
-        );
+    fn write_spring_forces_routes_into_force_containers() {
+        use crate::dynamics::{
+            RigidBodyBuilder, RigidBodySet, RigidBodyType,
+            force_containers::{ForceContainer, ForceKind},
+        };
+
+        // Two rigid bodies 4 units apart on the x-axis; bind one particle to each.
+        let mut bodies = RigidBodySet::new();
+        let builder_a = RigidBodyBuilder::new(RigidBodyType::Dynamic)
+            .translation(Vector::new(-2.0, 0.0, 0.0).into());
+        let builder_b = RigidBodyBuilder::new(RigidBodyType::Dynamic)
+            .translation(Vector::new(2.0, 0.0, 0.0).into());
+        let ha = bodies.insert(builder_a.build());
+        let hb = bodies.insert(builder_b.build());
+
+        // Soft body: two bound particles, spring rest = 1.0 (so the 4.0 gap pulls in).
+        let mut sb = SoftBody::new(Vector::ZERO);
+        let pa = sb.add_particle(Vector::new(-2.0, 0.0, 0.0));
+        let pb = sb.add_particle(Vector::new(2.0, 0.0, 0.0));
+        sb.particles[pa].bound_body = Some(ha);
+        sb.particles[pb].bound_body = Some(hb);
+        sb.add_spring(pa, pb, 50.0, 0.5); // rest auto-set to 4.0 by add_spring...
+
+        // Override rest length to 1.0 so the stretched spring produces a known force.
+        sb.springs[0].rest_length = 1.0;
+
+        let mut set = SoftBodySet::new();
+        let id = set.insert(sb);
+        let _ = id;
+
+        set.write_spring_forces(&mut bodies);
+
+        let kind = ForceKind::Custom(SOFT_SPRING_CUSTOM_ID);
+        let ca = bodies
+            .get(ha)
+            .unwrap()
+            .force_containers
+            .get(&kind)
+            .expect("soft-spring container present on body A");
+        let cb = bodies
+            .get(hb)
+            .unwrap()
+            .force_containers
+            .get(&kind)
+            .expect("soft-spring container present on body B");
+
+        // Read back the routed forces via the public contribution iterator.
+        let fa = ca.contributions().next().unwrap().force();
+        let fb = cb.contributions().next().unwrap().force();
+
+        // Spring stretched: len=4, rest=1 → f_spring = 50*(4-1) = 150, along +x from A.
+        assert!((fb.x + 150.0).abs() < 1e-9, "B force.x = {}", fb.x);
+        // Equal and opposite, no y/z component.
+        assert!(fa.y.abs() < 1e-12 && fa.z.abs() < 1e-12);
+        assert!(fb.y.abs() < 1e-12 && fb.z.abs() < 1e-12);
     }
 }

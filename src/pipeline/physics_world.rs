@@ -148,6 +148,11 @@ impl PhysicsWorld {
     /// }
     /// ```
     pub fn step_with_events(&mut self, hooks: &dyn PhysicsHooks, events: &dyn EventHandler) {
+        // Phase 2: route bound soft-body spring/damping forces into the rigid
+        // bodies' `force_containers` *before* the pipeline integrates them, so the
+        // soft forces act on the rigid bodies through the standard effective-force
+        // path this step. Free (unbound) particles are integrated separately below.
+        self.soft_bodies.write_spring_forces(&mut self.bodies);
         self.physics_pipeline.step(
             self.gravity,
             &self.integration_parameters,
@@ -162,9 +167,8 @@ impl PhysicsWorld {
             hooks,
             events,
         );
-        // Phase 0b: advance soft bodies after the rigid-body pipeline. Soft bodies
-        // are stepped independently here; coupling to rigid bodies / collisions is a
-        // later phase. Sleeping bodies are skipped inside `SoftBodySet::step`.
+        // Phase 0b: advance free soft-body particles after the rigid-body pipeline.
+        // Sleeping bodies are skipped inside `SoftBodySet::step`.
         self.soft_bodies.step(self.integration_parameters.dt);
     }
 
