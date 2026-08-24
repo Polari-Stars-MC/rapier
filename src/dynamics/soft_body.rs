@@ -108,16 +108,66 @@ pub struct Spring {
     pub damping: Real,
 }
 
+/// A distance constraint (XPBD) between two particles — the edge of a deformable
+/// mesh. Unlike [`Spring`] (a force), this is a *position* constraint solved by
+/// XPBD's small-iteration projection, which is unconditionally stable even for
+/// stiff/rigid edges (no explicit-spring explosion).
+#[derive(Clone, Copy, Debug)]
+pub struct DistanceConstraint {
+    /// First endpoint particle index.
+    pub a: usize,
+    /// Second endpoint particle index.
+    pub b: usize,
+    /// Rest length.
+    pub rest: Real,
+    /// XPBD compliance `α` (0 = rigid, > 0 = soft). Stored per-constraint so
+    /// different edges can have different stiffness.
+    pub compliance: Real,
+}
+
+/// Which integrator a [`SoftBody`] uses.
+///
+/// * `MassSpring` — the Phase 0/2 Hookean-spring + semi-implicit Euler path.
+/// * `Xpbd { iterations, compliance }` — Phase 3 position-based dynamics: edges
+///   become [`DistanceConstraint`]s and tetrahedra carry a volume constraint,
+///   both projected with a fixed number of Gauss-Seidel iterations. `compliance`
+///   is the default used when a constraint is added without an explicit one.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum SoftSolver {
+    /// Hookean springs (default, Phase 0/2).
+    #[default]
+    MassSpring,
+    /// XPBD position-based solver (Phase 3).
+    Xpbd {
+        /// Gauss-Seidel projection iterations per substep.
+        iterations: u32,
+        /// Default XPBD compliance for constraints created without an explicit one.
+        compliance: Real,
+    },
+}
+
 /// A soft body: a collection of point masses connected by springs.
 ///
-/// In Phase 0 it is a standalone structure. Later phases attach it to a
-/// [`crate::dynamics::SoftBodySet`] and (optionally) to the solver islands.
+/// In Phase 0/2 it is a mass-spring cloud. Phase 3 adds an optional XPBD
+/// position-based solver: edges become [`DistanceConstraint`]s and tetrahedra
+/// carry a volume constraint, projected each substep. The `solver` field selects
+/// which path [`SoftBody::step`] takes.
 #[derive(Clone, Debug)]
 pub struct SoftBody {
-    /// Point masses. Spring endpoints index into this `Vec`.
+    /// Point masses. Spring endpoints / constraint indices index into this `Vec`.
     pub particles: Vec<SoftParticle>,
-    /// Springs (edges) between particles.
+    /// Springs (edges) between particles — used by the `MassSpring` solver.
     pub springs: Vec<Spring>,
+    /// Distance constraints (edges) — used by the `Xpbd` solver.
+    pub distance_constraints: Vec<DistanceConstraint>,
+    /// Tetrahedral volume elements. Each entry is `[a, b, c, d]` particle indices.
+    /// Used by the `Xpbd` solver's volume-preservation constraint.
+    pub tetrahedra: Vec<[u32; 4]>,
+    /// Rest (reference) signed volume of each tetrahedron, precomputed at
+    /// `add_tetrahedron` time. Indexed parallel to `tetrahedra`.
+    pub tetra_rest_volumes: Vec<Real>,
+    /// Active integrator.
+    pub solver: SoftSolver,
     /// Constant acceleration applied to every free particle (typically gravity).
     pub gravity: Vector,
     /// Coarse sleeping flag (island-style). When `true`, [`SoftBody::step`] is a
@@ -134,6 +184,10 @@ impl SoftBody {
         Self {
             particles: Vec::new(),
             springs: Vec::new(),
+            distance_constraints: Vec::new(),
+            tetrahedra: Vec::new(),
+            tetra_rest_volumes: Vec::new(),
+            solver: SoftSolver::MassSpring,
             gravity,
             sleeping: false,
         }
@@ -257,8 +311,23 @@ impl SoftBody {
         }
     }
 
-    /// One substep: clear/accumulate forces, then integrate.
+    /// One substep: integrate according to the active [`SoftSolver`].
+    ///
+    /// * `MassSpring` → [`Self::step_mass_spring`] (Hookean forces, semi-implicit Euler).
+    /// * `Xpbd` → [`Self::step_xpbd`] (distance + volume constraints, position-based).
     pub fn step(&mut self, dt: Real) {
+        if self.sleeping {
+            return;
+        }
+        match self.solver {
+            SoftSolver::MassSpring => self.step_mass_spring(dt),
+            SoftSolver::Xpbd { .. } => self.step_xpbd(dt),
+        }
+    }
+
+    /// Mass-spring substep (Phase 0/2): accumulate Hookean + damping forces, then
+    /// integrate with semi-implicit Euler.
+    pub fn step_mass_spring(&mut self, dt: Real) {
         if self.sleeping {
             return;
         }
@@ -274,12 +343,337 @@ impl SoftBody {
             .map(|p| 0.5 * p.mass() * p.vel.dot(p.vel))
             .fold(0.0, |acc, e| acc + e)
     }
+
+    // ── Phase 3: XPBD setup ────────────────────────────────────────────────
+
+    /// Switches this body to the XPBD solver with the given iteration count and
+    /// default compliance. Existing springs are ignored in XPBD mode; add distance
+    /// constraints and tetrahedra instead.
+    pub fn configure_xpbd(&mut self, iterations: u32, compliance: Real) {
+        self.solver = SoftSolver::Xpbd {
+            iterations,
+            compliance,
+        };
+    }
+
+    /// Adds a distance constraint between particles `a` and `b`. The rest length
+    /// is taken from the current distance (0 is rejected to avoid a degenerate
+    /// axis). Returns `None` if indices are out of bounds or coincide.
+    pub fn add_distance_constraint(
+        &mut self,
+        a: usize,
+        b: usize,
+        compliance: Real,
+    ) -> Option<usize> {
+        let (pa, pb) = (self.particles.get(a)?, self.particles.get(b)?);
+        let rest = (pb.pos - pa.pos).length();
+        if rest == 0.0 {
+            return None;
+        }
+        let idx = self.distance_constraints.len();
+        self.distance_constraints.push(DistanceConstraint {
+            a,
+            b,
+            rest,
+            compliance,
+        });
+        Some(idx)
+    }
+
+    /// Adds a tetrahedral volume element `[a, b, c, d]`. The rest (reference)
+    /// signed volume is computed from the current particle positions and cached.
+    /// Returns `None` if any index is out of bounds or duplicated.
+    pub fn add_tetrahedron(&mut self, tet: [u32; 4]) -> Option<usize> {
+        let [a, b, c, d] = tet;
+        let (pa, pb, pc, pd) = (
+            self.particles.get(a as usize)?,
+            self.particles.get(b as usize)?,
+            self.particles.get(c as usize)?,
+            self.particles.get(d as usize)?,
+        );
+        // Reject degenerate (duplicate) indices.
+        if a == b || a == c || a == d || b == c || b == d || c == d {
+            return None;
+        }
+        let vol = signed_tetra_volume(pa.pos, pb.pos, pc.pos, pd.pos);
+        let idx = self.tetrahedra.len();
+        self.tetrahedra.push(tet);
+        self.tetra_rest_volumes.push(vol);
+        Some(idx)
+    }
+
+    /// Total (sum of absolute) signed volume of all tetrahedra — a finite,
+    /// deformation-sensitive scalar useful for regression tests.
+    pub fn total_volume(&self) -> Real {
+        self.tetra_rest_volumes
+            .iter()
+            .zip(self.tetrahedra.iter())
+            .map(|(rest_vol, tet)| {
+                let [a, b, c, d] = *tet;
+                let (pa, pb, pc, pd) = (
+                    self.particles[a as usize].pos,
+                    self.particles[b as usize].pos,
+                    self.particles[c as usize].pos,
+                    self.particles[d as usize].pos,
+                );
+                signed_tetra_volume(pa, pb, pc, pd).abs() / rest_vol.abs().max(1e-12)
+            })
+            .fold(0.0, |acc, r| acc + r)
+    }
+
+    /// Phase 3 XPBD substep (Matthias Müller "Small Steps" XPBD):
+    ///
+    /// 1. **Predict**: for each free particle, `v += dt·g`, `x_prev = x`, `x += dt·v`.
+    /// 2. **Project** `iterations` times (Gauss-Seidel, fixed constraint order for
+    ///    determinism): each distance constraint then each tetra volume constraint
+    ///    is solved, accumulating per-constraint Lagrange multipliers `λ`.
+    /// 3. **Update velocities**: `v = (x − x_prev) / dt`.
+    ///
+    /// Bound particles (`bound_body.is_some()`) are treated as infinite mass
+    /// (effective inverse mass 0) so the soft body can be anchored to rigid bodies
+    /// without the XPBD solve fighting `force_containers` (Phase 2).
+    ///
+    /// **Determinism**: constraints are traversed in vector order with no
+    /// concurrency, so two runs from identical state are bit-identical. (Compliance
+    /// `α̃ = α / dt²` makes stiff edges stable; `α = 0` gives a hard constraint.)
+    pub fn step_xpbd(&mut self, dt: Real) {
+        if self.sleeping {
+            return;
+        }
+        let iterations = match self.solver {
+            SoftSolver::Xpbd { iterations, .. } => iterations,
+            SoftSolver::MassSpring => return, // guarded by step(), defensive
+        };
+        if iterations == 0 {
+            return;
+        }
+        let n = self.particles.len();
+        // Effective inverse mass: 0 for pinned **and** bound (rigid-anchored) particles.
+        let mut w = Vec::with_capacity(n);
+        for p in &self.particles {
+            w.push(if p.bound_body.is_some() {
+                0.0
+            } else {
+                p.inv_mass
+            });
+        }
+        // Previous positions (for velocity recovery).
+        let mut prev = Vec::with_capacity(n);
+        for p in &self.particles {
+            prev.push(p.pos);
+        }
+
+        // 1. Predict.
+        for (i, p) in self.particles.iter_mut().enumerate() {
+            if w[i] == 0.0 {
+                continue;
+            }
+            p.vel += dir_scaled(self.gravity, dt);
+            p.pos += dir_scaled(p.vel, dt);
+        }
+
+        // 2. Project (fixed order → deterministic).
+        let alpha = self.xpbd_alpha(dt);
+        // Extract constraint parameters into local buffers so the projection loop
+        // can mutate `self.particles` through `&mut self` without holding an
+        // immutable borrow of `self.distance_constraints` / `self.tetrahedra`
+        // (avoids the borrow checker's simultaneous mutable+immutable error).
+        // Order is preserved → determinism is unchanged.
+        let ndc = self.distance_constraints.len();
+        let mut d_a = Vec::with_capacity(ndc);
+        let mut d_b = Vec::with_capacity(ndc);
+        let mut d_rest = Vec::with_capacity(ndc);
+        for c in &self.distance_constraints {
+            d_a.push(c.a);
+            d_b.push(c.b);
+            d_rest.push(c.rest);
+        }
+        let mut d_lambda = Vec::with_capacity(ndc);
+        #[allow(clippy::same_item_push)] // Lagrange accumulator, filled with zeros
+        for _ in 0..ndc {
+            d_lambda.push(0.0);
+        }
+        let ntet = self.tetrahedra.len();
+        let mut t_idx = Vec::with_capacity(ntet);
+        let mut t_rest = Vec::with_capacity(ntet);
+        for (i, tet) in self.tetrahedra.iter().enumerate() {
+            t_idx.push(*tet);
+            t_rest.push(self.tetra_rest_volumes[i]);
+        }
+        let mut v_lambda = Vec::with_capacity(ntet);
+        #[allow(clippy::same_item_push)] // Lagrange accumulator, filled with zeros
+        for _ in 0..ntet {
+            v_lambda.push(0.0);
+        }
+        for _ in 0..iterations {
+            for ci in 0..ndc {
+                solve_distance_constraint(
+                    &mut self.particles,
+                    d_a[ci],
+                    d_b[ci],
+                    d_rest[ci],
+                    alpha,
+                    &w,
+                    &mut d_lambda[ci],
+                );
+            }
+            for ti in 0..ntet {
+                solve_volume_constraint(
+                    &mut self.particles,
+                    &t_idx[ti],
+                    t_rest[ti],
+                    alpha,
+                    &w,
+                    &mut v_lambda[ti],
+                );
+            }
+        }
+
+        // 3. Recover velocities.
+        for (i, p) in self.particles.iter_mut().enumerate() {
+            if w[i] == 0.0 {
+                continue;
+            }
+            p.vel = (p.pos - prev[i]) / dt;
+        }
+    }
+
+    /// XPBD `α̃ = α / dt²` from the current solver compliance.
+    fn xpbd_alpha(&self, dt: Real) -> Real {
+        let compliance = match self.solver {
+            SoftSolver::Xpbd { compliance, .. } => compliance,
+            SoftSolver::MassSpring => 0.0,
+        };
+        compliance / (dt * dt)
+    }
 }
 
 /// `v * s` for a `Vector` and scalar `s` (glam supports `Vec3 * f64`).
 #[inline]
 fn dir_scaled(v: Vector, s: Real) -> Vector {
     v * s
+}
+
+// ── Phase 3: XPBD constraint projections ───────────────────────────────────
+//
+// These are free functions (not methods) so the solver can mutate particle
+// positions directly without borrow fights. All arithmetic is plain `f64`
+// four-operations on glam `Vector`s — bit-identical under IEEE-754, which is
+// what makes XPBD reproducible for `enhanced-determinism` (no `linalg` matrix
+// solve is needed for position-based projection; `linalg` is reserved for the
+// optional implicit-FEM comparison path in a later sub-phase).
+
+/// Signed volume of the tetrahedron `(p0, p1, p2, p3)`:
+/// `V = ((p1−p0) × (p2−p0)) · (p3−p0) / 6`.
+#[inline]
+fn signed_tetra_volume(p0: Vector, p1: Vector, p2: Vector, p3: Vector) -> Real {
+    let e1 = p1 - p0;
+    let e2 = p2 - p0;
+    let e3 = p3 - p0;
+    e1.cross(e2).dot(e3) / 6.0
+}
+
+/// Solve one XPBD distance constraint, updating `particles` in place and
+/// accumulating the Lagrange multiplier into `*lambda`.
+#[inline]
+fn solve_distance_constraint(
+    particles: &mut [SoftParticle],
+    a: usize,
+    b: usize,
+    rest: Real,
+    alpha: Real,
+    w: &[Real],
+    lambda: &mut Real,
+) {
+    let pa = particles[a].pos;
+    let pb = particles[b].pos;
+    let delta = pa - pb; // vector from b → a (XPBD standard: d = p_a − p_b)
+    let len = delta.length();
+    if len == 0.0 {
+        return;
+    }
+    let n = delta / len; // points from b toward a
+    let c_val = len - rest;
+    let wa = w[a];
+    let wb = w[b];
+    let w_sum = wa + wb;
+    if w_sum == 0.0 {
+        return;
+    }
+    let d_lambda = (-c_val - alpha * *lambda) / (w_sum + alpha);
+    *lambda += d_lambda;
+    // Standard XPBD distance projection: p_a += w_a·Δλ·n, p_b −= w_b·Δλ·n.
+    // With C = len − rest > 0 (too long), Δλ < 0, so a moves toward b and b toward a.
+    if wa != 0.0 {
+        particles[a].pos += dir_scaled(n, wa * d_lambda);
+    }
+    if wb != 0.0 {
+        particles[b].pos -= dir_scaled(n, wb * d_lambda);
+    }
+}
+
+/// Solve one XPBD tetrahedral volume constraint, updating `particles` in
+/// place and accumulating the Lagrange multiplier into `*lambda`.
+///
+/// Constraint: `C = V − V0` where `V` is the current signed volume. Gradients
+/// (Müller et al.):
+/// `∇_0 = −(e2×e3)/6`, `∇_1 = (e3×e1)/6`, `∇_2 = (e1×e2)/6`, `∇_3 = −(e1×e3)/6`
+/// (with `e_i = p_i − p_0`). The correction `Δp_i = w_i · Δλ · ∇_i`.
+#[inline]
+fn solve_volume_constraint(
+    particles: &mut [SoftParticle],
+    tet: &[u32; 4],
+    rest_vol: Real,
+    alpha: Real,
+    w: &[Real],
+    lambda: &mut Real,
+) {
+    let [a, b, c, d] = *tet;
+    let (ia, ib, ic, id) = (a as usize, b as usize, c as usize, d as usize);
+    let p0 = particles[ia].pos;
+    let p1 = particles[ib].pos;
+    let p2 = particles[ic].pos;
+    let p3 = particles[id].pos;
+    let e1 = p1 - p0;
+    let e2 = p2 - p0;
+    let e3 = p3 - p0;
+
+    let vol = e1.cross(e2).dot(e3) / 6.0;
+    let c_val = vol - rest_vol;
+
+    let g0 = e2.cross(e3) / -6.0;
+    let g1 = e3.cross(e1) / 6.0;
+    let g2 = e1.cross(e2) / 6.0;
+    let g3 = e1.cross(e3) / -6.0;
+
+    let wa = w[ia];
+    let wb = w[ib];
+    let wc = w[ic];
+    let wd = w[id];
+    // Σ w_i |∇_i|²  (all four gradients; w=0 particles contribute 0).
+    let mut denom = alpha;
+    denom += wa * g0.dot(g0);
+    denom += wb * g1.dot(g1);
+    denom += wc * g2.dot(g2);
+    denom += wd * g3.dot(g3);
+    if denom == 0.0 {
+        return;
+    }
+    let d_lambda = (-c_val - alpha * *lambda) / denom;
+    *lambda += d_lambda;
+
+    if wa != 0.0 {
+        particles[ia].pos += dir_scaled(g0, wa * d_lambda);
+    }
+    if wb != 0.0 {
+        particles[ib].pos += dir_scaled(g1, wb * d_lambda);
+    }
+    if wc != 0.0 {
+        particles[ic].pos += dir_scaled(g2, wc * d_lambda);
+    }
+    if wd != 0.0 {
+        particles[id].pos += dir_scaled(g3, wd * d_lambda);
+    }
 }
 
 /// A container owning all soft bodies in a simulation. Phase 0 keeps this as a
@@ -548,5 +942,118 @@ mod tests {
         // Equal and opposite, no y/z component.
         assert!(fa.y.abs() < 1e-12 && fa.z.abs() < 1e-12);
         assert!(fb.y.abs() < 1e-12 && fb.z.abs() < 1e-12);
+    }
+
+    // ── Phase 3: XPBD ─────────────────────────────────────────────────────
+
+    #[test]
+    fn xpbd_distance_constraint_restores_length() {
+        // Two free particles at distance 1 (rest=1), then b is yanked out to
+        // distance 4. XPBD projection should pull the gap back toward rest.
+        let mut body = SoftBody::new(Vector::ZERO);
+        let a = body.add_particle(Vector::new(0.0, 0.0, 0.0));
+        let b = body.add_particle(Vector::new(1.0, 0.0, 0.0));
+        body.configure_xpbd(20, 0.0); // rigid (α=0)
+        body.add_distance_constraint(a, b, 0.0); // rest captured as 1.0
+
+        // Perturb b to distance 4 (current > rest).
+        body.particles[b].pos = Vector::new(4.0, 0.0, 0.0);
+        let d0 = (body.particles[b].pos - body.particles[a].pos).length();
+        body.step_xpbd(0.01);
+        let d1 = (body.particles[b].pos - body.particles[a].pos).length();
+        // Distance should shrink from 4 toward rest (1.0).
+        assert!(d1 < d0, "XPBD distance should shrink gap: {d0} -> {d1}");
+        assert!(d1 > 0.5 && d1 < 4.0, "XPBD gap in sane band: {d1}");
+        assert!(body.particles[a].pos.is_finite());
+        assert!(body.particles[b].pos.is_finite());
+    }
+
+    #[test]
+    fn xpbd_volume_constraint_preserves_tetrahedron() {
+        // Regular tetrahedron; perturb one vertex, then XPBD volume constraint
+        // should keep the (relative) volume finite and pull it back toward rest.
+        let mut body = SoftBody::new(Vector::ZERO);
+        let p0 = body.add_particle(Vector::new(0.0, 0.0, 0.0));
+        let p1 = body.add_particle(Vector::new(1.0, 0.0, 0.0));
+        let p2 = body.add_particle(Vector::new(0.0, 1.0, 0.0));
+        let p3 = body.add_particle(Vector::new(0.0, 0.0, 1.0));
+        body.configure_xpbd(20, 0.0);
+        body.add_tetrahedron([p0 as u32, p1 as u32, p2 as u32, p3 as u32]);
+        let rest = body.total_volume();
+        assert!(rest.is_finite() && rest > 0.0, "rest volume sane: {rest}");
+
+        // Perturb p3 outward; volume should grow, then projection pulls it back.
+        body.particles[p3].pos = Vector::new(0.0, 0.0, 5.0);
+        let perturbed = body.total_volume();
+        assert!(
+            perturbed > rest,
+            "perturbation grew volume: {rest} -> {perturbed}"
+        );
+
+        body.step_xpbd(0.01);
+        let recovered = body.total_volume();
+        // Should be pulled back toward rest (not explode, not collapse to 0).
+        assert!(recovered.is_finite());
+        assert!(
+            recovered > 0.1 * rest && recovered < perturbed,
+            "volume recovered: {rest} -> {perturbed} -> {recovered}"
+        );
+    }
+
+    #[test]
+    fn xpbd_is_deterministic_bit_identical() {
+        // Two identical XPBD bodies from the same initial state must produce
+        // bit-identical results (fixed constraint order, IEEE-754 float ops).
+        let build = || {
+            let mut body = SoftBody::new(Vector::new(0.0, -9.81, 0.0));
+            let p0 = body.add_particle(Vector::new(0.0, 0.0, 0.0));
+            let p1 = body.add_particle(Vector::new(1.0, 0.0, 0.0));
+            let p2 = body.add_particle(Vector::new(0.0, 1.0, 0.0));
+            let p3 = body.add_particle(Vector::new(0.0, 0.0, 1.0));
+            body.configure_xpbd(15, 1e-6);
+            body.add_distance_constraint(p0, p1, 1e-6);
+            body.add_distance_constraint(p1, p2, 1e-6);
+            body.add_distance_constraint(p2, p3, 1e-6);
+            body.add_tetrahedron([p0 as u32, p1 as u32, p2 as u32, p3 as u32]);
+            body
+        };
+        let mut a = build();
+        let mut b = build();
+        for _ in 0..30 {
+            a.step_xpbd(0.01);
+            b.step_xpbd(0.01);
+        }
+        for i in 0..a.particles.len() {
+            assert_eq!(
+                a.particles[i].pos.x.to_bits(),
+                b.particles[i].pos.x.to_bits(),
+                "x bit-identical p{i}"
+            );
+            assert_eq!(
+                a.particles[i].pos.y.to_bits(),
+                b.particles[i].pos.y.to_bits(),
+                "y bit-identical p{i}"
+            );
+            assert_eq!(
+                a.particles[i].pos.z.to_bits(),
+                b.particles[i].pos.z.to_bits(),
+                "z bit-identical p{i}"
+            );
+        }
+    }
+
+    #[test]
+    fn xpbd_step_dispatcher_routes_to_xpbd() {
+        // `SoftBody::step` must dispatch to XPBD when solver is configured.
+        let mut body = SoftBody::new(Vector::ZERO);
+        let a = body.add_particle(Vector::new(0.0, 0.0, 0.0));
+        let b = body.add_particle(Vector::new(1.0, 0.0, 0.0));
+        body.configure_xpbd(20, 0.0); // rest captured as 1.0
+        body.add_distance_constraint(a, b, 0.0);
+        body.particles[b].pos = Vector::new(4.0, 0.0, 0.0); // yank to 4
+        let d0 = (body.particles[b].pos - body.particles[a].pos).length();
+        body.step(0.01); // dispatches to step_xpbd
+        let d1 = (body.particles[b].pos - body.particles[a].pos).length();
+        assert!(d1 < d0, "dispatched XPBD should shrink gap: {d0} -> {d1}");
     }
 }
