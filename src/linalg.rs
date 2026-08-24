@@ -154,7 +154,7 @@ impl<T: ComplexField<RealField = T> + Copy> DVector<T> {
     /// Computes `self = alpha * a * x + beta * self`, bit-identical to `nalgebra`'s vector `gemv`.
     /// `a` is a column-readable matrix (`ColAccess`), `x` a vector. Generic over matrix kind.
     #[inline]
-    pub fn gemv<M: ColAccess<T>>(&mut self, alpha: T, a: &M, x: &DVector<T>, beta: T) {
+    pub fn gemv<M: ColAccess<T>>(&mut self, alpha: T, a: &M, x: &DVectorView<T>, beta: T) {
         let n = a.ncols();
         assert_eq!(a.nrows(), self.data.len(), "gemv: row mismatch");
         assert_eq!(n, x.data.len(), "gemv: col mismatch");
@@ -167,11 +167,48 @@ impl<T: ComplexField<RealField = T> + Copy> DVector<T> {
         }
     }
 
+    /// Borrows this vector as an immutable view.
+    #[inline]
+    pub fn as_view(&self) -> DVectorView<'_, T> {
+        DVectorView { data: &self.data }
+    }
+
     /// Transpose (vector → 1×n matrix view). Implemented at the matrix level; here returns self.
     #[inline]
     pub fn transpose(&self) -> DVector<T> {
         DVector {
             data: self.data.clone(),
+        }
+    }
+
+    /// Builds a vector of length `n` where element `i` is `f(i)`.
+    #[inline]
+    pub fn from_fn(n: usize, mut f: impl FnMut(usize) -> T) -> DVector<T> {
+        let data = (0..n).map(&mut f).collect();
+        DVector { data }
+    }
+
+    /// Returns an owned copy of rows `first..first+n`.
+    #[inline]
+    pub fn rows_owned(&self, first: usize, n: usize) -> DVector<T> {
+        DVector {
+            data: self.data[first..first + n].to_vec(),
+        }
+    }
+}
+
+impl<T: ComplexField<RealField = T> + Copy> From<Vec<T>> for DVector<T> {
+    #[inline]
+    fn from(v: Vec<T>) -> DVector<T> {
+        DVector { data: v }
+    }
+}
+
+impl<T: ComplexField<RealField = T> + Copy> From<&[T]> for DVector<T> {
+    #[inline]
+    fn from(v: &[T]) -> DVector<T> {
+        DVector {
+            data: v.to_vec(),
         }
     }
 }
@@ -317,7 +354,7 @@ impl<T: ComplexField<RealField = T> + Copy> DVector<T> {
     /// Computes `self = alpha * a.transpose() * x + beta * self`, bit-identical to
     /// `nalgebra`'s vector `gemv_tr`. `a` is a column-readable matrix (`ColAccess`).
     #[inline]
-    pub fn gemv_tr<M: ColAccess<T>>(&mut self, alpha: T, a: &M, x: &DVector<T>, beta: T) {
+    pub fn gemv_tr<M: ColAccess<T>>(&mut self, alpha: T, a: &M, x: &DVectorView<T>, beta: T) {
         let mut v = DVectorViewMut {
             data: self.as_mut_slice(),
         };
@@ -379,6 +416,14 @@ impl<'a, T: ComplexField<RealField = T> + Copy + PartialOrd> DVectorView<'a, T> 
     #[inline]
     pub fn copy_to(&self, dst: &mut DVector<T>) {
         dst.data.copy_from_slice(self.data);
+    }
+}
+
+impl<T: ComplexField<RealField = T> + Copy> std::ops::Index<usize> for DVectorView<'_, T> {
+    type Output = T;
+    #[inline]
+    fn index(&self, i: usize) -> &T {
+        &self.data[i]
     }
 }
 
@@ -456,18 +501,76 @@ impl<'a, T: ComplexField<RealField = T> + Copy> DVectorViewMut<'a, T> {
     /// Computes `self = alpha * a.transpose() * x + beta * self`, bit-identical to
     /// `nalgebra`'s vector `gemv_tr`. `a` is a column-readable matrix (`ColAccess`).
     #[inline]
-    pub fn gemv_tr<M: ColAccess<T>>(&mut self, alpha: T, a: &M, x: &DVector<T>, beta: T) {
+    pub fn gemv_tr<M: ColAccess<T>>(&mut self, alpha: T, a: &M, x: &DVectorView<T>, beta: T) {
         let n = a.ncols();
         assert_eq!(a.nrows(), x.data.len(), "gemv_tr: row mismatch");
         assert_eq!(n, self.data.len(), "gemv_tr: col mismatch");
         for j in 0..n {
-            let d = a.col(j).dot(x);
+            let d = a.col(j).dot(&DVector::from_slice(x.data));
             if !beta.is_zero() {
                 self.data[j] = alpha * d + beta * self.data[j];
             } else {
                 self.data[j] = alpha * d;
             }
         }
+    }
+
+    /// Euclidean norm.
+    #[inline]
+    pub fn norm(&self) -> T {
+        let mut s = T::zero();
+        for &e in self.data.iter() {
+            s += e * e;
+        }
+        s.sqrt()
+    }
+
+    /// Squared Euclidean norm.
+    #[inline]
+    pub fn norm_squared(&self) -> T {
+        let mut s = T::zero();
+        for &e in self.data.iter() {
+            s += e * e;
+        }
+        s
+    }
+
+    /// Fills every element with `value`.
+    #[inline]
+    pub fn fill(&mut self, value: T) {
+        self.data.fill(value);
+    }
+
+    /// Returns a sub-view of rows `r0..` as a mutable vector view.
+    #[inline]
+    pub fn rows_range_mut(&mut self, r0: usize) -> DVectorViewMut<'_, T> {
+        DVectorViewMut {
+            data: &mut self.data[r0..],
+        }
+    }
+
+    /// Element-wise multiply-assign `self[i] *= other[i]`.
+    #[inline]
+    pub fn component_mul_assign(&mut self, other: &DVector<T>) {
+        assert_eq!(self.data.len(), other.data.len());
+        for i in 0..self.data.len() {
+            self.data[i] *= other.data[i];
+        }
+    }
+}
+
+impl<T: ComplexField<RealField = T> + Copy> std::ops::Index<usize> for DVectorViewMut<'_, T> {
+    type Output = T;
+    #[inline]
+    fn index(&self, i: usize) -> &T {
+        &self.data[i]
+    }
+}
+
+impl<T: ComplexField<RealField = T> + Copy> std::ops::IndexMut<usize> for DVectorViewMut<'_, T> {
+    #[inline]
+    fn index_mut(&mut self, i: usize) -> &mut T {
+        &mut self.data[i]
     }
 }
 
@@ -642,6 +745,13 @@ impl<T: ComplexField<RealField = T> + Copy> DMatrix<T> {
         }
     }
 
+    /// Copies `src` (length `nrows`) into column `j`.
+    #[inline]
+    pub fn set_column(&mut self, j: usize, src: &DVector<T>) {
+        let start = j * self.col_stride;
+        self.data[start..start + self.nrows].copy_from_slice(&src.data);
+    }
+
     /// Returns an immutable view of columns `first..first+n`.
     #[inline]
     pub fn columns(&self, first: usize, n: usize) -> MatrixView<'_, T> {
@@ -800,7 +910,7 @@ impl<T: ComplexField<RealField = T> + Copy> DMatrix<T> {
         for j1 in 0..ncols1 {
             let mut y = self.column_mut(j1);
             let bcol = b.col(j1);
-            gemv_column(&mut y, alpha, a, &bcol, beta);
+            gemv_column(&mut y, alpha, a, &bcol.as_view(), beta);
         }
     }
 
@@ -837,17 +947,17 @@ impl<T: ComplexField<RealField = T> + Copy> DMatrix<T> {
 
         let mut work = DVector::zeros(dim);
         for j in 0..rhs.ncols() {
-            work.gemv(T::one(), mid, &rhs.col(j), T::zero());
+            work.gemv(T::one(), mid, &rhs.col(j).as_view(), T::zero());
             self.column_mut(j)
-                .gemv_tr(alpha, rhs, &work, if j == 0 { beta } else { T::one() });
+                .gemv_tr(alpha, rhs, &work.as_view(), if j == 0 { beta } else { T::one() });
         }
     }
 
     /// Equivalent to `self.transpose() * rhs` but stores the result (vector) into `out`.
     /// Bit-identical to `nalgebra::tr_mul_to` for the matrix × vector case.
     #[inline]
-    pub fn tr_mul_to(&self, rhs: &DVector<T>, out: &mut DVector<T>) {
-        assert_eq!(self.nrows, rhs.len(), "tr_mul_to: row mismatch");
+    pub fn tr_mul_to(&self, rhs: &DVectorView<T>, out: &mut DVector<T>) {
+        assert_eq!(self.nrows, rhs.data.len(), "tr_mul_to: row mismatch");
         assert_eq!(self.ncols, out.len(), "tr_mul_to: out mismatch");
         out.gemv_tr(T::one(), self, rhs, T::zero());
     }
@@ -882,8 +992,77 @@ impl<T: ComplexField<RealField = T> + Copy> DMatrix<T> {
         for j1 in 0..ncols1 {
             let mut y = self.column_mut(j1);
             let bcol = b.col(j1);
-            gemv_tr_column(&mut y, alpha, a, &bcol, beta);
+            gemv_tr_column(&mut y, alpha, a, &bcol.as_view(), beta);
         }
+    }
+
+    /// Returns an immutable view of the block starting at `(first_row, first_col)` with
+    /// dimensions `(nrows, ncols)`. Matches nalgebra's `matrix.view((r, c), (nr, nc))`.
+    #[inline]
+    pub fn view(&self, (r, c): (usize, usize), (nr, nc): (usize, usize)) -> MatrixView<'_, T> {
+        MatrixView {
+            data: &self.data[r + c * self.col_stride
+                ..r + c * self.col_stride + nr + (nc - 1) * self.col_stride],
+            nrows: nr,
+            ncols: nc,
+            col_stride: self.col_stride,
+        }
+    }
+
+    /// Returns a mutable view of the block starting at `(first_row, first_col)` with
+    /// dimensions `(nrows, ncols)`.
+    #[inline]
+    pub fn view_mut(
+        &mut self,
+        (r, c): (usize, usize),
+        (nr, nc): (usize, usize),
+    ) -> MatrixViewMut<'_, T> {
+        MatrixViewMut {
+            data: &mut self.data[r + c * self.col_stride
+                ..r + c * self.col_stride + nr + (nc - 1) * self.col_stride],
+            nrows: nr,
+            ncols: nc,
+            col_stride: self.col_stride,
+        }
+    }
+
+    /// Returns a mutable view of rows `first..first+n` (as a row-block of this matrix).
+    #[inline]
+    pub fn rows_mut_block(&mut self, first: usize, n: usize) -> MatrixViewMut<'_, T> {
+        MatrixViewMut {
+            data: &mut self.data[first..first + n + (self.ncols - 1) * self.col_stride],
+            nrows: n,
+            ncols: self.ncols,
+            col_stride: self.col_stride,
+        }
+    }
+
+    /// Returns a mutable view of the columns in `range` (e.g. `start..` or `a..b`).
+    #[inline]
+    pub fn columns_range_mut(&mut self, range: std::ops::Range<usize>) -> MatrixViewMut<'_, T> {
+        let n = range.end - range.start;
+        MatrixViewMut {
+            data: &mut self.data[range.start * self.col_stride
+                ..(range.start + n) * self.col_stride],
+            nrows: self.nrows,
+            ncols: n,
+            col_stride: self.col_stride,
+        }
+    }
+}
+
+impl<T: ComplexField<RealField = T> + Copy> std::ops::Index<(usize, usize)> for DMatrix<T> {
+    type Output = T;
+    #[inline]
+    fn index(&self, (i, j): (usize, usize)) -> &T {
+        &self.data[i + j * self.col_stride]
+    }
+}
+
+impl<T: ComplexField<RealField = T> + Copy> std::ops::IndexMut<(usize, usize)> for DMatrix<T> {
+    #[inline]
+    fn index_mut(&mut self, (i, j): (usize, usize)) -> &mut T {
+        &mut self.data[i + j * self.col_stride]
     }
 }
 
@@ -1018,6 +1197,48 @@ impl<'a, T: ComplexField<RealField = T> + Copy> MatrixView<'a, T> {
             col_stride: self.col_stride,
         }
     }
+
+    /// Returns a dense owned copy (compact, column stride = `nrows`).
+    #[inline]
+    pub fn into_owned(&self) -> DMatrix<T> {
+        let mut data = Vec::with_capacity(self.nrows * self.ncols);
+        for j in 0..self.ncols {
+            for i in 0..self.nrows {
+                data.push(self.data[i + j * self.col_stride]);
+            }
+        }
+        DMatrix {
+            data,
+            nrows: self.nrows,
+            ncols: self.ncols,
+            col_stride: self.nrows,
+        }
+    }
+}
+
+impl<'a, T: ComplexField<RealField = T> + Copy> std::ops::Index<(usize, usize)> for MatrixView<'a, T> {
+    type Output = T;
+    #[inline]
+    fn index(&self, (i, j): (usize, usize)) -> &T {
+        &self.data[i + j * self.col_stride]
+    }
+}
+
+impl<'a, T: ComplexField<RealField = T> + Copy> std::ops::IndexMut<(usize, usize)>
+    for MatrixViewMut<'a, T>
+{
+    #[inline]
+    fn index_mut(&mut self, (i, j): (usize, usize)) -> &mut T {
+        &mut self.data[i + j * self.col_stride]
+    }
+}
+
+impl<'a, T: ComplexField<RealField = T> + Copy> std::ops::Index<(usize, usize)> for MatrixViewMut<'a, T> {
+    type Output = T;
+    #[inline]
+    fn index(&self, (i, j): (usize, usize)) -> &T {
+        &self.data[i + j * self.col_stride]
+    }
 }
 
 /// Mutable view into a column-major sub-matrix (full or strided).
@@ -1046,6 +1267,12 @@ impl<'a, T: ComplexField<RealField = T> + Copy> MatrixViewMut<'a, T> {
         self.ncols
     }
 
+    /// Element read.
+    #[inline]
+    pub fn get(&self, i: usize, j: usize) -> T {
+        self.data[i + j * self.col_stride]
+    }
+
     /// Returns a mutable view of column `j`.
     #[inline]
     pub fn column_mut(&mut self, j: usize) -> DVectorViewMut<'_, T> {
@@ -1065,6 +1292,53 @@ impl<'a, T: ComplexField<RealField = T> + Copy> MatrixViewMut<'a, T> {
             nrows: L,
             ncols,
             col_stride: self.col_stride,
+        }
+    }
+
+    /// Returns a dense owned copy (compact, column stride = `nrows`).
+    #[inline]
+    pub fn into_owned(&self) -> DMatrix<T> {
+        let mut data = Vec::with_capacity(self.nrows * self.ncols);
+        for j in 0..self.ncols {
+            for i in 0..self.nrows {
+                data.push(self.data[i + j * self.col_stride]);
+            }
+        }
+        DMatrix {
+            data,
+            nrows: self.nrows,
+            ncols: self.ncols,
+            col_stride: self.nrows,
+        }
+    }
+
+    /// Copies the content of `other` (same dimensions) into `self`.
+    #[inline]
+    pub fn copy_from(&mut self, other: &MatrixView<'_, T>) {
+        assert_eq!(
+            (self.nrows, self.ncols),
+            (other.nrows, other.ncols),
+            "copy_from dimension mismatch"
+        );
+        for j in 0..self.ncols {
+            for i in 0..self.nrows {
+                self.data[i + j * self.col_stride] = other.data[i + j * other.col_stride];
+            }
+        }
+    }
+
+    /// Copies the content of `other` (same dimensions) into `self`.
+    #[inline]
+    pub fn copy_from_dmatrix(&mut self, other: &DMatrix<T>) {
+        assert_eq!(
+            (self.nrows, self.ncols),
+            (other.nrows, other.ncols),
+            "copy_from dimension mismatch"
+        );
+        for j in 0..self.ncols {
+            for i in 0..self.nrows {
+                self.data[i + j * self.col_stride] = other.data[i + j * other.col_stride];
+            }
         }
     }
 
@@ -1090,6 +1364,24 @@ impl<'a, T: ComplexField<RealField = T> + Copy> MatrixViewMut<'a, T> {
                 let si = i + j * rhs.col_stride;
                 f(&mut self.data[di], rhs.data[si]);
             }
+        }
+    }
+
+    /// Swaps elements `(i0, j0)` and `(i1, j1)` in place.
+    #[inline]
+    pub fn swap(&mut self, (i0, j0): (usize, usize), (i1, j1): (usize, usize)) {
+        self.data
+            .swap(i0 + j0 * self.col_stride, i1 + j1 * self.col_stride);
+    }
+
+    /// Returns a mutable view of rows `first..first+n` (as a row-block of this view).
+    #[inline]
+    pub fn rows_mut(&mut self, first: usize, n: usize) -> MatrixViewMut<'_, T> {
+        MatrixViewMut {
+            data: &mut self.data[first..first + n + (self.ncols - 1) * self.col_stride],
+            nrows: n,
+            ncols: self.ncols,
+            col_stride: self.col_stride,
         }
     }
 
@@ -1151,7 +1443,7 @@ impl<'a, T: ComplexField<RealField = T> + Copy> MatrixViewMut<'a, T> {
         for j1 in 0..ncols1 {
             let mut y = self.column_mut(j1);
             let bcol = b.col(j1);
-            gemv_column(&mut y, alpha, a, &bcol, beta);
+            gemv_column(&mut y, alpha, a, &bcol.as_view(), beta);
         }
     }
 
@@ -1188,17 +1480,17 @@ impl<'a, T: ComplexField<RealField = T> + Copy> MatrixViewMut<'a, T> {
 
         let mut work = DVector::zeros(dim);
         for j in 0..rhs.ncols() {
-            work.gemv(T::one(), mid, &rhs.col(j), T::zero());
+            work.gemv(T::one(), mid, &rhs.col(j).as_view(), T::zero());
             self.column_mut(j)
-                .gemv_tr(alpha, rhs, &work, if j == 0 { beta } else { T::one() });
+                .gemv_tr(alpha, rhs, &work.as_view(), if j == 0 { beta } else { T::one() });
         }
     }
 
     /// Equivalent to `self.transpose() * rhs` but stores the result (vector) into `out`.
     /// Bit-identical to `nalgebra::tr_mul_to` for the matrix × vector case.
     #[inline]
-    pub fn tr_mul_to(&self, rhs: &DVector<T>, out: &mut DVector<T>) {
-        assert_eq!(self.nrows, rhs.len(), "tr_mul_to: row mismatch");
+    pub fn tr_mul_to(&self, rhs: &DVectorView<T>, out: &mut DVector<T>) {
+        assert_eq!(self.nrows, rhs.data.len(), "tr_mul_to: row mismatch");
         assert_eq!(self.ncols, out.len(), "tr_mul_to: out mismatch");
         out.gemv_tr(T::one(), self, rhs, T::zero());
     }
@@ -1233,7 +1525,7 @@ impl<'a, T: ComplexField<RealField = T> + Copy> MatrixViewMut<'a, T> {
         for j1 in 0..ncols1 {
             let mut y = self.column_mut(j1);
             let bcol = b.col(j1);
-            gemv_tr_column(&mut y, alpha, a, &bcol, beta);
+            gemv_tr_column(&mut y, alpha, a, &bcol.as_view(), beta);
         }
     }
 }
@@ -1397,7 +1689,7 @@ fn gemv_column<T: ComplexField<RealField = T> + Copy, M: MatrixLike<T>>(
     y: &mut DVectorViewMut<'_, T>,
     alpha: T,
     a: &M,
-    x: &DVector<T>,
+    x: &DVectorView<T>,
     beta: T,
 ) {
     let ncols2 = a.ncols();
@@ -1419,7 +1711,7 @@ fn gemv_tr_column<T: ComplexField<RealField = T> + Copy, M: MatrixLike<T>>(
     y: &mut DVectorViewMut<'_, T>,
     alpha: T,
     a: &M,
-    x: &DVector<T>,
+    x: &DVectorView<T>,
     beta: T,
 ) {
     let ncols2 = a.ncols();
@@ -1428,7 +1720,7 @@ fn gemv_tr_column<T: ComplexField<RealField = T> + Copy, M: MatrixLike<T>>(
 
     for j in 0..ncols2 {
         let a_col = a.col(j);
-        let d = a_col.dot(x);
+        let d = a_col.dot(&DVector::from_slice(x.data));
         if !beta.is_zero() {
             y.data[j] = alpha * d + beta * y.data[j];
         } else {
@@ -1474,7 +1766,7 @@ impl PermutationSequence {
     #[inline]
     pub fn permute_rows<T: ComplexField<RealField = T> + Copy + PartialOrd>(
         &self,
-        rhs: &mut DMatrix<T>,
+        rhs: &mut MatrixViewMut<'_, T>,
     ) {
         for k in 0..self.len {
             let (i0, i1) = self.ipiv[k];
@@ -1506,6 +1798,62 @@ pub struct LU<T: ComplexField<RealField = T> + Copy> {
     pub lu: DMatrix<T>,
     /// Row permutation sequence.
     pub p: PermutationSequence,
+}
+
+/// A right-hand side that an `LU` decomposition can solve into (vector or matrix view).
+pub trait SolveTarget<T: ComplexField<RealField = T> + Copy> {
+    /// Exposes the target as a mutable column-major view for in-place solve.
+    fn as_view_mut(&mut self) -> MatrixViewMut<'_, T>;
+}
+
+impl<T: ComplexField<RealField = T> + Copy> SolveTarget<T> for DMatrix<T> {
+    #[inline]
+    fn as_view_mut(&mut self) -> MatrixViewMut<'_, T> {
+        MatrixViewMut {
+            data: &mut self.data,
+            nrows: self.nrows,
+            ncols: self.ncols,
+            col_stride: self.col_stride,
+        }
+    }
+}
+
+impl<T: ComplexField<RealField = T> + Copy> SolveTarget<T> for DVector<T> {
+    #[inline]
+    fn as_view_mut(&mut self) -> MatrixViewMut<'_, T> {
+        let n = self.data.len();
+        MatrixViewMut {
+            data: &mut self.data,
+            nrows: n,
+            ncols: 1,
+            col_stride: n,
+        }
+    }
+}
+
+impl<'a, T: ComplexField<RealField = T> + Copy> SolveTarget<T> for DVectorViewMut<'a, T> {
+    #[inline]
+    fn as_view_mut(&mut self) -> MatrixViewMut<'_, T> {
+        let n = self.data.len();
+        MatrixViewMut {
+            data: self.data,
+            nrows: n,
+            ncols: 1,
+            col_stride: n,
+        }
+    }
+}
+
+impl<'a, T: ComplexField<RealField = T> + Copy> SolveTarget<T> for MatrixViewMut<'a, T> {
+    #[inline]
+    fn as_view_mut(&mut self) -> MatrixViewMut<'_, T> {
+        MatrixViewMut {
+            data: self.data,
+            nrows: self.nrows,
+            ncols: self.ncols,
+            col_stride: self.col_stride,
+        }
+    }
 }
 
 impl<T: ComplexField<RealField = T> + Copy + PartialOrd> LU<T> {
@@ -1544,9 +1892,10 @@ impl<T: ComplexField<RealField = T> + Copy + PartialOrd> LU<T> {
     }
 
     /// Solves `self * x = b` in place. Returns `false` if the matrix is not invertible.
-    pub fn solve_mut(&self, b: &mut DMatrix<T>) -> bool {
+    pub fn solve_mut<B: SolveTarget<T>>(&self, b: &mut B) -> bool {
+        let mut bv = b.as_view_mut();
         assert_eq!(
-            self.lu.nrows, b.nrows,
+            self.lu.nrows, bv.nrows,
             "LU solve matrix dimension mismatch."
         );
         assert!(
@@ -1554,9 +1903,9 @@ impl<T: ComplexField<RealField = T> + Copy + PartialOrd> LU<T> {
             "LU solve: unable to solve a non-square system."
         );
 
-        self.p.permute_rows(b);
-        let _ = solve_lower_triangular_with_diag_mut(&self.lu, b, T::one());
-        solve_upper_triangular_mut(&self.lu, b)
+        self.p.permute_rows(&mut bv);
+        let _ = solve_lower_triangular_with_diag_mut(&self.lu, &mut bv, T::one());
+        solve_upper_triangular_mut(&self.lu, &mut bv)
     }
 
     /// Solves `self * x = b`, returning `None` if not invertible.
@@ -1708,7 +2057,7 @@ pub fn gauss_step_swap<T: ComplexField<RealField = T> + Copy>(
 /// `solve_lower_triangular_with_diag_mut`.
 pub fn solve_lower_triangular_with_diag_mut<T: ComplexField<RealField = T> + Copy>(
     lu: &DMatrix<T>,
-    b: &mut DMatrix<T>,
+    b: &mut MatrixViewMut<'_, T>,
     diag: T,
 ) -> bool {
     if diag.is_zero() {
@@ -1734,7 +2083,7 @@ pub fn solve_lower_triangular_with_diag_mut<T: ComplexField<RealField = T> + Cop
 /// `solve_upper_triangular_mut`.
 pub fn solve_upper_triangular_mut<T: ComplexField<RealField = T> + Copy>(
     lu: &DMatrix<T>,
-    b: &mut DMatrix<T>,
+    b: &mut MatrixViewMut<'_, T>,
 ) -> bool {
     let dim = lu.nrows;
     let cols = b.ncols;
@@ -1771,6 +2120,29 @@ impl<T: ComplexField<RealField = T> + Copy + PartialOrd> DMatrix<T> {
             }
         }
         best_row
+    }
+}
+
+impl<T: ComplexField<RealField = T> + Copy> std::ops::Add for DMatrix<T> {
+    type Output = DMatrix<T>;
+    #[inline]
+    fn add(mut self, rhs: DMatrix<T>) -> DMatrix<T> {
+        self += rhs;
+        self
+    }
+}
+
+impl<T: ComplexField<RealField = T> + Copy> std::ops::AddAssign for DMatrix<T> {
+    #[inline]
+    fn add_assign(&mut self, rhs: DMatrix<T>) {
+        assert_eq!(
+            (self.nrows, self.ncols, self.col_stride),
+            (rhs.nrows, rhs.ncols, rhs.col_stride),
+            "AddAssign dimension/stride mismatch"
+        );
+        for i in 0..self.data.len() {
+            self.data[i] += rhs.data[i];
+        }
     }
 }
 
@@ -2084,7 +2456,9 @@ mod tests {
         let na_j = NaOMatrix::<f64, nalgebra::Const<6>, nalgebra::Dyn>::from_row_slice(&j);
         let na_f = nalgebra::DVector::from_vec(f.clone());
         let mut out = DVector::zeros(c);
-        mine.tr_mul_to(&DVector::from_vec(f), &mut out);
+        let f_vec = DVector::from_vec(f);
+        let fv = f_vec.as_view();
+        mine.tr_mul_to(&fv, &mut out);
         let na_out = na_j.tr_mul(&na_f);
 
         for (m, n) in out.data.iter().zip(na_out.iter()) {
