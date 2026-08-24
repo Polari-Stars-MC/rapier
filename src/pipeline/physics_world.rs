@@ -3,6 +3,7 @@ use crate::dynamics::{
     CCDSolver, GenericJoint, ImpulseJoint, ImpulseJointHandle, ImpulseJointSet,
     IntegrationParameters, IslandManager, Multibody, MultibodyJointHandle, MultibodyJointSet,
     MultibodyLink, MultibodyLinkId, RigidBody, RigidBodyHandle, RigidBodySet,
+    soft_body::{SoftBody, SoftBodyId, SoftBodySet},
 };
 use crate::geometry::{
     BroadPhaseBvh, Collider, ColliderHandle, ColliderSet, ContactPair, DefaultBroadPhase,
@@ -85,6 +86,13 @@ pub struct PhysicsWorld {
     /// Workspace only: not part of a snapshot (see the type docs).
     #[cfg_attr(feature = "serde-serialize", serde(skip))]
     pub ccd_solver: CCDSolver,
+    /// All soft bodies (deformable / point-mass + spring structures).
+    ///
+    /// Advanced after the rigid-body pipeline each step. Phase 0b wiring only:
+    /// soft bodies are stepped independently (they do not yet exchange forces or
+    /// collisions with rigid bodies — that coupling arrives in later phases). Each
+    /// body with its `sleeping` flag set is skipped, mirroring island sleeping.
+    pub soft_bodies: SoftBodySet,
 }
 
 impl Default for PhysicsWorld {
@@ -101,6 +109,7 @@ impl Default for PhysicsWorld {
             impulse_joints: ImpulseJointSet::new(),
             multibody_joints: MultibodyJointSet::new(),
             ccd_solver: CCDSolver::new(),
+            soft_bodies: SoftBodySet::new(),
         }
     }
 }
@@ -153,6 +162,10 @@ impl PhysicsWorld {
             hooks,
             events,
         );
+        // Phase 0b: advance soft bodies after the rigid-body pipeline. Soft bodies
+        // are stepped independently here; coupling to rigid bodies / collisions is a
+        // later phase. Sleeping bodies are skipped inside `SoftBodySet::step`.
+        self.soft_bodies.step(self.integration_parameters.dt);
     }
 
     /// The bodies and colliders automatically disabled during the last step because their
@@ -208,6 +221,41 @@ impl PhysicsWorld {
     /// ```
     pub fn insert_body(&mut self, body: impl Into<RigidBody>) -> RigidBodyHandle {
         self.bodies.insert(body)
+    }
+
+    // ── Soft bodies ─────────────────────────────────────────────────────
+
+    /// Insert a soft body into the world and return its id.
+    ///
+    /// The soft body is stepped automatically each [`step`](Self::step) after the
+    /// rigid-body pipeline (Phase 0b wiring).
+    pub fn insert_soft_body(&mut self, body: SoftBody) -> SoftBodyId {
+        self.soft_bodies.insert(body)
+    }
+
+    /// Immutable access to a soft body by id.
+    pub fn soft_body(&self, id: SoftBodyId) -> Option<&SoftBody> {
+        self.soft_bodies.get(id)
+    }
+
+    /// Mutable access to a soft body by id.
+    pub fn soft_body_mut(&mut self, id: SoftBodyId) -> Option<&mut SoftBody> {
+        self.soft_bodies.get_mut(id)
+    }
+
+    /// Mark a soft body as sleeping (its particles are not integrated until woken).
+    pub fn sleep_soft_body(&mut self, id: SoftBodyId) -> bool {
+        self.soft_bodies.sleep(id)
+    }
+
+    /// Wake a sleeping soft body.
+    pub fn wake_soft_body(&mut self, id: SoftBodyId) -> bool {
+        self.soft_bodies.wake(id)
+    }
+
+    /// Whether a soft body is currently sleeping.
+    pub fn is_soft_body_sleeping(&self, id: SoftBodyId) -> bool {
+        self.soft_bodies.is_sleeping(id)
     }
 
     /// Remove a rigid body and all its attached colliders and joints.

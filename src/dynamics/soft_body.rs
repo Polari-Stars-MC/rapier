@@ -104,6 +104,12 @@ pub struct SoftBody {
     pub springs: Vec<Spring>,
     /// Constant acceleration applied to every free particle (typically gravity).
     pub gravity: Vector,
+    /// Coarse sleeping flag (island-style). When `true`, [`SoftBody::step`] is a
+    /// no-op: the whole body is treated as an inactive unit, mirroring how
+    /// `PersistentIslands` keeps a sleeping rigid-body island from being
+    /// re-simulated. Per-particle island membership is Phase 3; this flag gives
+    /// the same "skip inactive work" behavior at body granularity for now.
+    pub sleeping: bool,
 }
 
 impl SoftBody {
@@ -113,6 +119,7 @@ impl SoftBody {
             particles: Vec::new(),
             springs: Vec::new(),
             gravity,
+            sleeping: false,
         }
     }
 
@@ -219,6 +226,9 @@ impl SoftBody {
 
     /// One substep: clear/accumulate forces, then integrate.
     pub fn step(&mut self, dt: Real) {
+        if self.sleeping {
+            return;
+        }
         self.compute_forces();
         self.integrate(dt);
     }
@@ -281,11 +291,39 @@ impl SoftBodySet {
         self.bodies.get_mut(id.0 as usize)
     }
 
-    /// Advances every soft body by `dt`.
+    /// Advances every soft body by `dt` (sleeping bodies are skipped).
     pub fn step(&mut self, dt: Real) {
         for body in &mut self.bodies {
             body.step(dt);
         }
+    }
+
+    /// Marks a soft body as sleeping (no further integration until woken).
+    pub fn sleep(&mut self, id: SoftBodyId) -> bool {
+        if let Some(b) = self.bodies.get_mut(id.0 as usize) {
+            b.sleeping = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Wakes a sleeping soft body.
+    pub fn wake(&mut self, id: SoftBodyId) -> bool {
+        if let Some(b) = self.bodies.get_mut(id.0 as usize) {
+            b.sleeping = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether the soft body is currently sleeping.
+    pub fn is_sleeping(&self, id: SoftBodyId) -> bool {
+        self.bodies
+            .get(id.0 as usize)
+            .map(|b| b.sleeping)
+            .unwrap_or(false)
     }
 }
 
@@ -376,5 +414,31 @@ mod tests {
         assert!(body.kinetic_energy().is_finite());
         assert!(body.particles[a].pos.is_finite());
         assert!(body.particles[b].pos.is_finite());
+    }
+
+    #[test]
+    fn sleeping_body_does_not_integrate() {
+        let mut body = SoftBody::new(Vector::new(0.0, -9.81, 0.0));
+        body.add_particle(Vector::new(0.0, 5.0, 0.0));
+        body.sleeping = true;
+        let before = body.particles[0].pos;
+        for _ in 0..50 {
+            body.step(0.01);
+        }
+        assert_eq!(
+            body.particles[0].pos.x.to_bits(),
+            before.x.to_bits(),
+            "sleeping soft body must not move (x)"
+        );
+        assert_eq!(
+            body.particles[0].pos.y.to_bits(),
+            before.y.to_bits(),
+            "sleeping soft body must not move (y)"
+        );
+        assert_eq!(
+            body.particles[0].pos.z.to_bits(),
+            before.z.to_bits(),
+            "sleeping soft body must not move (z)"
+        );
     }
 }
