@@ -207,9 +207,7 @@ impl<T: ComplexField<RealField = T> + Copy> From<Vec<T>> for DVector<T> {
 impl<T: ComplexField<RealField = T> + Copy> From<&[T]> for DVector<T> {
     #[inline]
     fn from(v: &[T]) -> DVector<T> {
-        DVector {
-            data: v.to_vec(),
-        }
+        DVector { data: v.to_vec() }
     }
 }
 
@@ -948,8 +946,12 @@ impl<T: ComplexField<RealField = T> + Copy> DMatrix<T> {
         let mut work = DVector::zeros(dim);
         for j in 0..rhs.ncols() {
             work.gemv(T::one(), mid, &rhs.col(j).as_view(), T::zero());
-            self.column_mut(j)
-                .gemv_tr(alpha, rhs, &work.as_view(), if j == 0 { beta } else { T::one() });
+            self.column_mut(j).gemv_tr(
+                alpha,
+                rhs,
+                &work.as_view(),
+                if j == 0 { beta } else { T::one() },
+            );
         }
     }
 
@@ -1042,8 +1044,8 @@ impl<T: ComplexField<RealField = T> + Copy> DMatrix<T> {
     pub fn columns_range_mut(&mut self, range: std::ops::Range<usize>) -> MatrixViewMut<'_, T> {
         let n = range.end - range.start;
         MatrixViewMut {
-            data: &mut self.data[range.start * self.col_stride
-                ..(range.start + n) * self.col_stride],
+            data: &mut self.data
+                [range.start * self.col_stride..(range.start + n) * self.col_stride],
             nrows: self.nrows,
             ncols: n,
             col_stride: self.col_stride,
@@ -1216,7 +1218,9 @@ impl<'a, T: ComplexField<RealField = T> + Copy> MatrixView<'a, T> {
     }
 }
 
-impl<'a, T: ComplexField<RealField = T> + Copy> std::ops::Index<(usize, usize)> for MatrixView<'a, T> {
+impl<'a, T: ComplexField<RealField = T> + Copy> std::ops::Index<(usize, usize)>
+    for MatrixView<'a, T>
+{
     type Output = T;
     #[inline]
     fn index(&self, (i, j): (usize, usize)) -> &T {
@@ -1233,7 +1237,9 @@ impl<'a, T: ComplexField<RealField = T> + Copy> std::ops::IndexMut<(usize, usize
     }
 }
 
-impl<'a, T: ComplexField<RealField = T> + Copy> std::ops::Index<(usize, usize)> for MatrixViewMut<'a, T> {
+impl<'a, T: ComplexField<RealField = T> + Copy> std::ops::Index<(usize, usize)>
+    for MatrixViewMut<'a, T>
+{
     type Output = T;
     #[inline]
     fn index(&self, (i, j): (usize, usize)) -> &T {
@@ -1481,8 +1487,12 @@ impl<'a, T: ComplexField<RealField = T> + Copy> MatrixViewMut<'a, T> {
         let mut work = DVector::zeros(dim);
         for j in 0..rhs.ncols() {
             work.gemv(T::one(), mid, &rhs.col(j).as_view(), T::zero());
-            self.column_mut(j)
-                .gemv_tr(alpha, rhs, &work.as_view(), if j == 0 { beta } else { T::one() });
+            self.column_mut(j).gemv_tr(
+                alpha,
+                rhs,
+                &work.as_view(),
+                if j == 0 { beta } else { T::one() },
+            );
         }
     }
 

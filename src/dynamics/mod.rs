@@ -36,6 +36,12 @@ pub use self::rigid_body_set::{BodyPair, RigidBodySet};
 #[cfg(feature = "alloc")]
 pub use self::force_containers::*;
 
+// Soft-body (deformable body) support — Phase 0 foundation. Independent of the
+// SoA SIMD solver boundary; wires into `World` / `PersistentIslands` in a later
+// phase (see `.hermes/plans/2026-08-24_soft-body-roadmap.md`).
+#[cfg(feature = "alloc")]
+pub mod soft_body;
+
 #[cfg(feature = "alloc")]
 mod ccd;
 mod coefficient_combine_rule;
