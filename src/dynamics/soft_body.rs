@@ -402,6 +402,86 @@ impl SoftBody {
         Some(idx)
     }
 
+    /// Removes the particle at `index`, keeping the topology consistent.
+    ///
+    /// Springs, distance constraints, and tetrahedra that *reference* the removed
+    /// particle are dropped; every remaining index `> index` is decremented by one
+    /// so it still points at the same particle. `tetra_rest_volumes` is filtered in
+    /// lockstep with `tetrahedra`. Returns `false` (and does nothing) if `index` is
+    /// out of bounds.
+    ///
+    /// This is the per-particle counterpart of [`SoftBodySet::remove`]: deleting a
+    /// block/voxel in a Minecraft chunk maps to removing the corresponding particle
+    /// plus its incident springs/edges, after which the body keeps simulating under
+    /// the new (smaller) topology.
+    pub fn remove_particle(&mut self, index: usize) -> bool {
+        if index >= self.particles.len() {
+            return false;
+        }
+        self.particles.remove(index);
+
+        // Springs: drop any touching `index`, shift the rest.
+        self.springs.retain_mut(|s| {
+            if s.a == index || s.b == index {
+                return false;
+            }
+            if s.a > index {
+                s.a -= 1;
+            }
+            if s.b > index {
+                s.b -= 1;
+            }
+            true
+        });
+
+        // Distance constraints: same treatment.
+        self.distance_constraints.retain_mut(|c| {
+            if c.a == index || c.b == index {
+                return false;
+            }
+            if c.a > index {
+                c.a -= 1;
+            }
+            if c.b > index {
+                c.b -= 1;
+            }
+            true
+        });
+
+        // Tetrahedra: drop any containing `index`; otherwise shift each index down.
+        let keep: Vec<bool> = self
+            .tetrahedra
+            .iter()
+            .map(|t| !t.contains(&(index as u32)))
+            .collect();
+        let remapped: Vec<[u32; 4]> = self
+            .tetrahedra
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| keep[*i])
+            .map(|(_, t)| {
+                let mut t = *t;
+                for x in t.iter_mut() {
+                    if *x as usize > index {
+                        *x -= 1;
+                    }
+                }
+                t
+            })
+            .collect();
+        let kept_volumes: Vec<Real> = self
+            .tetra_rest_volumes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| keep[*i])
+            .map(|(_, v)| *v)
+            .collect();
+        self.tetrahedra = remapped;
+        self.tetra_rest_volumes = kept_volumes;
+
+        true
+    }
+
     /// Total (sum of absolute) signed volume of all tetrahedra — a finite,
     /// deformation-sensitive scalar useful for regression tests.
     pub fn total_volume(&self) -> Real {
@@ -681,7 +761,11 @@ fn solve_volume_constraint(
 /// rigid-body / joint sets.
 #[derive(Clone, Debug, Default)]
 pub struct SoftBodySet {
-    bodies: Vec<SoftBody>,
+    /// Slot storage. A slot becomes `None` once its body is removed via
+    /// [`SoftBodySet::remove`], which keeps `SoftBodyId`s stable: ids are slot
+    /// indices, so removal is id-preserving and never reshuffles live bodies
+    /// (important for the FFI layer that hands `SoftBodyId`s to callers).
+    bodies: Vec<Option<SoftBody>>,
 }
 
 impl SoftBodySet {
@@ -693,55 +777,77 @@ impl SoftBodySet {
     /// Inserts a soft body and returns its id.
     pub fn insert(&mut self, body: SoftBody) -> SoftBodyId {
         let id = SoftBodyId(self.bodies.len() as u32);
-        self.bodies.push(body);
+        self.bodies.push(Some(body));
         id
     }
 
-    /// Number of soft bodies.
+    /// Number of slots (including tombstoned/removed ones).
     pub fn len(&self) -> usize {
         self.bodies.len()
     }
 
-    /// Whether the set is empty.
-    pub fn is_empty(&self) -> bool {
-        self.bodies.is_empty()
+    /// Number of live (not removed) soft bodies.
+    pub fn count(&self) -> usize {
+        self.bodies.iter().filter(|b| b.is_some()).count()
     }
 
-    /// Immutable access by id.
+    /// Whether the set holds no live bodies.
+    pub fn is_empty(&self) -> bool {
+        self.count() == 0
+    }
+
+    /// Removes the soft body with the given id, freeing its storage. The id
+    /// stays reserved (the slot becomes a tombstone), so every other live
+    /// `SoftBodyId` remains valid — callers may keep holding ids across removals.
+    /// Returns `true` if a live body was removed.
+    pub fn remove(&mut self, id: SoftBodyId) -> bool {
+        let slot = match self.bodies.get_mut(id.0 as usize) {
+            Some(slot) => slot,
+            None => return false,
+        };
+        match slot.take() {
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// Immutable access by id. Returns `None` for an unknown or removed id.
     #[allow(dead_code)] // consumed by later integration phases (World/FFI).
     pub fn get(&self, id: SoftBodyId) -> Option<&SoftBody> {
-        self.bodies.get(id.0 as usize)
+        self.bodies.get(id.0 as usize).and_then(|b| b.as_ref())
     }
 
-    /// Mutable access by id.
+    /// Mutable access by id. Returns `None` for an unknown or removed id.
     pub fn get_mut(&mut self, id: SoftBodyId) -> Option<&mut SoftBody> {
-        self.bodies.get_mut(id.0 as usize)
+        self.bodies.get_mut(id.0 as usize).and_then(|b| b.as_mut())
     }
 
-    /// Advances every soft body by `dt` (sleeping bodies are skipped).
+    /// Advances every live soft body by `dt` (sleeping bodies are skipped).
     pub fn step(&mut self, dt: Real) {
-        for body in &mut self.bodies {
+        for body in self.bodies.iter_mut().flatten() {
             body.step(dt);
         }
     }
 
     /// Marks a soft body as sleeping (no further integration until woken).
     pub fn sleep(&mut self, id: SoftBodyId) -> bool {
-        if let Some(b) = self.bodies.get_mut(id.0 as usize) {
-            b.sleeping = true;
-            true
-        } else {
-            false
+        match self.bodies.get_mut(id.0 as usize).and_then(|b| b.as_mut()) {
+            Some(b) => {
+                b.sleeping = true;
+                true
+            }
+            None => false,
         }
     }
 
     /// Wakes a sleeping soft body.
     pub fn wake(&mut self, id: SoftBodyId) -> bool {
-        if let Some(b) = self.bodies.get_mut(id.0 as usize) {
-            b.sleeping = false;
-            true
-        } else {
-            false
+        match self.bodies.get_mut(id.0 as usize).and_then(|b| b.as_mut()) {
+            Some(b) => {
+                b.sleeping = false;
+                true
+            }
+            None => false,
         }
     }
 
@@ -749,6 +855,7 @@ impl SoftBodySet {
     pub fn is_sleeping(&self, id: SoftBodyId) -> bool {
         self.bodies
             .get(id.0 as usize)
+            .and_then(|b| b.as_ref())
             .map(|b| b.sleeping)
             .unwrap_or(false)
     }
@@ -769,7 +876,7 @@ impl SoftBodySet {
     /// Sleeping soft bodies are skipped entirely.
     pub fn write_spring_forces(&self, bodies: &mut RigidBodySet) {
         let kind = ForceKind::Custom(SOFT_SPRING_CUSTOM_ID);
-        for body in &self.bodies {
+        for body in self.bodies.iter().flatten() {
             if body.sleeping {
                 continue;
             }
