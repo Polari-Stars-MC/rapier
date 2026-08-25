@@ -176,6 +176,17 @@ pub struct SoftBody {
     /// re-simulated. Per-particle island membership is Phase 3; this flag gives
     /// the same "skip inactive work" behavior at body granularity for now.
     pub sleeping: bool,
+    /// Phase 5f: collision coupling flag. When `true` the soft body's particles
+    /// are driven by external proxy rigid bodies (one `Ball` collider per free
+    /// particle, maintained by the mps-core integration layer), so [`SoftBody::step`]
+    /// must NOT integrate the particles itself — their positions/velocities are
+    /// written back from the proxy bodies after the rigid-body narrow-phase/contact
+    /// step. Forces (springs + gravity) are still computed and exported by the
+    /// integration layer. Defaults to `false`.
+    pub collide: bool,
+    /// Phase 5f: proxy collider radius used when `collide` is enabled. Each free
+    /// particle gets a `Ball` collider of this radius. Defaults to `0.1`.
+    pub particle_radius: Real,
 }
 
 impl SoftBody {
@@ -190,6 +201,8 @@ impl SoftBody {
             solver: SoftSolver::MassSpring,
             gravity,
             sleeping: false,
+            collide: false,
+            particle_radius: 0.1,
         }
     }
 
@@ -317,6 +330,12 @@ impl SoftBody {
     /// * `Xpbd` → [`Self::step_xpbd`] (distance + volume constraints, position-based).
     pub fn step(&mut self, dt: Real) {
         if self.sleeping {
+            return;
+        }
+        // Phase 5f: when collision coupling is on, the integration layer drives
+        // particle positions/velocities from proxy rigid bodies (after the
+        // rigid-body narrow-phase/contact step), so we must not integrate here.
+        if self.collide {
             return;
         }
         match self.solver {
