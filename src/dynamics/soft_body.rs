@@ -146,6 +146,23 @@ pub enum SoftSolver {
     },
 }
 
+/// A uniform wind / air-resistance field applied to every free particle of a
+/// soft body (Phase 7). It is a *pure external force* — no new mechanics, it
+/// reuses the same force path as gravity:
+///
+/// * `accel` — constant wind acceleration (a directional push, like a sideways
+///   gravity). Makes a pinned-edge cloth fly out like a flag.
+/// * `drag` — linear air-resistance coefficient. Each free particle feels
+///   `F = m·accel − m·drag·v`, i.e. a velocity damping toward the wind state.
+///   Keep `drag·dt < 1` for stability (the integration clamp handles it too).
+#[derive(Clone, Copy, Debug)]
+pub struct Wind {
+    /// Constant wind acceleration (`m/s²`), applied to every free particle.
+    pub accel: Vector,
+    /// Linear air-resistance coefficient (`1/s`). `F_drag = -m·drag·v`.
+    pub drag: Real,
+}
+
 /// A soft body: a collection of point masses connected by springs.
 ///
 /// In Phase 0/2 it is a mass-spring cloud. Phase 3 adds an optional XPBD
@@ -194,6 +211,11 @@ pub struct SoftBody {
     /// Phase 5f: proxy collider radius used when `collide` is enabled. Each free
     /// particle gets a `Ball` collider of this radius. Defaults to `0.1`.
     pub particle_radius: Real,
+    /// Phase 7: uniform wind / air-resistance field. `None` = no wind. When set,
+    /// every free particle feels `F = m·wind.accel − m·wind.drag·v` in addition to
+    /// gravity — a pure external force, no new solver mechanics. Applied in both
+    /// the `MassSpring` (`compute_forces`) and `Xpbd` (`step_xpbd` predict) paths.
+    pub wind: Option<Wind>,
 }
 
 impl SoftBody {
@@ -211,6 +233,7 @@ impl SoftBody {
             sleeping: false,
             collide: false,
             particle_radius: 0.1,
+            wind: None,
         }
     }
 
@@ -226,6 +249,20 @@ impl SoftBody {
         let idx = self.particles.len();
         self.particles.push(SoftParticle::pinned(pos));
         idx
+    }
+
+    /// Phase 7: enables a uniform wind / air-resistance field for this body.
+    /// `accel` is a constant wind acceleration applied to every free particle
+    /// (like a sideways gravity); `drag` is a linear air-resistance coefficient
+    /// (`F_drag = −m·drag·v`). See [`Wind`]. Pass `accel = ZERO, drag = 0` to
+    /// get the same effect as [`Self::clear_wind`].
+    pub fn apply_wind(&mut self, accel: Vector, drag: Real) {
+        self.wind = Some(Wind { accel, drag });
+    }
+
+    /// Phase 7: disables the wind field (`None`).
+    pub fn clear_wind(&mut self) {
+        self.wind = None;
     }
 
     /// Adds a spring between particles `a` and `b` with the given stiffness/damping.
@@ -314,6 +351,11 @@ impl SoftBody {
             } else {
                 p.mass() * self.gravity
             };
+            // Phase 7: uniformly applied wind / air-resistance (pure external force).
+            if let Some(wind) = self.wind {
+                p.force += p.mass() * wind.accel;
+                p.force -= p.mass() * wind.drag * p.vel;
+            }
             p.force += spring[i];
         }
     }
@@ -671,7 +713,14 @@ impl SoftBody {
             if w[i] == 0.0 {
                 continue;
             }
-            p.vel += dir_scaled(self.gravity, dt);
+            // Phase 7: wind / air-resistance is a pure external acceleration,
+            // applied alongside gravity in the predict step (no new mechanics).
+            let mut a = self.gravity;
+            if let Some(wind) = self.wind {
+                a += wind.accel;
+                a -= wind.drag * p.vel;
+            }
+            p.vel += dir_scaled(a, dt);
             p.pos += dir_scaled(p.vel, dt);
         }
 
