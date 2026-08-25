@@ -166,6 +166,13 @@ pub struct SoftBody {
     /// Rest (reference) signed volume of each tetrahedron, precomputed at
     /// `add_tetrahedron` time. Indexed parallel to `tetrahedra`.
     pub tetra_rest_volumes: Vec<Real>,
+    /// Triangular faces (cloth / shell topology). Each entry is `[a, b, c]`
+    /// particle indices, CCW for outward normal. Phase 6: cloth soft bodies are
+    /// built from triangles; the structural edges are added automatically as
+    /// distance constraints (see `add_triangle`), so the XPBD solver needs no new
+    /// mechanics — bending is just extra distance constraints between opposite
+    /// vertices of adjacent quads (composed by the caller).
+    pub triangles: Vec<[u32; 3]>,
     /// Active integrator.
     pub solver: SoftSolver,
     /// Constant acceleration applied to every free particle (typically gravity).
@@ -198,6 +205,7 @@ impl SoftBody {
             distance_constraints: Vec::new(),
             tetrahedra: Vec::new(),
             tetra_rest_volumes: Vec::new(),
+            triangles: Vec::new(),
             solver: SoftSolver::MassSpring,
             gravity,
             sleeping: false,
@@ -421,6 +429,79 @@ impl SoftBody {
         Some(idx)
     }
 
+    /// Phase 6 — cloth: adds a triangular face `[a, b, c]` (CCW for outward
+    /// normal) to the body's shell topology **and** automatically registers its
+    /// three structural edges as distance constraints (rest length from the
+    /// current particle spacing) so the existing XPBD solver keeps the face
+    /// shape. Duplicate edges (shared by neighbouring triangles) are silently
+    /// de-duplicated against existing distance constraints to avoid double
+    /// stiffness. Returns `None` (and does nothing) if any index is out of
+    /// bounds or duplicated, or if the face is degenerate (a zero-length edge).
+    ///
+    /// Bending stiffness is *not* added here: it is composed by the caller via
+    /// [`Self::add_distance_constraint`] between opposite vertices of adjacent
+    /// quad pairs (cross-diagonal edges), which needs no new mechanics.
+    pub fn add_triangle(&mut self, tri: [u32; 3]) -> Option<usize> {
+        let [a, b, c] = tri;
+        let (pa, pb, pc) = (
+            self.particles.get(a as usize)?,
+            self.particles.get(b as usize)?,
+            self.particles.get(c as usize)?,
+        );
+        if a == b || a == c || b == c {
+            return None;
+        }
+        // Reject degenerate faces (any edge has zero rest length).
+        let ab = (pb.pos - pa.pos).length();
+        let bc = (pc.pos - pb.pos).length();
+        let ca = (pa.pos - pc.pos).length();
+        if ab == 0.0 || bc == 0.0 || ca == 0.0 {
+            return None;
+        }
+        // Register structural edges (a-b, b-c, c-a) as distance constraints,
+        // skipping any edge already present (shared by a neighbour triangle).
+        for (u, v, rest) in [(a, b, ab), (b, c, bc), (c, a, ca)] {
+            let exists = self.distance_constraints.iter().any(|d| {
+                (d.a == u as usize && d.b == v as usize) || (d.a == v as usize && d.b == u as usize)
+            });
+            if !exists {
+                self.distance_constraints.push(DistanceConstraint {
+                    a: u as usize,
+                    b: v as usize,
+                    rest,
+                    // Default compliance; tune via configure_xpbd / explicit later.
+                    compliance: 0.0,
+                });
+            }
+        }
+        let idx = self.triangles.len();
+        self.triangles.push(tri);
+        Some(idx)
+    }
+
+    /// Phase 6 — cloth bending: adds a single bending edge between two particles
+    /// `p` and `q` as a distance constraint (rest length from current spacing).
+    /// Compose bending across a quad by calling this for its two diagonals, or
+    /// across a fold line by linking the un-shared vertices of two adjacent
+    /// triangles. Reuses the existing XPBD distance solver (no new mechanics).
+    /// Returns `None` (and does nothing) if indices are out of bounds or the
+    /// endpoints coincide.
+    pub fn add_bending_constraint(&mut self, p: usize, q: usize) -> Option<usize> {
+        let (pp, pq) = (self.particles.get(p)?, self.particles.get(q)?);
+        let rest = (pq.pos - pp.pos).length();
+        if rest == 0.0 {
+            return None;
+        }
+        let idx = self.distance_constraints.len();
+        self.distance_constraints.push(DistanceConstraint {
+            a: p,
+            b: q,
+            rest,
+            compliance: 0.0,
+        });
+        Some(idx)
+    }
+
     /// Removes the particle at `index`, keeping the topology consistent.
     ///
     /// Springs, distance constraints, and tetrahedra that *reference* the removed
@@ -497,6 +578,29 @@ impl SoftBody {
             .collect();
         self.tetrahedra = remapped;
         self.tetra_rest_volumes = kept_volumes;
+
+        // Triangles: drop any containing `index`; otherwise shift each index down.
+        let keep_tri: Vec<bool> = self
+            .triangles
+            .iter()
+            .map(|t| !t.contains(&(index as u32)))
+            .collect();
+        let remapped_tri: Vec<[u32; 3]> = self
+            .triangles
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| keep_tri[*i])
+            .map(|(_, t)| {
+                let mut t = *t;
+                for x in t.iter_mut() {
+                    if *x as usize > index {
+                        *x -= 1;
+                    }
+                }
+                t
+            })
+            .collect();
+        self.triangles = remapped_tri;
 
         true
     }
