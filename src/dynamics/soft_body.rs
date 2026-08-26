@@ -231,6 +231,26 @@ pub struct SoftBody {
     /// rendering the broken face. `None` (default) = no tearing. Pure topology
     /// edit — no new solver mechanics, no SoA interaction.
     pub tear_strain: Option<Real>,
+    /// Phase 10: plasticity (permanent deformation, like putty / memory foam).
+    /// When `Some(params)`, any structural edge whose elastic strain magnitude
+    /// exceeds `params.yield_strain` has its rest length permanently shifted
+    /// toward the current length by `params.creep` (clamped to `[0,1]`) each step,
+    /// so the deformation "freezes in" instead of springing back. `None` (default)
+    /// = perfectly elastic (Hookean). Pure rest-length edit — no new solver
+    /// mechanics, no SoA interaction.
+    pub plasticity: Option<PlasticityParams>,
+}
+
+/// Phase 10: plasticity parameters (see [`SoftBody::plasticity`]).
+#[derive(Clone, Copy, Debug)]
+pub struct PlasticityParams {
+    /// Yield strain: elastic deformation below this magnitude is fully recovered;
+    /// above it, the excess becomes permanent. Must be ≥ 0.
+    pub yield_strain: Real,
+    /// Creep rate in `[0,1]`: fraction of the over-yield strain that is transferred
+    /// from elastic to plastic (rest-length) each step. `1` = instantly frozen at
+    /// the yield surface; `0` = no plasticity (elastic).
+    pub creep: Real,
 }
 
 impl SoftBody {
@@ -250,6 +270,7 @@ impl SoftBody {
             particle_radius: 0.1,
             wind: None,
             tear_strain: None,
+            plasticity: None,
         }
     }
 
@@ -439,6 +460,10 @@ impl SoftBody {
         // Phase 9: remove over-stretched structural edges before integrating.
         // (No-op unless `tear_strain` is `Some`.)
         self.tear();
+        // Phase 10: freeze over-yield deformation into rest lengths before
+        // integrating, so elastic edges become permanently deformed. (No-op unless
+        // `plasticity` is `Some`.)
+        self.apply_plasticity();
         // Phase 5f: when collision coupling is on, the integration layer drives
         // particle positions/velocities from proxy rigid bodies (after the
         // rigid-body narrow-phase/contact step), so we must not integrate here.
@@ -699,6 +724,93 @@ impl SoftBody {
         self.triangles
             .retain(|t| has_edge(t[0], t[1]) && has_edge(t[1], t[2]) && has_edge(t[2], t[0]));
         let _ = broken_dc; // retained for clarity; broken edges already excluded.
+    }
+
+    /// Phase 10: enables/disables plasticity. Pass `None` to disable (perfectly
+    /// elastic, the default). With `Some(PlasticityParams { yield_strain, creep })`,
+    /// edges whose elastic strain magnitude exceeds `yield_strain` permanently shift
+    /// their rest length toward the current length by `creep` (clamped to `[0,1]`)
+    /// each step — the deformation freezes in instead of springing back.
+    ///
+    /// `yield_strain` is clamped to `≥ 0`; `creep` is clamped to `[0,1]`.
+    pub fn set_plasticity(&mut self, params: Option<PlasticityParams>) {
+        self.plasticity = params.map(|p| PlasticityParams {
+            yield_strain: p.yield_strain.max(0.0),
+            creep: p.creep.clamp(0.0, 1.0),
+        });
+    }
+
+    /// Phase 10: permanently deforms over-yielded edges. Called once at the top of
+    /// [`SoftBody::step`] after [`SoftBody::tear`]; a no-op when `plasticity` is
+    /// `None`.
+    ///
+    /// For every structural edge (XPBD distance constraint / MassSpring spring) the
+    /// elastic strain `s = (|len| − rest) / rest` is measured. If `|s| > yield_strain`,
+    /// the over-yield portion is frozen: `rest += creep · (len − rest)` (the rest
+    /// length moves toward the current length, so the edge no longer pulls back toward
+    /// its original size). Pure rest-length edit — neither the SoA solver nor the
+    /// integration order is touched.
+    pub fn apply_plasticity(&mut self) {
+        let (yield_strain, creep) = match self.plasticity {
+            Some(p) => (p.yield_strain, p.creep),
+            None => return,
+        };
+        if yield_strain <= 0.0 || creep <= 0.0 {
+            return; // degenerate: no plasticity.
+        }
+
+        // Distance constraints (XPBD path). Filtered first into a `Vec`, then the
+        // inner `self.particles` borrow for length measurement is released before we
+        // mutate `self.distance_constraints` — keeps the two borrows disjoint.
+        let new_rests: Vec<Real> = self
+            .distance_constraints
+            .iter()
+            .map(|c| {
+                let (pa, pb) = match (self.particles.get(c.a), self.particles.get(c.b)) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => return c.rest, // dangling edge → leave unchanged.
+                };
+                let len = (pb.pos - pa.pos).length();
+                if c.rest <= 0.0 {
+                    return c.rest;
+                }
+                let strain = (len - c.rest) / c.rest;
+                if strain.abs() <= yield_strain {
+                    c.rest
+                } else {
+                    // Freeze part of the elastic stretch into the rest length.
+                    c.rest + creep * (len - c.rest)
+                }
+            })
+            .collect();
+        for (c, nr) in self.distance_constraints.iter_mut().zip(new_rests) {
+            c.rest = nr;
+        }
+
+        // MassSpring springs.
+        let new_springs: Vec<Spring> = self
+            .springs
+            .iter()
+            .map(|s| {
+                let (pa, pb) = match (self.particles.get(s.a), self.particles.get(s.b)) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => return *s,
+                };
+                let len = (pb.pos - pa.pos).length();
+                if s.rest_length <= 0.0 {
+                    return *s;
+                }
+                let strain = (len - s.rest_length) / s.rest_length;
+                if strain.abs() <= yield_strain {
+                    *s
+                } else {
+                    let mut ns = *s;
+                    ns.rest_length += creep * (len - s.rest_length);
+                    ns
+                }
+            })
+            .collect();
+        self.springs = new_springs;
     }
 
     /// Removes the particle at `index`, keeping the topology consistent.
