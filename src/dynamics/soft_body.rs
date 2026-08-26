@@ -128,9 +128,19 @@ pub struct DistanceConstraint {
     pub b: usize,
     /// Rest length.
     pub rest: Real,
-    /// XPBD compliance `α` (0 = rigid, > 0 = soft). Stored per-constraint so
-    /// different edges can have different stiffness.
+    /// XPBD stretch compliance `α_s` (0 = rigid, > 0 = soft), applied when the edge
+    /// is **longer** than `rest` (tension). Stored per-constraint so different edges
+    /// can have different stiffness. Phase 19: this is the *stretch* compliance; the
+    /// *compression* compliance lives in [`Self::compression`], enabling anisotropic
+    /// behaviour (e.g. cloth resists stretch but folds easily under compression).
     pub compliance: Real,
+    /// Phase 19 — XPBD compression compliance `α_c` (0 = rigid, > 0 = soft), applied
+    /// when the edge is **shorter** than `rest` (compression). When equal to
+    /// [`Self::compliance`] the edge is isotropic. Initialized to the stretch
+    /// compliance by every constructor (`add_distance_constraint`, `add_triangle`,
+    /// `add_bending_constraint`) so existing bodies stay isotropic unless the caller
+    /// opts into anisotropy via `set_distance_constraint_compression`.
+    pub compression: Real,
 }
 
 /// Which integrator a [`SoftBody`] uses.
@@ -908,6 +918,7 @@ impl SoftBody {
             b,
             rest,
             compliance,
+            compression: compliance,
         });
         Some(idx)
     }
@@ -932,7 +943,10 @@ impl SoftBody {
 
     /// Phase 13 — sets the XPBD `compliance` (α) of an existing distance constraint
     /// (by the index returned from `add_distance_constraint`) at runtime. Per-constraint
-    /// compliance is honored by the XPBD solver (see `step_xpbd`). Returns `false` for
+    /// compliance is honored by the XPBD solver (see `step_xpbd`). Phase 19: this sets
+    /// **both** the stretch and compression compliance to the same value, i.e. it keeps
+    /// the edge isotropic. Use `set_distance_constraint_compression` to make it
+    /// anisotropic (different stretch vs compression softness). Returns `false` for
     /// an out-of-range index or a negative/non-finite compliance.
     pub fn set_distance_constraint_compliance(&mut self, index: usize, compliance: Real) -> bool {
         if compliance < 0.0 || !compliance.is_finite() {
@@ -941,6 +955,27 @@ impl SoftBody {
         match self.distance_constraints.get_mut(index) {
             Some(c) => {
                 c.compliance = compliance;
+                c.compression = compliance;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Phase 19 — sets the XPBD **compression** compliance `α_c` of an existing
+    /// distance constraint (by the index returned from `add_distance_constraint`)
+    /// at runtime, independently of its stretch compliance. This is the anisotropic
+    /// knob: a cloth edge can resist stretch (`compliance`, small) but fold/compress
+    /// easily (`compression`, large). The solver selects the compliance by the
+    /// current strain sign each iteration (see `step_xpbd`). Returns `false` for an
+    /// out-of-range index or a negative/non-finite compliance.
+    pub fn set_distance_constraint_compression(&mut self, index: usize, compression: Real) -> bool {
+        if compression < 0.0 || !compression.is_finite() {
+            return false;
+        }
+        match self.distance_constraints.get_mut(index) {
+            Some(c) => {
+                c.compression = compression;
                 true
             }
             None => false,
@@ -1011,6 +1046,7 @@ impl SoftBody {
                     rest,
                     // Default compliance; tune via configure_xpbd / explicit later.
                     compliance: 0.0,
+                    compression: 0.0,
                 });
             }
         }
@@ -1038,6 +1074,7 @@ impl SoftBody {
             b: q,
             rest,
             compliance: 0.0,
+            compression: 0.0,
         });
         Some(idx)
     }
@@ -1425,11 +1462,13 @@ impl SoftBody {
         let mut d_b = Vec::with_capacity(ndc);
         let mut d_rest = Vec::with_capacity(ndc);
         let mut d_comp = Vec::with_capacity(ndc);
+        let mut d_compress = Vec::with_capacity(ndc);
         for c in &self.distance_constraints {
             d_a.push(c.a);
             d_b.push(c.b);
             d_rest.push(c.rest);
             d_comp.push(c.compliance);
+            d_compress.push(c.compression);
         }
         let mut d_lambda = Vec::with_capacity(ndc);
         #[allow(clippy::same_item_push)] // Lagrange accumulator, filled with zeros
@@ -1466,7 +1505,15 @@ impl SoftBody {
         for _ in 0..iterations {
             for ci in 0..ndc {
                 // Phase 13: honor per-constraint compliance → per-constraint α̃.
-                let c_alpha = d_comp[ci] / (dt * dt);
+                // Phase 19: pick stretch vs compression compliance by the current
+                // strain sign (tension uses `compliance`, compression uses
+                // `compression`), enabling anisotropic edges.
+                let len = (self.particles[d_a[ci]].pos - self.particles[d_b[ci]].pos).length();
+                let c_alpha = if len > d_rest[ci] {
+                    d_comp[ci]
+                } else {
+                    d_compress[ci]
+                } / (dt * dt);
                 solve_distance_constraint(
                     &mut self.particles,
                     d_a[ci],
