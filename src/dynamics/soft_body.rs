@@ -257,6 +257,13 @@ pub struct SoftBody {
     /// springs/cloth edges are not treated as collisions. `None` (default) = off.
     /// Pure positional projection — no new solver mechanics, no SoA interaction.
     pub self_collision: Option<SelfCollisionParams>,
+    /// Phase 14: soft-soft (cross-body) collision. When `Some(params)`, this body
+    /// collides with *other* soft bodies that also have `cross_collision` set: their
+    /// free particles repel when centres come within `2·min(radius_a, radius_b)`.
+    /// Reuses the same spatial-hash broad-phase + XPBD push-apart as self-collision,
+    /// but the world-level pass runs over pairs of bodies. `None` (default) = off.
+    /// Pure positional projection — no new solver mechanics, no SoA interaction.
+    pub cross_collision: Option<SelfCollisionParams>,
 }
 /// Phase 10: plasticity parameters (see [`SoftBody::plasticity`]).
 #[derive(Clone, Copy, Debug)]
@@ -303,6 +310,7 @@ impl SoftBody {
             plasticity: None,
             pressure: None,
             self_collision: None,
+            cross_collision: None,
         }
     }
 
@@ -477,6 +485,25 @@ impl SoftBody {
     /// Phase 12: disables self-collision (`None`).
     pub fn clear_self_collision(&mut self) {
         self.self_collision = None;
+    }
+
+    /// Phase 14: enables soft-soft (cross-body) collision with the given `radius`
+    /// (particle sphere radius) and `stiffness` (XPBD compliance of the repulsion
+    /// constraint, `0` = hard). Two bodies only collide if *both* have
+    /// `cross_collision` set; the effective repulsion distance is
+    /// `2·min(radius_a, radius_b)`. Rejects non-positive `radius` or negative
+    /// `stiffness`.
+    pub fn set_cross_collision(&mut self, radius: Real, stiffness: Real) -> bool {
+        if !(radius > 0.0) || stiffness < 0.0 {
+            return false;
+        }
+        self.cross_collision = Some(SelfCollisionParams { radius, stiffness });
+        true
+    }
+
+    /// Phase 14: disables soft-soft (cross-body) collision (`None`).
+    pub fn clear_cross_collision(&mut self) {
+        self.cross_collision = None;
     }
 
     /// Phase 12: broad-phase + projection for self-collision. Builds a uniform
@@ -1357,6 +1384,145 @@ impl SoftBody {
     }
 }
 
+/// Phase 14 — world-level soft-soft (cross-body) collision.
+///
+/// Runs after every soft body has been stepped. For each unordered pair of bodies
+/// `(a, b)` with `a < b` that *both* have `cross_collision` set, it builds a uniform
+/// spatial hash over the free particles of **both** bodies (cell size `2·R`, where
+/// `R = min(radius_a, radius_b)`), finds all inter-body particle pairs whose centres
+/// are within `2·R`, and pushes them apart with the same XPBD distance projection used
+/// by self-collision (`rest = 2·R`, compliance = `min(stiffness_a, stiffness_b)`).
+///
+/// Pairs are projected with a few Gauss-Seidel iterations for stability. Body ids are
+/// enumerated in ascending `SoftBodyId` order and particle pairs in index order, so the
+/// result is deterministic. Pinned particles (`inv_mass == 0`) and same-body pairs are
+/// skipped. This is pure positional projection — it adds no forces and does not touch
+/// the SoA solver.
+pub fn solve_cross_body_collisions(set: &mut SoftBodySet, dt: Real) {
+    // Collect ids of bodies with cross-collision enabled, ascending by inner u32.
+    let mut ids: Vec<SoftBodyId> = Vec::new();
+    for (id, sb) in set.iter() {
+        if sb.cross_collision.is_some() {
+            ids.push(id);
+        }
+    }
+    ids.sort_by_key(|id| id.0);
+    let n = ids.len();
+    // A few iterations of inter-body projection for stability.
+    for _iter in 0..3 {
+        for ia in 0..n {
+            for ib in (ia + 1)..n {
+                let a = ids[ia];
+                let b = ids[ib];
+                let (pa, pb) = match (set.get(a), set.get(b)) {
+                    (Some(x), Some(y)) => (x, y),
+                    _ => continue,
+                };
+                let (ca, cb) = match (pa.cross_collision, pb.cross_collision) {
+                    (Some(x), Some(y)) => (x, y),
+                    _ => continue,
+                };
+                let radius = ca.radius.min(cb.radius);
+                let stiffness = ca.stiffness.min(cb.stiffness);
+                let d = radius * 2.0;
+                let compliance = stiffness / (dt * dt);
+                let mut pos_a: Vec<Vector> = Vec::new();
+                let mut w_a: Vec<Real> = Vec::new();
+                let mut map_a: HashMap<usize, usize> = HashMap::new();
+                for (oi, p) in pa.particles.iter().enumerate() {
+                    if p.inv_mass != 0.0 {
+                        map_a.insert(oi, pos_a.len());
+                        pos_a.push(p.pos);
+                        w_a.push(p.inv_mass);
+                    }
+                }
+                let mut pos_b: Vec<Vector> = Vec::new();
+                let mut w_b: Vec<Real> = Vec::new();
+                let mut map_b: HashMap<usize, usize> = HashMap::new();
+                for (oi, p) in pb.particles.iter().enumerate() {
+                    if p.inv_mass != 0.0 {
+                        map_b.insert(oi, pos_b.len());
+                        pos_b.push(p.pos);
+                        w_b.push(p.inv_mass);
+                    }
+                }
+                let cell = d;
+                let mut grid: HashMap<(i64, i64, i64), Vec<(usize, bool)>> = HashMap::new();
+                for (si, p) in pos_a.iter().enumerate() {
+                    let key = (
+                        (p.x / cell).floor() as i64,
+                        (p.y / cell).floor() as i64,
+                        (p.z / cell).floor() as i64,
+                    );
+                    grid.entry(key).or_insert_with(Vec::new).push((si, false));
+                }
+                for (si, p) in pos_b.iter().enumerate() {
+                    let key = (
+                        (p.x / cell).floor() as i64,
+                        (p.y / cell).floor() as i64,
+                        (p.z / cell).floor() as i64,
+                    );
+                    grid.entry(key).or_insert_with(Vec::new).push((si, true));
+                }
+                let mut pairs: Vec<(usize, usize)> = Vec::new();
+                for (si, p) in pos_a.iter().enumerate() {
+                    let cx = (p.x / cell).floor() as i64;
+                    let cy = (p.y / cell).floor() as i64;
+                    let cz = (p.z / cell).floor() as i64;
+                    for ox in -1..=1i64 {
+                        for oy in -1..=1i64 {
+                            for oz in -1..=1i64 {
+                                if let Some(bucket) = grid.get(&(cx + ox, cy + oy, cz + oz)) {
+                                    for &(sj, is_b) in bucket {
+                                        if !is_b {
+                                            continue;
+                                        }
+                                        let delta = pos_a[si] - pos_b[sj];
+                                        let dist = delta.length();
+                                        if dist < d && dist > 1e-9 {
+                                            pairs.push((si, sj));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for &(sa, sb_idx) in &pairs {
+                    let (body_a, body_b) = set.get2_mut(a, b);
+                    // Resolve original particle indices from the slot maps.
+                    let oa_idx = map_a.iter().find(|(_, v)| **v == sa).map(|(&k, _)| k);
+                    let ob_idx = map_b.iter().find(|(_, v)| **v == sb_idx).map(|(&k, _)| k);
+                    if let (Some(oa_idx), Some(ob_idx)) = (oa_idx, ob_idx) {
+                        if let (Some(ba), Some(bb)) = (body_a, body_b) {
+                            let wa = w_a[sa];
+                            let wb = w_b[sb_idx];
+                            let pa_now = ba.particles[oa_idx].pos;
+                            let pb_now = bb.particles[ob_idx].pos;
+                            let delta = pa_now - pb_now;
+                            let dist = delta.length();
+                            if dist < d && dist > 1e-9 {
+                                let n = delta / dist;
+                                let cval = dist - d;
+                                let wsum = wa + wb;
+                                if wsum > 0.0 {
+                                    let dlambda = (-cval - compliance * 0.0) / (wsum + compliance);
+                                    if wa != 0.0 {
+                                        ba.particles[oa_idx].pos += dir_scaled(n, wa * dlambda);
+                                    }
+                                    if wb != 0.0 {
+                                        bb.particles[ob_idx].pos -= dir_scaled(n, wb * dlambda);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// `v * s` for a `Vector` and scalar `s` (glam supports `Vec3 * f64`).
 #[inline]
 fn dir_scaled(v: Vector, s: Real) -> Vector {
@@ -1549,6 +1715,42 @@ impl SoftBodySet {
     /// Mutable access by id. Returns `None` for an unknown or removed id.
     pub fn get_mut(&mut self, id: SoftBodyId) -> Option<&mut SoftBody> {
         self.bodies.get_mut(id.0 as usize).and_then(|b| b.as_mut())
+    }
+
+    /// Iterator over all live `(SoftBodyId, &SoftBody)` pairs, in ascending id order.
+    pub fn iter(&self) -> impl Iterator<Item = (SoftBodyId, &SoftBody)> {
+        self.bodies
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| b.as_ref().map(|sb| (SoftBodyId(i as u32), sb)))
+    }
+
+    /// Simultaneous mutable access to two distinct live bodies. Returns
+    /// `(None, None)` if either id is unknown/removed or the two ids are equal.
+    /// Used by the Phase 14 cross-body collision pass to project two bodies apart.
+    pub fn get2_mut(
+        &mut self,
+        a: SoftBodyId,
+        b: SoftBodyId,
+    ) -> (Option<&mut SoftBody>, Option<&mut SoftBody>) {
+        if a == b {
+            return (None, None);
+        }
+        let (lo, hi) = if a.0 <= b.0 { (a, b) } else { (b, a) };
+        let (lo_i, hi_i) = (lo.0 as usize, hi.0 as usize);
+        let len = self.bodies.len();
+        if lo_i >= len || hi_i >= len {
+            return (None, None);
+        }
+        // Split the slice so the two borrows are disjoint.
+        let (left, right) = self.bodies.split_at_mut(hi_i);
+        let first = left.get_mut(lo_i).and_then(|b| b.as_mut());
+        let second = right.get_mut(0).and_then(|b| b.as_mut());
+        if a.0 <= b.0 {
+            (first, second)
+        } else {
+            (second, first)
+        }
     }
 
     /// Advances every live soft body by `dt` (sleeping bodies are skipped).
