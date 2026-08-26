@@ -325,6 +325,12 @@ pub struct SelfCollisionParams {
     /// XPBD compliance of the repulsion constraint. `0` = perfectly hard (rigid
     /// non-penetration); larger values allow softer, springier contact. Must be ≥ 0.
     pub stiffness: Real,
+    /// Phase 20: contact friction coefficient for the tangential relative slip at a
+    /// soft-soft contact (self-collision and, via the shared struct, cross-collision).
+    /// `None` = frictionless (default). When set, the tangential relative velocity of a
+    /// contacting pair is damped by `μ` each step (Coulomb-style, bounded to `[0,1]`:
+    /// `μ = 0` no friction, `μ = 1` fully kills tangential slip). Must be `0 ≤ μ ≤ 1`.
+    pub friction: Option<Real>,
 }
 
 /// Phase 17: cohesion (adhesion / breakable glue) parameters for inter-body
@@ -543,7 +549,25 @@ impl SoftBody {
         if !(radius > 0.0) || stiffness < 0.0 {
             return false;
         }
-        self.self_collision = Some(SelfCollisionParams { radius, stiffness });
+        self.self_collision = Some(SelfCollisionParams {
+            radius,
+            stiffness,
+            friction: None,
+        });
+        true
+    }
+
+    /// Phase 20: sets the contact friction coefficient `μ` for self-collision.
+    /// Requires `self_collision` to be enabled first. Rejects non-finite or out-of-range
+    /// `μ` (`0 ≤ μ ≤ 1`). `clear_self_collision` resets it to `None` (frictionless).
+    pub fn set_self_collision_friction(&mut self, mu: Real) -> bool {
+        if !mu.is_finite() || mu < 0.0 || mu > 1.0 {
+            return false;
+        }
+        let Some(p) = self.self_collision.as_mut() else {
+            return false;
+        };
+        p.friction = Some(mu);
         true
     }
 
@@ -562,7 +586,25 @@ impl SoftBody {
         if !(radius > 0.0) || stiffness < 0.0 {
             return false;
         }
-        self.cross_collision = Some(SelfCollisionParams { radius, stiffness });
+        self.cross_collision = Some(SelfCollisionParams {
+            radius,
+            stiffness,
+            friction: None,
+        });
+        true
+    }
+
+    /// Phase 20: sets the contact friction coefficient `μ` for cross-collision.
+    /// Requires `cross_collision` to be enabled first. Rejects non-finite or out-of-range
+    /// `μ` (`0 ≤ μ ≤ 1`). `clear_cross_collision` resets it to `None` (frictionless).
+    pub fn set_cross_collision_friction(&mut self, mu: Real) -> bool {
+        if !mu.is_finite() || mu < 0.0 || mu > 1.0 {
+            return false;
+        }
+        let Some(p) = self.cross_collision.as_mut() else {
+            return false;
+        };
+        p.friction = Some(mu);
         true
     }
 
@@ -641,10 +683,59 @@ impl SoftBody {
     /// caller decides how many times to invoke this (once per iteration in XPBD,
     /// a few times after integration in MassSpring). Pure positional projection:
     /// `self.particles` is mutated directly; no new solver mechanics.
-    fn solve_self_collisions(&mut self, alpha: Real) {
+    fn damp_contact_velocity_split(
+        pa: &mut [SoftParticle],
+        pb: &mut [SoftParticle],
+        i: usize,
+        j: usize,
+        mu: Real,
+    ) {
+        let wi = pa[i].inv_mass;
+        let wj = pb[j].inv_mass;
+        let wsum = wi + wj;
+        if wsum == 0.0 {
+            return;
+        }
+        let delta = pa[i].pos - pb[j].pos;
+        let len = delta.length();
+        if len < 1e-12 {
+            return;
+        }
+        let n = delta / len;
+        let v_rel = pa[i].vel - pb[j].vel;
+        let vn = v_rel.dot(n);
+        let v_t = v_rel - n * vn;
+        let corr = v_t * mu;
+        pa[i].vel -= corr * (wi / wsum);
+        pb[j].vel += corr * (wj / wsum);
+    }
+
+    fn damp_contact_velocity(ps: &mut [SoftParticle], i: usize, j: usize, mu: Real) {
+        let wi = ps[i].inv_mass;
+        let wj = ps[j].inv_mass;
+        let wsum = wi + wj;
+        if wsum == 0.0 {
+            return;
+        }
+        let delta = ps[i].pos - ps[j].pos;
+        let len = delta.length();
+        if len < 1e-12 {
+            return;
+        }
+        let n = delta / len; // contact normal (b → a)
+        let v_rel = ps[i].vel - ps[j].vel;
+        let vn = v_rel.dot(n);
+        let v_t = v_rel - n * vn; // tangential relative velocity
+        // Apply -μ·v_t distributed by inverse mass (like a velocity constraint).
+        let corr = v_t * mu;
+        ps[i].vel -= corr * (wi / wsum);
+        ps[j].vel += corr * (wj / wsum);
+    }
+
+    fn solve_self_collisions(&mut self, alpha: Real) -> Vec<(usize, usize)> {
         let params = match self.self_collision {
             Some(p) => p,
-            None => return,
+            None => return Vec::new(),
         };
         let d = params.radius * 2.0;
         // Inverse-mass view aligned to particle order (read by the projection helper).
@@ -673,6 +764,7 @@ impl SoftBody {
             grid.entry(key).or_default().push(i);
         }
         // For each free particle, test against its cell + 26 neighbours.
+        let mut contacts: Vec<(usize, usize)> = Vec::new();
         for &i in &free {
             let pi = self.particles[i].pos;
             let ci = (
@@ -702,12 +794,14 @@ impl SoftBody {
                                     &w,
                                     &mut 0.0,
                                 );
+                                contacts.push((i, j));
                             }
                         }
                     }
                 }
             }
         }
+        contacts
     }
 
     /// Adds a spring between particles `a` and `b` with the given stiffness/damping.
@@ -870,9 +964,17 @@ impl SoftBody {
         // compliance comes from `self.self_collision.stiffness`.
         if self.self_collision.is_some() {
             let stiffness = self.self_collision.unwrap().stiffness;
+            let mu = self.self_collision.unwrap().friction;
             let alpha = stiffness / (dt * dt);
+            let mut all_contacts: Vec<(usize, usize)> = Vec::new();
             for _ in 0..4 {
-                self.solve_self_collisions(alpha);
+                all_contacts.extend(self.solve_self_collisions(alpha));
+            }
+            // Phase 20: velocity-level friction (vel is valid post-integrate).
+            if let Some(mu) = mu {
+                for (i, j) in all_contacts {
+                    Self::damp_contact_velocity(&mut self.particles, i, j, mu);
+                }
             }
         }
     }
@@ -1502,6 +1604,9 @@ impl SoftBody {
         } else {
             0.0
         };
+        // Phase 20: accumulate self-collision contacts across iterations for
+        // post-recovery tangential friction.
+        let mut self_contacts: Vec<(usize, usize)> = Vec::new();
         for _ in 0..iterations {
             for ci in 0..ndc {
                 // Phase 13: honor per-constraint compliance → per-constraint α̃.
@@ -1535,8 +1640,10 @@ impl SoftBody {
                 );
             }
             // Phase 12: self-collision projection (broad-phase + push-apart) once
-            // per iteration, interleaved with the structural constraints.
-            self.solve_self_collisions(sc_alpha);
+            // per iteration, interleaved with the structural constraints. Phase 20:
+            // contacts are accumulated so tangential friction can be applied after
+            // velocity recovery (where velocities are valid).
+            self_contacts.extend(self.solve_self_collisions(sc_alpha));
         }
 
         // 3. Recover velocities.
@@ -1550,6 +1657,13 @@ impl SoftBody {
             // each step (jelly / slime energy loss). Skipped when damping == 0.
             if keep < 1.0 {
                 p.vel *= keep;
+            }
+        }
+        // Phase 20: velocity-level Coulomb friction at every self-collision contact.
+        // Runs after velocity recovery so `vel` reflects the post-projection motion.
+        if let Some(mu) = self.self_collision.and_then(|p| p.friction) {
+            for (i, j) in self_contacts {
+                Self::damp_contact_velocity(&mut self.particles, i, j, mu);
             }
         }
     }
@@ -1604,6 +1718,12 @@ pub fn solve_cross_body_collisions(set: &mut SoftBodySet, dt: Real) {
                 };
                 let radius = ca.radius.min(cb.radius);
                 let stiffness = ca.stiffness.min(cb.stiffness);
+                // Phase 20: effective contact friction = min of both bodies' μ (a frictionless
+                // body in the pair makes the contact frictionless, like real Coulomb coupling).
+                let friction = match (ca.friction, cb.friction) {
+                    (Some(x), Some(y)) => Some(x.min(y)),
+                    _ => None,
+                };
                 let d = radius * 2.0;
                 let compliance = stiffness / (dt * dt);
                 let mut pos_a: Vec<Vector> = Vec::new();
@@ -1692,6 +1812,18 @@ pub fn solve_cross_body_collisions(set: &mut SoftBodySet, dt: Real) {
                                     }
                                     if wb != 0.0 {
                                         bb.particles[ob_idx].pos -= dir_scaled(n, wb * dlambda);
+                                    }
+                                    // Phase 20: velocity-level Coulomb friction on the
+                                    // tangential relative slip (velocities are valid here,
+                                    // post step_xpbd).
+                                    if let Some(mu) = friction {
+                                        SoftBody::damp_contact_velocity_split(
+                                            &mut ba.particles,
+                                            &mut bb.particles,
+                                            oa_idx,
+                                            ob_idx,
+                                            mu,
+                                        );
                                     }
                                 }
                             }
