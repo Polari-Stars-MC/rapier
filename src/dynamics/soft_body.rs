@@ -1106,6 +1106,92 @@ impl SoftBody {
         Some(idx)
     }
 
+    /// Phase 21 — adaptive tetrahedral subdivision (1 → 4 barycentric split).
+    ///
+    /// Each source tetrahedron `[a,b,c,d]` gains one new particle at its centroid
+    /// (position = vertex mean; `inv_mass` = mean of the four endpoints, so a centroid
+    /// bounded by pinned vertices stays effectively pinned) and is replaced by four
+    /// sub-tetrahedra sharing that centroid: `(m,a,b,c)`, `(m,a,b,d)`, `(m,a,c,d)`,
+    /// `(m,b,c,d)`. The four sub-volumes sum exactly to the parent volume, so the
+    /// XPBD volume-conservation constraint (Phase 16) stays consistent — the centroid
+    /// particle is a vertex of every sub-tet, so it is driven by those volume
+    /// constraints directly (no extra distance edges are added, which would
+    /// over-constrain and destabilise the solve). The shell topology (`triangles`)
+    /// is left untouched — this is a volumetric refinement.
+    ///
+    /// *Adaptive*: a source tet is only split when its longest edge exceeds
+    /// `max_edge_len`. Pass `max_edge_len = +∞` (the default when `!max_edge_len.is_finite()`)
+    /// to subdivide every tet unconditionally. Returns the number of source tetrahedra
+    /// actually split (0 if none qualified, e.g. all edges already short enough).
+    ///
+    /// Pure topology edit — no solver state, no SoA interaction. Determinism: source
+    /// tets are processed in index order, so subdivision is reproducible.
+    pub fn subdivide_tetrahedra(&mut self, max_edge_len: Real) -> usize {
+        let src_tets: Vec<[u32; 4]> = self.tetrahedra.clone();
+        let src_rests: Vec<Real> = self.tetra_rest_volumes.clone();
+        if src_tets.is_empty() {
+            return 0;
+        }
+        // Adaptive filter: only split tets whose longest edge exceeds the threshold.
+        let adaptive = max_edge_len.is_finite();
+        let mut new_tets: Vec<[u32; 4]> = Vec::with_capacity(src_tets.len() * 4);
+        let mut new_rests: Vec<Real> = Vec::with_capacity(src_tets.len() * 4);
+        let mut split_count = 0usize;
+        for (ti, &tet) in src_tets.iter().enumerate() {
+            let [a, b, c, d] = tet;
+            let (pa, pb, pc, pd) = (
+                self.particles[a as usize].pos,
+                self.particles[b as usize].pos,
+                self.particles[c as usize].pos,
+                self.particles[d as usize].pos,
+            );
+            let longest = (pa - pb)
+                .length()
+                .max((pa - pc).length())
+                .max((pa - pd).length())
+                .max((pb - pc).length())
+                .max((pb - pd).length())
+                .max((pc - pd).length());
+            if adaptive && longest <= max_edge_len {
+                // Keep the parent tet unchanged.
+                new_tets.push(tet);
+                new_rests.push(src_rests[ti]);
+                continue;
+            }
+            // Centroid particle (mean position + mean inverse mass).
+            let mpos = (pa + pb + pc + pd) * 0.25;
+            let im = (self.particles[a as usize].inv_mass
+                + self.particles[b as usize].inv_mass
+                + self.particles[c as usize].inv_mass
+                + self.particles[d as usize].inv_mass)
+                * 0.25;
+            let m = self.particles.len() as u32;
+            self.particles.push(SoftParticle {
+                pos: mpos,
+                vel: Vector::ZERO,
+                force: Vector::ZERO,
+                inv_mass: im,
+                bound_body: None,
+                bound_local: Vector::ZERO,
+            });
+            // Four sub-tetrahedra; each sub-rest-volume = 1/4 of the parent.
+            let sub_rest = src_rests[ti] * 0.25;
+            for sub in [
+                [m, a, b, c],
+                [m, a, b, d],
+                [m, a, c, d],
+                [m, b, c, d],
+            ] {
+                new_tets.push(sub);
+                new_rests.push(sub_rest);
+            }
+            split_count += 1;
+        }
+        self.tetrahedra = new_tets;
+        self.tetra_rest_volumes = new_rests;
+        split_count
+    }
+
     /// Phase 6 — cloth: adds a triangular face `[a, b, c]` (CCW for outward
     /// normal) to the body's shell topology **and** automatically registers its
     /// three structural edges as distance constraints (rest length from the
