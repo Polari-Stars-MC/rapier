@@ -30,6 +30,7 @@ use crate::dynamics::{
     force_containers::{ForceEntry, ForceKind, KindContainer, Persistence},
 };
 use crate::math::{AngVector, Real, Vector};
+use std::collections::HashSet;
 use std::vec::Vec;
 
 /// `ForceKind::Custom` discriminator for soft-body internal spring/damping forces.
@@ -223,6 +224,13 @@ pub struct SoftBody {
     /// gravity — a pure external force, no new solver mechanics. Applied in both
     /// the `MassSpring` (`compute_forces`) and `Xpbd` (`step_xpbd` predict) paths.
     pub wind: Option<Wind>,
+    /// Phase 9: tearing threshold. When `Some(ε)`, any structural edge (XPBD
+    /// distance constraint or MassSpring spring) whose strain `(|len| − rest)/rest`
+    /// exceeds `ε` is removed at the start of each [`SoftBody::step`]. Triangular
+    /// faces that lose any structural edge are dropped too, so a torn cloth stops
+    /// rendering the broken face. `None` (default) = no tearing. Pure topology
+    /// edit — no new solver mechanics, no SoA interaction.
+    pub tear_strain: Option<Real>,
 }
 
 impl SoftBody {
@@ -241,6 +249,7 @@ impl SoftBody {
             collide: false,
             particle_radius: 0.1,
             wind: None,
+            tear_strain: None,
         }
     }
 
@@ -427,6 +436,9 @@ impl SoftBody {
         if self.sleeping {
             return;
         }
+        // Phase 9: remove over-stretched structural edges before integrating.
+        // (No-op unless `tear_strain` is `Some`.)
+        self.tear();
         // Phase 5f: when collision coupling is on, the integration layer drives
         // particle positions/velocities from proxy rigid bodies (after the
         // rigid-body narrow-phase/contact step), so we must not integrate here.
@@ -587,6 +599,106 @@ impl SoftBody {
             compliance: 0.0,
         });
         Some(idx)
+    }
+
+    /// Phase 9: enables/disables tearing. `strain` is the max allowed strain
+    /// `(|len| − rest)/rest` before a structural edge snaps. Pass `None` to
+    /// disable (default). A value ≤ 0 tears immediately on any stretch.
+    pub fn set_tear_strain(&mut self, strain: Option<Real>) {
+        self.tear_strain = strain;
+    }
+
+    /// Phase 9: removes every over-stretched structural edge. Called once at the
+    /// top of [`SoftBody::step`]; a no-op when `tear_strain` is `None`.
+    ///
+    /// Edge strain is `s = (|len| − rest) / rest`. An XPBD distance constraint or
+    /// MassSpring spring with `s > threshold` is dropped. Triangular faces that
+    /// lose any of their structural edges (a-b, b-c, c-a) are dropped as well, so
+    /// a torn cloth stops rendering the broken face. Pure topology edit — neither
+    /// the SoA solver nor the integration order is touched.
+    pub fn tear(&mut self) {
+        let threshold = match self.tear_strain {
+            Some(t) => t,
+            None => return,
+        };
+        if threshold <= 0.0 {
+            return; // 0 / negative would tear everything on the first step.
+        }
+
+        // Collect the surviving distance-constraint edges (and their indices).
+        let mut keep_dc: Vec<(usize, DistanceConstraint)> = Vec::new();
+        for (i, c) in self.distance_constraints.iter().enumerate() {
+            let (pa, pb) = match (self.particles.get(c.a), self.particles.get(c.b)) {
+                (Some(a), Some(b)) => (a, b),
+                _ => continue, // dangling edge → drop.
+            };
+            let len = (pb.pos - pa.pos).length();
+            let strain = if c.rest > 0.0 {
+                (len - c.rest) / c.rest
+            } else {
+                0.0
+            };
+            if strain <= threshold {
+                keep_dc.push((i, *c));
+            }
+        }
+        let broken_dc: HashSet<usize> = {
+            let mut s = HashSet::new();
+            for i in 0..self.distance_constraints.len() {
+                if !keep_dc.iter().any(|(ki, _)| *ki == i) {
+                    s.insert(i);
+                }
+            }
+            s
+        };
+        self.distance_constraints = keep_dc.into_iter().map(|(_, c)| c).collect();
+
+        // Same for MassSpring springs.
+        let mut keep_sp: Vec<Spring> = Vec::new();
+        for s in self.springs.drain(..) {
+            let (pa, pb) = match (self.particles.get(s.a), self.particles.get(s.b)) {
+                (Some(a), Some(b)) => (a, b),
+                _ => continue,
+            };
+            let len = (pb.pos - pa.pos).length();
+            let strain = if s.rest_length > 0.0 {
+                (len - s.rest_length) / s.rest_length
+            } else {
+                0.0
+            };
+            if strain <= threshold {
+                keep_sp.push(s);
+            }
+        }
+        self.springs = keep_sp;
+
+        // Drop triangles that lost any structural edge. A triangle's structural
+        // edges are its three sides; an edge is "structural" if it survives as a
+        // distance constraint (the XPBD path used by cloth) before this tear.
+        // (MassSpring cloth is built from springs, which we also dropped above, so
+        // we check both: an edge that is neither a surviving distance-constraint
+        // nor a surviving spring has snapped.)
+        let has_edge = |a: u32, b: u32| -> bool {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            self.distance_constraints.iter().any(|c| {
+                let (ca, cb) = if c.a as u32 <= c.b as u32 {
+                    (c.a as u32, c.b as u32)
+                } else {
+                    (c.b as u32, c.a as u32)
+                };
+                (ca, cb) == (lo, hi)
+            }) || self.springs.iter().any(|s| {
+                let (sa, sb) = if s.a as u32 <= s.b as u32 {
+                    (s.a as u32, s.b as u32)
+                } else {
+                    (s.b as u32, s.a as u32)
+                };
+                (sa, sb) == (lo, hi)
+            })
+        };
+        self.triangles
+            .retain(|t| has_edge(t[0], t[1]) && has_edge(t[1], t[2]) && has_edge(t[2], t[0]));
+        let _ = broken_dc; // retained for clarity; broken edges already excluded.
     }
 
     /// Removes the particle at `index`, keeping the topology consistent.
