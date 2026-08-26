@@ -30,7 +30,7 @@ use crate::dynamics::{
     force_containers::{ForceEntry, ForceKind, KindContainer, Persistence},
 };
 use crate::math::{AngVector, Real, Vector};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::vec::Vec;
 
 /// `ForceKind::Custom` discriminator for soft-body internal spring/damping forces.
@@ -247,8 +247,17 @@ pub struct SoftBody {
     /// = perfectly elastic (Hookean). Pure rest-length edit — no new solver
     /// mechanics, no SoA interaction.
     pub plasticity: Option<PlasticityParams>,
+    /// Phase 12: self-collision. When `Some(params)`, the body's free particles
+    /// repel each other when their centres come within `2·params.radius` (each
+    /// particle behaves as a sphere of that radius). Broad-phase uses a uniform
+    /// spatial hash; detected pairs are solved as stiff XPBD distance constraints
+    /// (rest = `2·radius`, compliance = `params.stiffness`) every solver iteration,
+    /// in both the MassSpring and XPBD paths. Direct structural neighbours (linked
+    /// by a [`SoftBody::distance_constraints`] edge) are excluded so existing
+    /// springs/cloth edges are not treated as collisions. `None` (default) = off.
+    /// Pure positional projection — no new solver mechanics, no SoA interaction.
+    pub self_collision: Option<SelfCollisionParams>,
 }
-
 /// Phase 10: plasticity parameters (see [`SoftBody::plasticity`]).
 #[derive(Clone, Copy, Debug)]
 pub struct PlasticityParams {
@@ -259,6 +268,19 @@ pub struct PlasticityParams {
     /// from elastic to plastic (rest-length) each step. `1` = instantly frozen at
     /// the yield surface; `0` = no plasticity (elastic).
     pub creep: Real,
+}
+
+/// Phase 12: self-collision parameters (see [`SoftBody::self_collision`]).
+#[derive(Clone, Copy, Debug)]
+pub struct SelfCollisionParams {
+    /// Particle collision radius. Two *free* particles whose centres come within
+    /// `2·radius` are pushed apart (each treated as a sphere of this radius). Should
+    /// match `SoftBody::particle_radius` used by the proxy-collider path, but is
+    /// independent here so self-collision works without rigin-body coupling. Must be > 0.
+    pub radius: Real,
+    /// XPBD compliance of the repulsion constraint. `0` = perfectly hard (rigid
+    /// non-penetration); larger values allow softer, springier contact. Must be ≥ 0.
+    pub stiffness: Real,
 }
 
 impl SoftBody {
@@ -280,6 +302,7 @@ impl SoftBody {
             tear_strain: None,
             plasticity: None,
             pressure: None,
+            self_collision: None,
         }
     }
 
@@ -438,6 +461,103 @@ impl SoftBody {
         forces
     }
 
+    /// Phase 12: enables self-collision with the given `radius` (particle sphere
+    /// radius) and `stiffness` (XPBD compliance of the repulsion constraint, `0`
+    /// = hard). Pairs of free particles closer than `2·radius` are pushed apart
+    /// every solver iteration. Rejects non-positive `radius` or negative
+    /// `stiffness` (returns `false` without enabling).
+    pub fn set_self_collision(&mut self, radius: Real, stiffness: Real) -> bool {
+        if !(radius > 0.0) || stiffness < 0.0 {
+            return false;
+        }
+        self.self_collision = Some(SelfCollisionParams { radius, stiffness });
+        true
+    }
+
+    /// Phase 12: disables self-collision (`None`).
+    pub fn clear_self_collision(&mut self) {
+        self.self_collision = None;
+    }
+
+    /// Phase 12: broad-phase + projection for self-collision. Builds a uniform
+    /// spatial hash (cell size `2·radius`) over the *free* particle positions,
+    /// finds all pairs within `2·radius` that are NOT direct structural neighbours
+    /// (linked by an existing distance constraint), and projects each apart as a
+    /// stiff XPBD distance constraint (`rest = 2·radius`, `compliance = stiffness`).
+    ///
+    /// `alpha` is the XPBD `α̃ = compliance / dt²` already used by the caller. The
+    /// caller decides how many times to invoke this (once per iteration in XPBD,
+    /// a few times after integration in MassSpring). Pure positional projection:
+    /// `self.particles` is mutated directly; no new solver mechanics.
+    fn solve_self_collisions(&mut self, alpha: Real) {
+        let params = match self.self_collision {
+            Some(p) => p,
+            None => return,
+        };
+        let d = params.radius * 2.0;
+        // Inverse-mass view aligned to particle order (read by the projection helper).
+        let w: Vec<Real> = self.particles.iter().map(|p| p.inv_mass).collect();
+        // Structural neighbour set: (min,max) of every distance-constraint edge.
+        let mut neighbours: HashSet<(usize, usize)> = HashSet::new();
+        for c in &self.distance_constraints {
+            let (a, b) = (c.a, c.b);
+            let key = if a <= b { (a, b) } else { (b, a) };
+            neighbours.insert(key);
+        }
+        // Build spatial hash of free-particle indices.
+        let cell = d;
+        let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+        let mut free: Vec<usize> = Vec::new();
+        for (i, p) in self.particles.iter().enumerate() {
+            if p.inv_mass == 0.0 {
+                continue; // pinned / bound particles don't self-collide
+            }
+            free.push(i);
+            let key = (
+                (p.pos.x / cell).floor() as i64,
+                (p.pos.y / cell).floor() as i64,
+                (p.pos.z / cell).floor() as i64,
+            );
+            grid.entry(key).or_default().push(i);
+        }
+        // For each free particle, test against its cell + 26 neighbours.
+        for &i in &free {
+            let pi = self.particles[i].pos;
+            let ci = (
+                (pi.x / cell).floor() as i64,
+                (pi.y / cell).floor() as i64,
+                (pi.z / cell).floor() as i64,
+            );
+            for gx in ci.0 - 1..=ci.0 + 1 {
+                for gy in ci.1 - 1..=ci.1 + 1 {
+                    for gz in ci.2 - 1..=ci.2 + 1 {
+                        if let Some(bucket) = grid.get(&(gx, gy, gz)) {
+                            for &j in bucket {
+                                if j <= i {
+                                    continue; // each unordered pair once
+                                }
+                                let key = if i <= j { (i, j) } else { (j, i) };
+                                if neighbours.contains(&key) {
+                                    continue; // structural link, not a collision
+                                }
+                                // Project apart using the shared XPBD primitive.
+                                solve_distance_constraint(
+                                    &mut self.particles,
+                                    i,
+                                    j,
+                                    d,
+                                    alpha,
+                                    &w,
+                                    &mut 0.0,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Adds a spring between particles `a` and `b` with the given stiffness/damping.
     /// The rest length is taken from the current distance between the endpoints.
     /// Returns `None` (and does nothing) if either index is out of bounds or the
@@ -587,6 +707,16 @@ impl SoftBody {
         }
         self.compute_forces();
         self.integrate(dt);
+        // Phase 12: self-collision as positional projection (a handful of passes).
+        // Reuses the same broad-phase + XPBD push-apart as the XPBD path; the
+        // compliance comes from `self.self_collision.stiffness`.
+        if self.self_collision.is_some() {
+            let stiffness = self.self_collision.unwrap().stiffness;
+            let alpha = stiffness / (dt * dt);
+            for _ in 0..4 {
+                self.solve_self_collisions(alpha);
+            }
+        }
     }
 
     /// Total kinetic energy of the free particles (`½ · m · |v|²`).
@@ -1156,6 +1286,9 @@ impl SoftBody {
                     &mut v_lambda[ti],
                 );
             }
+            // Phase 12: self-collision projection (broad-phase + push-apart) once
+            // per iteration, interleaved with the structural constraints.
+            self.solve_self_collisions(alpha);
         }
 
         // 3. Recover velocities.
