@@ -224,6 +224,14 @@ pub struct SoftBody {
     /// gravity — a pure external force, no new solver mechanics. Applied in both
     /// the `MassSpring` (`compute_forces`) and `Xpbd` (`step_xpbd` predict) paths.
     pub wind: Option<Wind>,
+    /// Phase 11: uniform internal pressure (`P`, force/area). When `Some`, every
+    /// free particle of a closed triangular mesh gets an outward push along the
+    /// surface normal, `F = P · area` per incident triangle (balloon / gas-law
+    /// model). A pure external force mirroring [`Self::wind`]; applied in both the
+    /// MassSpring (`compute_forces`) and XPBD (`step_xpbd` predict) paths. `None`
+    /// (default) = no pressure. Closed manifold (`self.triangles`) needed for a
+    /// real balloon; an open sheet just bulges along single-sided normals.
+    pub pressure: Option<Real>,
     /// Phase 9: tearing threshold. When `Some(ε)`, any structural edge (XPBD
     /// distance constraint or MassSpring spring) whose strain `(|len| − rest)/rest`
     /// exceeds `ε` is removed at the start of each [`SoftBody::step`]. Triangular
@@ -271,6 +279,7 @@ impl SoftBody {
             wind: None,
             tear_strain: None,
             plasticity: None,
+            pressure: None,
         }
     }
 
@@ -338,6 +347,95 @@ impl SoftBody {
     /// Phase 7: disables the wind field (`None`).
     pub fn clear_wind(&mut self) {
         self.wind = None;
+    }
+
+    /// Phase 11: enables a uniform internal pressure `P` (force/area). When `P > 0`,
+    /// every free particle of a closed triangular mesh is pushed outward along the
+    /// surface normal with force `F = P · area` per incident triangle (the balloon /
+    /// gas-law model). Pass `P <= 0` (or [`Self::clear_pressure`]) to disable.
+    pub fn set_pressure(&mut self, pressure: Real) {
+        if pressure > 0.0 {
+            self.pressure = Some(pressure);
+        } else {
+            self.pressure = None;
+        }
+    }
+
+    /// Phase 11: disables internal pressure (`None`).
+    pub fn clear_pressure(&mut self) {
+        self.pressure = None;
+    }
+
+    /// Phase 11: per-particle outward pressure forces, `F_i = Σ_t P · area(t) · n̂(t)`
+    /// over triangles incident to `i`. The normal is the *centroid-oriented* outward
+    /// direction: each triangle contributes equally to its three vertices using the
+    /// face normal that points away from the mesh centroid. This keeps a closed mesh
+    /// inflating symmetrically (no net single-sided bias) and lets an open sheet
+    /// bulge along its normals. Pure topology read — no solver state touched.
+    fn pressure_forces(&self) -> Vec<Vector> {
+        let p = match self.pressure {
+            Some(p) => p,
+            None => {
+                return {
+                    let mut v = Vec::with_capacity(self.particles.len());
+                    for _ in 0..self.particles.len() {
+                        v.push(Vector::ZERO);
+                    }
+                    v
+                };
+            }
+        };
+        // Mesh centroid for outward orientation.
+        let centroid = if self.particles.is_empty() {
+            Vector::ZERO
+        } else {
+            let mut c = Vector::ZERO;
+            for pt in &self.particles {
+                c += pt.pos;
+            }
+            c / (self.particles.len() as Real)
+        };
+        let mut forces = Vec::with_capacity(self.particles.len());
+        for _ in 0..self.particles.len() {
+            forces.push(Vector::ZERO);
+        }
+        for tri in &self.triangles {
+            let (ia, ib, ic) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+            let (pa, pb, pc) = match (
+                self.particles.get(ia),
+                self.particles.get(ib),
+                self.particles.get(ic),
+            ) {
+                (Some(a), Some(b), Some(c)) => (a.pos, b.pos, c.pos),
+                _ => continue,
+            };
+            // Face normal (not normalized) = (b−a) × (c−a); magnitude = 2·area.
+            let n = (pb - pa).cross(pc - pa);
+            let area = n.length() * 0.5;
+            if area <= 0.0 {
+                continue;
+            }
+            // Orient outward relative to centroid; n̂ is the unit face normal.
+            let n_hat = n.normalize();
+            let tri_center = (pa + pb + pc) / 3.0;
+            let outward = if (tri_center - centroid).dot(n_hat) >= 0.0 {
+                n_hat
+            } else {
+                -n_hat
+            };
+            // Force magnitude per triangle: P · area, split equally to 3 vertices.
+            let f = outward * (p * area / 3.0);
+            if let Some(fa) = forces.get_mut(ia) {
+                *fa += f;
+            }
+            if let Some(fb) = forces.get_mut(ib) {
+                *fb += f;
+            }
+            if let Some(fc) = forces.get_mut(ic) {
+                *fc += f;
+            }
+        }
+        forces
     }
 
     /// Adds a spring between particles `a` and `b` with the given stiffness/damping.
@@ -415,6 +513,8 @@ impl SoftBody {
     /// so the rigid body's own integrator applies it through `force_containers`.
     pub fn compute_forces(&mut self) {
         let spring = self.spring_damping_forces();
+        // Phase 11: internal pressure (balloon model) — computed once, added per particle.
+        let pressure = self.pressure_forces();
         for (i, p) in self.particles.iter_mut().enumerate() {
             if p.bound_body.is_some() {
                 // Driven externally via force_containers; no local integration.
@@ -431,6 +531,9 @@ impl SoftBody {
                 p.force += p.mass() * wind.accel;
                 p.force -= p.mass() * wind.drag * p.vel;
             }
+            // Phase 11: internal pressure pushes free particles outward along the
+            // surface normal (balloon model).
+            p.force += pressure[i];
             p.force += spring[i];
         }
     }
@@ -978,6 +1081,9 @@ impl SoftBody {
         }
 
         // 1. Predict.
+        // Phase 11: internal pressure (balloon model) as a pure external
+        // acceleration, applied alongside gravity/wind in the predict step.
+        let pressure_forces = self.pressure_forces();
         for (i, p) in self.particles.iter_mut().enumerate() {
             if w[i] == 0.0 {
                 continue;
@@ -989,6 +1095,8 @@ impl SoftBody {
                 a += wind.accel;
                 a -= wind.drag * p.vel;
             }
+            // Phase 11: pressure force → acceleration (a += M⁻¹ · F).
+            a += pressure_forces[i] * p.inv_mass;
             p.vel += dir_scaled(a, dt);
             p.pos += dir_scaled(p.vel, dt);
         }
