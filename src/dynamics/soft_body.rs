@@ -274,6 +274,13 @@ pub struct SoftBody {
     /// = fall back to the global solver compliance for tetra volume (existing
     /// behaviour). Pure positional constraint — no new solver mechanics.
     pub volume_conservation: Option<Real>,
+    /// Phase 17: cohesion (adhesion / breakable glue) between this body and *other*
+    /// bodies. When `Some(p)`, free particles of this body within `p.radius` of a
+    /// free particle of another cohesion-enabled body attract toward contact, bonding
+    /// the bodies (the dual of Phase 9 tearing). Bonds break when pulled apart beyond
+    /// `p.break_distance`. Solved at world level by `solve_cohesion`. `None` (default)
+    /// = off.
+    pub cohesion: Option<CohesionParams>,
 }
 /// Phase 10: plasticity parameters (see [`SoftBody::plasticity`]).
 #[derive(Clone, Copy, Debug)]
@@ -300,6 +307,31 @@ pub struct SelfCollisionParams {
     pub stiffness: Real,
 }
 
+/// Phase 17: cohesion (adhesion / breakable glue) parameters for inter-body
+/// (soft-soft) contact — the dual of Phase 9 tearing. Two *free* particles from
+/// *different* bodies whose centres come within `radius` attract toward contact
+/// (rest distance `radius`), bonding the bodies together like glue. The bond is
+/// *breakable*: if the pair separation ever exceeds `break_distance` (which is
+/// usually `> radius`, giving a hysteresis so bonded pairs need to be pulled apart
+/// to break), the attraction is released for that pair for the rest of the step —
+/// i.e. the glue tears. Each step is stateless: bonds are re-evaluated from the
+/// current geometry, so it composes naturally with Phase 14 cross-collision.
+#[derive(Clone, Copy, Debug)]
+pub struct CohesionParams {
+    /// Capture radius: a free particle from another body within this distance is
+    /// attracted and bonded. Should match `SoftBody::particle_radius` conceptually.
+    /// Must be > 0.
+    pub radius: Real,
+    /// XPBD compliance of the attraction constraint. `0` = hard glue (bonded pairs
+    /// snap to exactly `radius` apart); larger values give springier, stretchier
+    /// glue. Must be ≥ 0.
+    pub stiffness: Real,
+    /// Break distance: once a bonded pair is pulled apart beyond this separation the
+    /// attraction releases (the glue tears). Must be `> radius`. `inf` disables
+    /// breaking (permanent glue).
+    pub break_distance: Real,
+}
+
 impl SoftBody {
     /// Creates an empty soft body in a gravity field `gravity`.
     pub fn new(gravity: Vector) -> Self {
@@ -322,6 +354,7 @@ impl SoftBody {
             self_collision: None,
             cross_collision: None,
             volume_conservation: None,
+            cohesion: None,
         }
     }
 
@@ -534,6 +567,35 @@ impl SoftBody {
     /// reverting tetra volume to the global solver compliance.
     pub fn clear_volume_conservation(&mut self) {
         self.volume_conservation = None;
+    }
+
+    /// Phase 17: enables cohesion (adhesion / breakable glue) toward other bodies with
+    /// the given `radius`, `stiffness` (compliance of the attraction constraint) and
+    /// `break_distance` (separation at which a bond tears). Returns `false` (and does
+    /// nothing) if `radius <= 0`, `stiffness < 0`, `break_distance <= radius`, or
+    /// `break_distance`/`radius`/`stiffness` is `NaN`. `break_distance == +inf` is
+    /// explicitly allowed (permanent, unbreakable glue).
+    pub fn set_cohesion(&mut self, radius: Real, stiffness: Real, break_distance: Real) -> bool {
+        if !radius.is_finite()
+            || !stiffness.is_finite()
+            || break_distance.is_nan()
+            || !(radius > 0.0)
+            || stiffness < 0.0
+            || break_distance <= radius
+        {
+            return false;
+        }
+        self.cohesion = Some(CohesionParams {
+            radius,
+            stiffness,
+            break_distance,
+        });
+        true
+    }
+
+    /// Phase 17: disables cohesion (`None`).
+    pub fn clear_cohesion(&mut self) {
+        self.cohesion = None;
     }
 
     /// Phase 12: broad-phase + projection for self-collision. Builds a uniform
@@ -1548,6 +1610,152 @@ pub fn solve_cross_body_collisions(set: &mut SoftBodySet, dt: Real) {
                                     }
                                     if wb != 0.0 {
                                         bb.particles[ob_idx].pos -= dir_scaled(n, wb * dlambda);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Phase 17: world-level cohesion (adhesion / breakable glue) between soft bodies.
+///
+/// For every pair of bodies that both have `cohesion` set, free particles of `a` within
+/// `radius = min(radius_a, radius_b)` of a free particle of `b` are attracted toward
+/// contact (rest distance `radius`) via an XPBD constraint with compliance
+/// `min(stiffness_a, stiffness_b) / dt²`. This bonds the two bodies together like glue —
+/// the dual of Phase 9 tearing (which *breaks* edges; this *creates* bonds between bodies).
+///
+/// Bonds are *breakable*: if the pair is already separated by more than
+/// `min(break_distance_a, break_distance_b)` the attraction is skipped (the glue has torn
+/// and is not re-formed this step). Because the solve is stateless and re-evaluated every
+/// step from current positions, a pair that drifts back within `radius` re-bonds — unless
+/// `break_distance` is `inf` (permanent glue). Runs a few iterations for stability. Shares
+/// the spatial-hash structure of [`solve_cross_body_collisions`]. Pure positional projection
+/// — no new solver mechanics, no SoA interaction.
+pub fn solve_cohesion(set: &mut SoftBodySet, dt: Real) {
+    let mut ids: Vec<SoftBodyId> = Vec::new();
+    for (id, sb) in set.iter() {
+        if sb.cohesion.is_some() {
+            ids.push(id);
+        }
+    }
+    ids.sort_by_key(|id| id.0);
+    let n = ids.len();
+    for _iter in 0..3 {
+        for ia in 0..n {
+            for ib in (ia + 1)..n {
+                let a = ids[ia];
+                let b = ids[ib];
+                let (pa, pb) = match (set.get(a), set.get(b)) {
+                    (Some(x), Some(y)) => (x, y),
+                    _ => continue,
+                };
+                let (ca, cb) = match (pa.cohesion, pb.cohesion) {
+                    (Some(x), Some(y)) => (x, y),
+                    _ => continue,
+                };
+                let radius = ca.radius.min(cb.radius);
+                let stiffness = ca.stiffness.min(cb.stiffness);
+                let break_distance = ca.break_distance.min(cb.break_distance);
+                // `capture` = how far apart two free particles may be and still form a bond
+                // (must exceed the rest distance `radius`, else indistinguishable from a
+                // non-overlapping contact). `d` = rest distance of the attraction (contact).
+                let capture = radius * 2.0;
+                let d = radius;
+                let compliance = stiffness / (dt * dt);
+                let mut pos_a: Vec<Vector> = Vec::new();
+                let mut w_a: Vec<Real> = Vec::new();
+                let mut map_a: HashMap<usize, usize> = HashMap::new();
+                for (oi, p) in pa.particles.iter().enumerate() {
+                    if p.inv_mass != 0.0 {
+                        map_a.insert(oi, pos_a.len());
+                        pos_a.push(p.pos);
+                        w_a.push(p.inv_mass);
+                    }
+                }
+                let mut pos_b: Vec<Vector> = Vec::new();
+                let mut w_b: Vec<Real> = Vec::new();
+                let mut map_b: HashMap<usize, usize> = HashMap::new();
+                for (oi, p) in pb.particles.iter().enumerate() {
+                    if p.inv_mass != 0.0 {
+                        map_b.insert(oi, pos_b.len());
+                        pos_b.push(p.pos);
+                        w_b.push(p.inv_mass);
+                    }
+                }
+                let cell = capture;
+                let mut grid: HashMap<(i64, i64, i64), Vec<(usize, bool)>> = HashMap::new();
+                for (si, p) in pos_a.iter().enumerate() {
+                    let key = (
+                        (p.x / cell).floor() as i64,
+                        (p.y / cell).floor() as i64,
+                        (p.z / cell).floor() as i64,
+                    );
+                    grid.entry(key).or_insert_with(Vec::new).push((si, false));
+                }
+                for (si, p) in pos_b.iter().enumerate() {
+                    let key = (
+                        (p.x / cell).floor() as i64,
+                        (p.y / cell).floor() as i64,
+                        (p.z / cell).floor() as i64,
+                    );
+                    grid.entry(key).or_insert_with(Vec::new).push((si, true));
+                }
+                let mut pairs: Vec<(usize, usize)> = Vec::new();
+                for (si, p) in pos_a.iter().enumerate() {
+                    let cx = (p.x / cell).floor() as i64;
+                    let cy = (p.y / cell).floor() as i64;
+                    let cz = (p.z / cell).floor() as i64;
+                    for ox in -1..=1i64 {
+                        for oy in -1..=1i64 {
+                            for oz in -1..=1i64 {
+                                if let Some(bucket) = grid.get(&(cx + ox, cy + oy, cz + oz)) {
+                                    for &(sj, is_b) in bucket {
+                                        if !is_b {
+                                            continue;
+                                        }
+                                        let delta = pos_a[si] - pos_b[sj];
+                                        let dist = delta.length();
+                                        // Bond only when within capture radius AND not
+                                        // already torn apart beyond break_distance.
+                                        if dist < capture && dist > 1e-9 && dist < break_distance {
+                                            pairs.push((si, sj));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for &(sa, sb_idx) in &pairs {
+                    let (body_a, body_b) = set.get2_mut(a, b);
+                    let oa_idx = map_a.iter().find(|(_, v)| **v == sa).map(|(&k, _)| k);
+                    let ob_idx = map_b.iter().find(|(_, v)| **v == sb_idx).map(|(&k, _)| k);
+                    if let (Some(oa_idx), Some(ob_idx)) = (oa_idx, ob_idx) {
+                        if let (Some(ba), Some(bb)) = (body_a, body_b) {
+                            let wa = w_a[sa];
+                            let wb = w_b[sb_idx];
+                            let pa_now = ba.particles[oa_idx].pos;
+                            let pb_now = bb.particles[ob_idx].pos;
+                            let delta = pa_now - pb_now;
+                            let dist = delta.length();
+                            if dist < capture && dist > 1e-9 && dist < break_distance {
+                                let nrm = delta / dist;
+                                // Attract: pull the two particles toward contact distance d.
+                                // c(dist) = dist - d  (>0 means too far -> attract inward).
+                                let cval = dist - d;
+                                let wsum = wa + wb;
+                                if wsum > 0.0 {
+                                    let dlambda = (-cval - compliance * 0.0) / (wsum + compliance);
+                                    if wa != 0.0 {
+                                        ba.particles[oa_idx].pos += dir_scaled(nrm, wa * dlambda);
+                                    }
+                                    if wb != 0.0 {
+                                        bb.particles[ob_idx].pos -= dir_scaled(nrm, wb * dlambda);
                                     }
                                 }
                             }
