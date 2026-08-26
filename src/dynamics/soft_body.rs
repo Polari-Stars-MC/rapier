@@ -57,6 +57,11 @@ pub struct SoftParticle {
     /// (Phase 2), so the soft body drives the rigid body through the standard
     /// effective-force path rather than integrating the particle directly.
     pub bound_body: Option<RigidBodyHandle>,
+    /// Phase 8: when `bound_body` is `Some`, this is the attachment point
+    /// expressed in the bound body's *local* frame (so the particle rigidly
+    /// follows the body as it translates/rotates). Computed at attach time from
+    /// the world-space attach point; ignored when `bound_body` is `None`.
+    pub bound_local: Vector,
 }
 
 impl SoftParticle {
@@ -68,6 +73,7 @@ impl SoftParticle {
             force: Vector::ZERO,
             inv_mass: 1.0,
             bound_body: None,
+            bound_local: Vector::ZERO,
         }
     }
 
@@ -79,6 +85,7 @@ impl SoftParticle {
             force: Vector::ZERO,
             inv_mass: 0.0,
             bound_body: None,
+            bound_local: Vector::ZERO,
         }
     }
 
@@ -249,6 +256,44 @@ impl SoftBody {
         let idx = self.particles.len();
         self.particles.push(SoftParticle::pinned(pos));
         idx
+    }
+
+    /// Phase 8: anchors `particle` to a rigid body `body`, so it rigidly follows
+    /// that body's motion. `world_attach_point` is the world-space point where the
+    /// particle binds (usually the particle's current position). The point is
+    /// stored in the body's *local* frame so the particle tracks translation and
+    /// rotation. The particle stops integrating locally; its spring/damping force
+    /// is instead routed to the body via [`SoftBodySet::write_spring_forces`].
+    ///
+    /// Returns `false` if `particle` is out of range or `body` is not in `bodies`.
+    pub fn attach_particle(
+        &mut self,
+        particle: usize,
+        body: RigidBodyHandle,
+        world_attach_point: Vector,
+        bodies: &RigidBodySet,
+    ) -> bool {
+        let Some(rb) = bodies.get(body) else {
+            return false;
+        };
+        let local = rb.position().inverse_transform_point(world_attach_point);
+        let Some(p) = self.particles.get_mut(particle) else {
+            return false;
+        };
+        p.bound_body = Some(body);
+        p.bound_local = local;
+        true
+    }
+
+    /// Phase 8: detaches `particle` from any bound rigid body (returns it to a
+    /// free, locally-integrated particle). No-op if already free.
+    pub fn detach_particle(&mut self, particle: usize) -> bool {
+        let Some(p) = self.particles.get_mut(particle) else {
+            return false;
+        };
+        p.bound_body = None;
+        p.bound_local = Vector::ZERO;
+        true
     }
 
     /// Phase 7: enables a uniform wind / air-resistance field for this body.
@@ -1030,6 +1075,33 @@ impl SoftBodySet {
             .and_then(|b| b.as_ref())
             .map(|b| b.sleeping)
             .unwrap_or(false)
+    }
+
+    /// Phase 8: for every live soft body, snap each bound particle to its rigid
+    /// body's current world transform (`pos = body_local → world`, `vel =
+    /// body.velocity_at_point(world)`). Bound particles are infinite-mass in the
+    /// XPBD solve and skipped by local integration, so this is what makes a
+    /// particle *rigidly follow* the body it is anchored to (flags, tethers,
+    /// cloth pinned to a moving object). Call once per step, before
+    /// [`Self::step`] so the followers are already in place when constraints
+    /// project. Skips sleeping bodies.
+    pub fn follow_rigid_bodies(&mut self, bodies: &RigidBodySet) {
+        for body in self.bodies.iter_mut().flatten() {
+            if body.sleeping {
+                continue;
+            }
+            for p in body.particles.iter_mut() {
+                let Some(h) = p.bound_body else {
+                    continue;
+                };
+                let Some(rb) = bodies.get(h) else {
+                    continue;
+                };
+                let world = rb.position().transform_point(p.bound_local);
+                p.pos = world;
+                p.vel = rb.velocity_at_point(world);
+            }
+        }
     }
 
     /// Phase 2: routes each soft body's internal spring/damping forces into the

@@ -170,6 +170,10 @@ impl PhysicsWorld {
         // Phase 0b: advance free soft-body particles after the rigid-body pipeline.
         // Sleeping bodies are skipped inside `SoftBodySet::step`.
         self.soft_bodies.step(self.integration_parameters.dt);
+        // Phase 8: after the rigid pipeline integrates, snap bound soft particles
+        // to their rigid bodies' new world transforms (so anchored cloth/flags
+        // follow a moving body). Runs after step so followers see updated poses.
+        self.soft_bodies.follow_rigid_bodies(&self.bodies);
     }
 
     /// The bodies and colliders automatically disabled during the last step because their
