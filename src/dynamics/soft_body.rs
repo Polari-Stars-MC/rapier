@@ -264,6 +264,16 @@ pub struct SoftBody {
     /// but the world-level pass runs over pairs of bodies. `None` (default) = off.
     /// Pure positional projection — no new solver mechanics, no SoA interaction.
     pub cross_collision: Option<SelfCollisionParams>,
+    /// Phase 16: dedicated volume-conservation compliance for the tetrahedral
+    /// volume constraints. When `Some(c)`, every tetra volume constraint in
+    /// `step_xpbd` is solved with `α̃ = c / dt²` — *independent* of the distance
+    /// solver's compliance. This makes it possible to have soft edges but a hard
+    /// (incompressible) blob, or to keep volume conserved even when the distance
+    /// solver is soft. It is orthogonal to Phase 11 pressure (an outward force):
+    /// pressure inflates, this constraint holds the total volume. `None` (default)
+    /// = fall back to the global solver compliance for tetra volume (existing
+    /// behaviour). Pure positional constraint — no new solver mechanics.
+    pub volume_conservation: Option<Real>,
 }
 /// Phase 10: plasticity parameters (see [`SoftBody::plasticity`]).
 #[derive(Clone, Copy, Debug)]
@@ -311,6 +321,7 @@ impl SoftBody {
             pressure: None,
             self_collision: None,
             cross_collision: None,
+            volume_conservation: None,
         }
     }
 
@@ -504,6 +515,25 @@ impl SoftBody {
     /// Phase 14: disables soft-soft (cross-body) collision (`None`).
     pub fn clear_cross_collision(&mut self) {
         self.cross_collision = None;
+    }
+
+    /// Phase 16: enables the dedicated volume-conservation constraint with the given
+    /// `compliance` (`c`). Each tetra volume constraint in `step_xpbd` is then solved
+    /// with `α̃ = c / dt²`, independent of the distance solver's compliance. `c == 0`
+    /// gives a hard (incompressible) blob. Returns `false` (and does nothing) on a
+    /// non-finite or negative `compliance`.
+    pub fn set_volume_conservation(&mut self, compliance: Real) -> bool {
+        if !compliance.is_finite() || compliance < 0.0 {
+            return false;
+        }
+        self.volume_conservation = Some(compliance);
+        true
+    }
+
+    /// Phase 16: disables the dedicated volume-conservation constraint (`None`),
+    /// reverting tetra volume to the global solver compliance.
+    pub fn clear_volume_conservation(&mut self) {
+        self.volume_conservation = None;
     }
 
     /// Phase 12: broad-phase + projection for self-collision. Builds a uniform
@@ -1327,9 +1357,15 @@ impl SoftBody {
         for _ in 0..ntet {
             v_lambda.push(0.0);
         }
-        // Body-wide alpha for volume constraints (the tetrahedra share the solver's
-        // default compliance); distance constraints use their own per-constraint alpha.
-        let vol_alpha = self.xpbd_alpha(dt);
+        // Body-wide alpha for volume constraints. Phase 16: a dedicated
+        // `volume_conservation` compliance overrides the solver's default, so the
+        // tetra volume can be held hard (incompressible) even when the distance
+        // solver is soft. Falls back to the solver compliance when unset.
+        let vol_alpha = if let Some(c) = self.volume_conservation {
+            c / (dt * dt)
+        } else {
+            self.xpbd_alpha(dt)
+        };
         // Self-collision repulsion uses the compliance from `self_collision.stiffness`.
         let sc_alpha = if let Some(p) = self.self_collision {
             p.stiffness / (dt * dt)
