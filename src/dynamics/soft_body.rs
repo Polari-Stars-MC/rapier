@@ -1176,12 +1176,7 @@ impl SoftBody {
             });
             // Four sub-tetrahedra; each sub-rest-volume = 1/4 of the parent.
             let sub_rest = src_rests[ti] * 0.25;
-            for sub in [
-                [m, a, b, c],
-                [m, a, b, d],
-                [m, a, c, d],
-                [m, b, c, d],
-            ] {
+            for sub in [[m, a, b, c], [m, a, b, d], [m, a, c, d], [m, b, c, d]] {
                 new_tets.push(sub);
                 new_rests.push(sub_rest);
             }
