@@ -764,6 +764,41 @@ impl SoftBody {
         Some(idx)
     }
 
+    /// Phase 13 — sets the `stiffness` (Hookean `k`) of an existing spring (by the
+    /// index returned from `add_spring`) at runtime. Lets callers tune a body's
+    /// material heterogeneity after construction (e.g. stiffen a "bone", loosen a
+    /// "tendon") without rebuilding the topology. Returns `false` for an out-of-range
+    /// index or a negative/non-finite stiffness.
+    pub fn set_spring_stiffness(&mut self, index: usize, stiffness: Real) -> bool {
+        if stiffness < 0.0 || !stiffness.is_finite() {
+            return false;
+        }
+        match self.springs.get_mut(index) {
+            Some(s) => {
+                s.stiffness = stiffness;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Phase 13 — sets the XPBD `compliance` (α) of an existing distance constraint
+    /// (by the index returned from `add_distance_constraint`) at runtime. Per-constraint
+    /// compliance is honored by the XPBD solver (see `step_xpbd`). Returns `false` for
+    /// an out-of-range index or a negative/non-finite compliance.
+    pub fn set_distance_constraint_compliance(&mut self, index: usize, compliance: Real) -> bool {
+        if compliance < 0.0 || !compliance.is_finite() {
+            return false;
+        }
+        match self.distance_constraints.get_mut(index) {
+            Some(c) => {
+                c.compliance = compliance;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Adds a tetrahedral volume element `[a, b, c, d]`. The rest (reference)
     /// signed volume is computed from the current particle positions and cached.
     /// Returns `None` if any index is out of bounds or duplicated.
@@ -1232,7 +1267,6 @@ impl SoftBody {
         }
 
         // 2. Project (fixed order → deterministic).
-        let alpha = self.xpbd_alpha(dt);
         // Extract constraint parameters into local buffers so the projection loop
         // can mutate `self.particles` through `&mut self` without holding an
         // immutable borrow of `self.distance_constraints` / `self.tetrahedra`
@@ -1242,10 +1276,12 @@ impl SoftBody {
         let mut d_a = Vec::with_capacity(ndc);
         let mut d_b = Vec::with_capacity(ndc);
         let mut d_rest = Vec::with_capacity(ndc);
+        let mut d_comp = Vec::with_capacity(ndc);
         for c in &self.distance_constraints {
             d_a.push(c.a);
             d_b.push(c.b);
             d_rest.push(c.rest);
+            d_comp.push(c.compliance);
         }
         let mut d_lambda = Vec::with_capacity(ndc);
         #[allow(clippy::same_item_push)] // Lagrange accumulator, filled with zeros
@@ -1264,14 +1300,25 @@ impl SoftBody {
         for _ in 0..ntet {
             v_lambda.push(0.0);
         }
+        // Body-wide alpha for volume constraints (the tetrahedra share the solver's
+        // default compliance); distance constraints use their own per-constraint alpha.
+        let vol_alpha = self.xpbd_alpha(dt);
+        // Self-collision repulsion uses the compliance from `self_collision.stiffness`.
+        let sc_alpha = if let Some(p) = self.self_collision {
+            p.stiffness / (dt * dt)
+        } else {
+            0.0
+        };
         for _ in 0..iterations {
             for ci in 0..ndc {
+                // Phase 13: honor per-constraint compliance → per-constraint α̃.
+                let c_alpha = d_comp[ci] / (dt * dt);
                 solve_distance_constraint(
                     &mut self.particles,
                     d_a[ci],
                     d_b[ci],
                     d_rest[ci],
-                    alpha,
+                    c_alpha,
                     &w,
                     &mut d_lambda[ci],
                 );
@@ -1281,14 +1328,14 @@ impl SoftBody {
                     &mut self.particles,
                     &t_idx[ti],
                     t_rest[ti],
-                    alpha,
+                    vol_alpha,
                     &w,
                     &mut v_lambda[ti],
                 );
             }
             // Phase 12: self-collision projection (broad-phase + push-apart) once
             // per iteration, interleaved with the structural constraints.
-            self.solve_self_collisions(alpha);
+            self.solve_self_collisions(sc_alpha);
         }
 
         // 3. Recover velocities.
