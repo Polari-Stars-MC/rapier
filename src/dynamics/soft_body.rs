@@ -232,6 +232,16 @@ pub struct SoftBody {
     /// (default) = no pressure. Closed manifold (`self.triangles`) needed for a
     /// real balloon; an open sheet just bulges along single-sided normals.
     pub pressure: Option<Real>,
+    /// Phase 18: global internal (structural) damping. Each step, every free
+    /// particle's velocity is scaled by `1 − damping` (after the solver recovers
+    /// velocities), giving a body-wide "jelly / slime" energy loss that is
+    /// orthogonal to the per-spring axial `damping` (Phase 0) and to the
+    /// distance-solver `compliance` (Phase 13). `0` (default) = no damping (energy
+    /// conserving for the internal modes); larger values settle oscillation / jitter
+    /// faster. Clamped to `[0, 1)` — `1` would fully freeze motion, so it is rejected.
+    /// Applied in both the MassSpring (`integrate`) and XPBD (`step_xpbd` velocity
+    /// recovery) paths. No new solver mechanics, no SoA interaction.
+    pub damping: Real,
     /// Phase 9: tearing threshold. When `Some(ε)`, any structural edge (XPBD
     /// distance constraint or MassSpring spring) whose strain `(|len| − rest)/rest`
     /// exceeds `ε` is removed at the start of each [`SoftBody::step`]. Triangular
@@ -351,6 +361,7 @@ impl SoftBody {
             tear_strain: None,
             plasticity: None,
             pressure: None,
+            damping: 0.0,
             self_collision: None,
             cross_collision: None,
             volume_conservation: None,
@@ -598,6 +609,18 @@ impl SoftBody {
         self.cohesion = None;
     }
 
+    /// Phase 18: sets the global internal (structural) damping coefficient `d`.
+    /// Each step every free particle's velocity is scaled by `1 − d`. `0` = no
+    /// damping; values in `[0, 1)` settle oscillation faster; `d >= 1` would fully
+    /// freeze motion and is rejected (returns `false`). Non-finite `d` is rejected.
+    pub fn set_damping(&mut self, d: Real) -> bool {
+        if !d.is_finite() || d < 0.0 || d >= 1.0 {
+            return false;
+        }
+        self.damping = d;
+        true
+    }
+
     /// Phase 12: broad-phase + projection for self-collision. Builds a uniform
     /// spatial hash (cell size `2·radius`) over the *free* particle positions,
     /// finds all pairs within `2·radius` that are NOT direct structural neighbours
@@ -778,14 +801,20 @@ impl SoftBody {
     }
 
     /// Advances velocities then positions by `dt` (semi-implicit Euler).
-    /// Pinned particles (`inv_mass == 0`) are not moved.
+    /// Pinned particles (`inv_mass == 0`) are not moved. Phase 18: a global internal
+    /// damping factor `1 − self.damping` is applied to each free particle's velocity.
     pub fn integrate(&mut self, dt: Real) {
+        let keep = 1.0 - self.damping;
         for p in &mut self.particles {
             if p.inv_mass == 0.0 {
                 continue;
             }
             // v += dt · M⁻¹ · f   (M⁻¹ = inv_mass for a point mass)
             p.vel += dir_scaled(p.force, dt * p.inv_mass);
+            // Phase 18: global internal damping (skipped when damping == 0).
+            if keep < 1.0 {
+                p.vel *= keep;
+            }
             // x += dt · v
             p.pos += dir_scaled(p.vel, dt);
         }
@@ -1464,11 +1493,17 @@ impl SoftBody {
         }
 
         // 3. Recover velocities.
+        let keep = 1.0 - self.damping;
         for (i, p) in self.particles.iter_mut().enumerate() {
             if w[i] == 0.0 {
                 continue;
             }
             p.vel = (p.pos - prev[i]) / dt;
+            // Phase 18: global internal damping — bleed a fixed fraction of velocity
+            // each step (jelly / slime energy loss). Skipped when damping == 0.
+            if keep < 1.0 {
+                p.vel *= keep;
+            }
         }
     }
 
