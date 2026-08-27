@@ -264,6 +264,10 @@ pub struct SoftBody {
     /// (default) = no pressure. Closed manifold (`self.triangles`) needed for a
     /// real balloon; an open sheet just bulges along single-sided normals.
     pub pressure: Option<Real>,
+    /// Phase 27: optional viscoelastic (rate-dependent) constitutive model. `None` = purely elastic.
+    pub viscoelastic: Option<ViscoelasticParams>,
+    /// Phase 27: optional uniform thermal field. `None` = isothermal.
+    pub temperature: Option<ThermalParams>,
     /// Phase 27: optional body-level orthotropic stiffness axes. When `Some(v)`
     /// (each component ≥ 0), an edge's effective XPBD compliance is divided by the
     /// projection `nᵀ·diag(v)·n` where `n` is the edge unit direction — so an edge
@@ -352,6 +356,37 @@ pub struct PlasticityParams {
     pub creep: Real,
 }
 
+/// Phase 27: viscoelastic (rate-dependent) constitutive parameters.
+///
+/// Implements a Kelvin-Voigt-style **strain-rate hardening**: the effective spring
+/// stiffness grows with the magnitude of the local stretch rate, so a rapidly
+/// stretched edge resists more than a slowly stretched one (polymer / viscoelastic
+/// behaviour). `rate_coefficient >= 0`; `0` (or `None`) is pure elasticity.
+#[derive(Clone, Copy, Debug)]
+pub struct ViscoelasticParams {
+    /// Strain-rate stiffening gain. `k_eff = k·(1 + rate_coefficient·|d(strain)/dt|)`.
+    pub rate_coefficient: Real,
+}
+
+/// Phase 27: thermal field parameters.
+///
+/// A uniform body temperature `temp` (relative to `ambient`) modulates the material:
+/// rest lengths expand by `expansion·ΔT` (thermal expansion) and stiffness softens by
+/// `stiffness_temp_coeff·ΔT` (temperature-dependent modulus). Both effects are applied
+/// to every spring/constraint, giving a temperature-dependent soft body.
+#[derive(Clone, Copy, Debug)]
+pub struct ThermalParams {
+    /// Current uniform body temperature.
+    pub temp: Real,
+    /// Reference (ambient) temperature the material was characterised at.
+    pub ambient: Real,
+    /// Linear thermal-expansion coefficient (rest-length change per unit ΔT).
+    pub expansion: Real,
+    /// Stiffness temperature coefficient (modulus drop per unit ΔT; clamped so the
+    /// effective stiffness stays > 0).
+    pub stiffness_temp_coeff: Real,
+}
+
 /// Phase 12: self-collision parameters (see [`SoftBody::self_collision`]).
 #[derive(Clone, Copy, Debug)]
 pub struct SelfCollisionParams {
@@ -416,6 +451,8 @@ impl SoftBody {
             plasticity: None,
             pressure: None,
             anisotropy: None,
+            viscoelastic: None,
+            temperature: None,
             damping: 0.0,
             self_collision: None,
             cross_collision: None,
@@ -726,6 +763,49 @@ impl SoftBody {
         true
     }
 
+    /// Phase 27: enables/disables the viscoelastic (strain-rate hardening) model.
+    /// `None` = purely elastic. `rate_coefficient >= 0`; negative values are
+    /// rejected (returns `false`).
+    pub fn set_viscoelastic(&mut self, params: Option<ViscoelasticParams>) -> bool {
+        match params {
+            Some(p) if p.rate_coefficient >= 0.0 => {
+                self.viscoelastic = Some(p);
+                true
+            }
+            Some(_) => false,
+            None => {
+                self.viscoelastic = None;
+                true
+            }
+        }
+    }
+
+    /// Phase 27: enables/disables the uniform thermal field. `None` = isothermal.
+    /// All four components must be finite; `temp`/`ambient`/`expansion` unconstrained
+    /// but `stiffness_temp_coeff·(temp − ambient)` must keep stiffness positive
+    /// (i.e. `stiffness_temp_coeff·|ΔT| < 1`). Invalid input returns `false`.
+    pub fn set_thermal(&mut self, params: Option<ThermalParams>) -> bool {
+        match params {
+            Some(p) => {
+                let delta_t = p.temp - p.ambient;
+                if !p.temp.is_finite()
+                    || !p.ambient.is_finite()
+                    || !p.expansion.is_finite()
+                    || !p.stiffness_temp_coeff.is_finite()
+                    || p.stiffness_temp_coeff * delta_t.abs() >= 1.0
+                {
+                    return false;
+                }
+                self.temperature = Some(p);
+                true
+            }
+            None => {
+                self.temperature = None;
+                true
+            }
+        }
+    }
+
     /// Phase 12: broad-phase + projection for self-collision. Builds a uniform
     /// spatial hash (cell size `2·radius`) over the *free* particle positions,
     /// finds all pairs within `2·radius` that are NOT direct structural neighbours
@@ -907,7 +987,22 @@ impl SoftBody {
                 continue;
             }
             let dir = delta / len;
-            let f_spring = s.stiffness * (len - s.rest_length);
+            // Phase 27 B5: thermal modulation of rest length + stiffness.
+            let (rest_eff, mut k_eff) = if let Some(th) = self.temperature {
+                let delta_t = th.temp - th.ambient;
+                (
+                    s.rest_length * (1.0 + th.expansion * delta_t),
+                    s.stiffness * (1.0 - th.stiffness_temp_coeff * delta_t),
+                )
+            } else {
+                (s.rest_length, s.stiffness)
+            };
+            // Phase 27 B4: viscoelastic strain-rate hardening.
+            if let Some(ve) = self.viscoelastic {
+                let strain_rate = (pb_vel - pa_vel).dot(dir) / len.max(1e-9);
+                k_eff *= 1.0 + ve.rate_coefficient * strain_rate.abs();
+            }
+            let f_spring = k_eff * (len - rest_eff);
             let rel_vel = pb_vel - pa_vel;
             let f_damp = s.damping * rel_vel.dot(dir);
             let f_axial = f_spring + f_damp;
