@@ -143,6 +143,28 @@ pub struct DistanceConstraint {
     pub compression: Real,
 }
 
+/// Phase 27 — fracture-mechanics tearing criterion.
+///
+/// Replaces the old single strain-threshold with three physically-motivated
+/// fracture modes. Each edge (XPBD [`DistanceConstraint`] or MassSpring
+/// [`Spring`]) is evaluated against the chosen scalar; when the scalar exceeds
+/// the threshold the edge snaps (and any triangle losing a structural edge is
+/// dropped too).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TearCriterion {
+    /// Classic strain limit: snaps when `(|len| − rest)/rest > threshold`.
+    /// Threshold is dimensionless (e.g. `0.5` = break past 50% stretch).
+    Strain(Real),
+    /// Griffith-style stress limit: snaps when the axial force magnitude
+    /// `|k·(len − rest)|` exceeds `threshold` (force units). `k` is the spring
+    /// stiffness, or `1/(compliance + ε)` for an XPBD distance constraint.
+    Stress(Real),
+    /// Energy-release-rate limit: snaps when the elastic strain energy
+    /// `½·k·(len − rest)²` exceeds `threshold` (energy units). A proxy for the
+    /// fracture toughness / critical energy release rate of the material.
+    Energy(Real),
+}
+
 /// Which integrator a [`SoftBody`] uses.
 ///
 /// * `MassSpring` — the Phase 0/2 Hookean-spring + semi-implicit Euler path.
@@ -242,6 +264,14 @@ pub struct SoftBody {
     /// (default) = no pressure. Closed manifold (`self.triangles`) needed for a
     /// real balloon; an open sheet just bulges along single-sided normals.
     pub pressure: Option<Real>,
+    /// Phase 27: optional body-level orthotropic stiffness axes. When `Some(v)`
+    /// (each component ≥ 0), an edge's effective XPBD compliance is divided by the
+    /// projection `nᵀ·diag(v)·n` where `n` is the edge unit direction — so an edge
+    /// aligned with the x-axis uses compliance `α / v.x` (stiffer if `v.x > 1`).
+    /// This adds directional (orthotropic) material response on top of the
+    /// per-edge stretch/compression anisotropies ([`DistanceConstraint::compliance`
+    /// and `::compression`]); `None` (default) keeps every edge isotropic.
+    pub anisotropy: Option<Vector>,
     /// Phase 18: global internal (structural) damping. Each step, every free
     /// particle's velocity is scaled by `1 − damping` (after the solver recovers
     /// velocities), giving a body-wide "jelly / slime" energy loss that is
@@ -266,7 +296,7 @@ pub struct SoftBody {
     /// faces that lose any structural edge are dropped too, so a torn cloth stops
     /// rendering the broken face. `None` (default) = no tearing. Pure topology
     /// edit — no new solver mechanics, no SoA interaction.
-    pub tear_strain: Option<Real>,
+    pub tear: Option<TearCriterion>,
     /// Phase 10: plasticity (permanent deformation, like putty / memory foam).
     /// When `Some(params)`, any structural edge whose elastic strain magnitude
     /// exceeds `params.yield_strain` has its rest length permanently shifted
@@ -382,9 +412,10 @@ impl SoftBody {
             collide: false,
             particle_radius: 0.1,
             wind: None,
-            tear_strain: None,
+            tear: None,
             plasticity: None,
             pressure: None,
+            anisotropy: None,
             damping: 0.0,
             self_collision: None,
             cross_collision: None,
@@ -1297,8 +1328,32 @@ impl SoftBody {
     /// Phase 9: enables/disables tearing. `strain` is the max allowed strain
     /// `(|len| − rest)/rest` before a structural edge snaps. Pass `None` to
     /// disable (default). A value ≤ 0 tears immediately on any stretch.
+    /// Phase 9/27: enables/disables tearing by **strain** threshold. `strain` is
+    /// the max allowed strain `(|len| − rest)/rest` before a structural edge
+    /// snaps. Pass `None` to disable (default). A value ≤ 0 tears immediately on
+    /// any stretch.
     pub fn set_tear_strain(&mut self, strain: Option<Real>) {
-        self.tear_strain = strain;
+        self.tear = strain.map(TearCriterion::Strain);
+    }
+
+    /// Phase 27: enables/disables tearing by **axial stress** threshold. `stress`
+    /// is the max allowed `|k·(len − rest)|` before an edge snaps. Pass `None` to
+    /// disable. A value ≤ 0 tears immediately.
+    pub fn set_tear_stress(&mut self, stress: Option<Real>) {
+        self.tear = stress.map(TearCriterion::Stress);
+    }
+
+    /// Phase 27: enables/disables tearing by **strain-energy** (fracture-toughness)
+    /// threshold. `energy` is the max allowed `½·k·(len − rest)²` before an edge
+    /// snaps. Pass `None` to disable. A value ≤ 0 tears immediately.
+    pub fn set_tear_energy(&mut self, energy: Option<Real>) {
+        self.tear = energy.map(TearCriterion::Energy);
+    }
+
+    /// Phase 27: sets the body-level orthotropic stiffness axes (see
+    /// [`Self::anisotropy`]). `None` disables directional response.
+    pub fn set_anisotropy(&mut self, axes: Option<Vector>) {
+        self.anisotropy = axes;
     }
 
     /// Phase 9: removes every over-stretched structural edge. Called once at the
@@ -1310,13 +1365,26 @@ impl SoftBody {
     /// a torn cloth stops rendering the broken face. Pure topology edit — neither
     /// the SoA solver nor the integration order is touched.
     pub fn tear(&mut self) {
-        let threshold = match self.tear_strain {
-            Some(t) => t,
+        let threshold = match self.tear {
+            Some(TearCriterion::Strain(t))
+            | Some(TearCriterion::Stress(t))
+            | Some(TearCriterion::Energy(t)) => t,
             None => return,
         };
         if threshold <= 0.0 {
             return; // 0 / negative would tear everything on the first step.
         }
+        // Per-edge fracture scalar for the active criterion.
+        let metric = |rest: Real, len: Real, k: Real| -> Real {
+            match self.tear {
+                Some(TearCriterion::Strain(_)) => (len - rest) / rest.max(1e-12),
+                Some(TearCriterion::Stress(_)) => (k * (len - rest)).abs(),
+                Some(TearCriterion::Energy(_)) => 0.5 * k * (len - rest) * (len - rest),
+                None => 0.0,
+            }
+        };
+        let spring_k = |s: &Spring| s.stiffness;
+        let dc_k = |c: &DistanceConstraint| 1.0 / (c.compliance + 1e-9);
 
         // Collect the surviving distance-constraint edges (and their indices).
         let mut keep_dc: Vec<(usize, DistanceConstraint)> = Vec::new();
@@ -1326,12 +1394,8 @@ impl SoftBody {
                 _ => continue, // dangling edge → drop.
             };
             let len = (pb.pos - pa.pos).length();
-            let strain = if c.rest > 0.0 {
-                (len - c.rest) / c.rest
-            } else {
-                0.0
-            };
-            if strain <= threshold {
+            let k = dc_k(c);
+            if metric(c.rest, len, k) <= threshold {
                 keep_dc.push((i, *c));
             }
         }
@@ -1354,12 +1418,8 @@ impl SoftBody {
                 _ => continue,
             };
             let len = (pb.pos - pa.pos).length();
-            let strain = if s.rest_length > 0.0 {
-                (len - s.rest_length) / s.rest_length
-            } else {
-                0.0
-            };
-            if strain <= threshold {
+            let k = spring_k(&s);
+            if metric(s.rest_length, len, k) <= threshold {
                 keep_sp.push(s);
             }
         }
@@ -1678,12 +1738,29 @@ impl SoftBody {
         let mut d_rest = Vec::with_capacity(ndc);
         let mut d_comp = Vec::with_capacity(ndc);
         let mut d_compress = Vec::with_capacity(ndc);
+        let aniso = self.anisotropy.unwrap_or(Vector::new(1.0, 1.0, 1.0));
         for c in &self.distance_constraints {
             d_a.push(c.a);
             d_b.push(c.b);
             d_rest.push(c.rest);
-            d_comp.push(c.compliance);
-            d_compress.push(c.compression);
+            // Phase 27: directional (orthotropic) compliance scaling.
+            let factor = if self.anisotropy.is_some() {
+                let pa = match (self.particles.get(c.a), self.particles.get(c.b)) {
+                    (Some(a), Some(b)) => a.pos - b.pos,
+                    _ => Vector::new(0.0, 0.0, 0.0),
+                };
+                let len = pa.length();
+                if len > 1e-9 {
+                    let n = pa / len;
+                    (n.x * n.x * aniso.x + n.y * n.y * aniso.y + n.z * n.z * aniso.z).max(1e-6)
+                } else {
+                    1.0
+                }
+            } else {
+                1.0
+            };
+            d_comp.push(c.compliance / factor);
+            d_compress.push(c.compression / factor);
         }
         let mut d_lambda = Vec::with_capacity(ndc);
         #[allow(clippy::same_item_push)] // Lagrange accumulator, filled with zeros
