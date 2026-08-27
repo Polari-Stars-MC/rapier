@@ -1146,6 +1146,118 @@ impl SoftBody {
             .fold(0.0, |acc, e| acc + e)
     }
 
+    /// Phase 27 (B8): **implicit (backward-Euler) reference integrator** for the
+    /// mass-spring system — a comparison path against [`Self::step_mass_spring`]
+    /// (explicit semi-implicit Euler). Unlike the explicit solver, backward Euler is
+    /// *unconditionally stable*: it solves the linear system
+    /// `(M/dt² − K) · vₙ₊₁ = M·vₙ/dt² + fₙ/dt` for the new velocities, where `M` is the
+    /// (diagonal) mass matrix and `K = −∂f/∂x` is the symmetric spring stiffness matrix.
+    /// A stiff spring that makes the explicit solver explode (energy growth / NaN) stays
+    /// bounded here, which is exactly what a comparison harness wants to demonstrate.
+    ///
+    /// This is intentionally a *reference* solver (dense `nalgebra` `DMatrix`, O(n³)
+    /// per step) — fine for small meshes used in tests/benchmarks, not for production
+    /// large bodies (use XPBD). Springs only; gravity/pressure/wind are captured through
+    /// the assembled force `fₙ`. Pinned particles (`inv_mass == 0`) are held fixed.
+    pub fn step_implicit_euler(&mut self, dt: Real) {
+        if self.sleeping {
+            return;
+        }
+        // Assemble fₙ (gravity + springs + pressure + wind) into the per-particle force.
+        self.compute_forces();
+        let n = self.particles.len();
+        let dim = 3 * n;
+        if dim == 0 {
+            return;
+        }
+        // Mass matrix M (diagonal) and stiffness K (symmetric, sparse-as-dense).
+        let mut m_diag = Vec::with_capacity(dim);
+        for p in &self.particles {
+            let m = if p.inv_mass == 0.0 { 0.0 } else { p.mass() };
+            for _ in 0..3 {
+                m_diag.push(m);
+            }
+        }
+        let mut k_mat = nalgebra::DMatrix::<Real>::zeros(dim, dim);
+        for s in &self.springs {
+            let (pa, pb) = match (self.particles.get(s.a), self.particles.get(s.b)) {
+                (Some(a), Some(b)) => (a, b),
+                _ => continue,
+            };
+            let delta = pb.pos - pa.pos;
+            let len = delta.length();
+            if len == 0.0 {
+                continue;
+            }
+            let d = delta / len; // unit direction
+            // Thermal/viscoelastic modulation (mirrors spring_damping_forces).
+            let (rest_eff, mut k_eff) = if let Some(th) = self.temperature {
+                let dt_t = th.temp - th.ambient;
+                (
+                    s.rest_length * (1.0 + th.expansion * dt_t),
+                    s.stiffness * (1.0 - th.stiffness_temp_coeff * dt_t),
+                )
+            } else {
+                (s.rest_length, s.stiffness)
+            };
+            if let Some(ve) = self.viscoelastic {
+                let strain_rate = (pb.vel - pa.vel).dot(d) / len.max(1e-9);
+                k_eff *= 1.0 + ve.rate_coefficient * strain_rate.abs();
+            }
+            let _ = rest_eff;
+            // 3x3 block B = k_eff·(I − d⊗d).
+            let mut b = [[0.0; 3]; 3];
+            for r in 0..3 {
+                for c in 0..3 {
+                    let outer = d[r] * d[c];
+                    b[r][c] = k_eff * if r == c { 1.0 - outer } else { -outer };
+                }
+            }
+            let ia = 3 * s.a;
+            let ib = 3 * s.b;
+            for r in 0..3 {
+                for c in 0..3 {
+                    k_mat[(ia + r, ia + c)] += b[r][c];
+                    k_mat[(ib + r, ib + c)] += b[r][c];
+                    k_mat[(ia + r, ib + c)] -= b[r][c];
+                    k_mat[(ib + r, ia + c)] -= b[r][c];
+                }
+            }
+        }
+        // A = M/dt² − K,  rhs = M·vₙ/dt² + fₙ/dt.
+        let inv_dt2 = 1.0 / (dt * dt);
+        let mut a_mat = nalgebra::DMatrix::<Real>::zeros(dim, dim);
+        let mut rhs = nalgebra::DVector::<Real>::zeros(dim);
+        for i in 0..n {
+            let p = &self.particles[i];
+            for c in 0..3 {
+                let row = 3 * i + c;
+                a_mat[(row, row)] += m_diag[row] * inv_dt2;
+                rhs[row] = m_diag[row] * p.vel[c] * inv_dt2 + p.force[c] / dt;
+            }
+        }
+        a_mat -= &k_mat;
+        // Solve A · v = rhs (Cholesky if SPD, else LU fallback).
+        let v_new = if let Some(chol) = nalgebra::Cholesky::new(a_mat.clone()) {
+            chol.solve(&rhs)
+        } else {
+            // A may be indefinite (e.g. all-pinned or degenerate); fall back to LU.
+            match a_mat.clone().lu().solve(&rhs) {
+                Some(v) => v,
+                None => rhs, // singular system: leave velocities unchanged
+            }
+        };
+        // Commit velocities, then advance positions x += dt·v.
+        for i in 0..n {
+            let p = &mut self.particles[i];
+            if p.inv_mass == 0.0 {
+                continue;
+            }
+            p.vel = Vector::new(v_new[3 * i], v_new[3 * i + 1], v_new[3 * i + 2]);
+            p.pos += Vector::new(p.vel.x * dt, p.vel.y * dt, p.vel.z * dt);
+        }
+    }
+
     // ── Phase 3: XPBD setup ────────────────────────────────────────────────
 
     /// Switches this body to the XPBD solver with the given iteration count and
