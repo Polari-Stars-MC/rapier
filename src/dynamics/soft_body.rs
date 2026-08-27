@@ -252,6 +252,14 @@ pub struct SoftBody {
     /// Applied in both the MassSpring (`integrate`) and XPBD (`step_xpbd` velocity
     /// recovery) paths. No new solver mechanics, no SoA interaction.
     pub damping: Real,
+    /// Phase 24: XPBD/MassSpring substeps per [`SoftBody::step`] call. Splits the
+    /// frame `dt` into `substeps` equal slices and runs the active solver once per
+    /// slice (so constraint projection happens at a finer time resolution). `1`
+    /// reproduces the historic single-substep behaviour. Larger values make stiff
+    /// materials / high compliance converge faster and stay stable; they cost
+    /// `substeps`× the per-step work. Mirrors `World::integration_parameters`
+    /// substepping for the rigid side — same idea, local to each soft body.
+    pub substeps: u32,
     /// Phase 9: tearing threshold. When `Some(ε)`, any structural edge (XPBD
     /// distance constraint or MassSpring spring) whose strain `(|len| − rest)/rest`
     /// exceeds `ε` is removed at the start of each [`SoftBody::step`]. Triangular
@@ -382,6 +390,7 @@ impl SoftBody {
             cross_collision: None,
             volume_conservation: None,
             cohesion: None,
+            substeps: 1,
         }
     }
 
@@ -673,6 +682,19 @@ impl SoftBody {
         true
     }
 
+    /// Phase 24: set the number of solver substeps per [`SoftBody::step`] call.
+    /// `n >= 1` splits the frame `dt` into `n` equal slices, projecting constraints
+    /// at a finer time resolution. A value of `0` is rejected (kept at the previous
+    /// setting) so a body never silently degrades to a no-op step. See the
+    /// `substeps` field for the stability/convergence rationale.
+    pub fn set_substeps(&mut self, n: u32) -> bool {
+        if n == 0 {
+            return false;
+        }
+        self.substeps = n;
+        true
+    }
+
     /// Phase 12: broad-phase + projection for self-collision. Builds a uniform
     /// spatial hash (cell size `2·radius`) over the *free* particle positions,
     /// finds all pairs within `2·radius` that are NOT direct structural neighbours
@@ -945,9 +967,19 @@ impl SoftBody {
         if self.collide {
             return;
         }
-        match self.solver {
-            SoftSolver::MassSpring => self.step_mass_spring(dt),
-            SoftSolver::Xpbd { .. } => self.step_xpbd(dt),
+        // Phase 24: subdivide the frame into `substeps` equal slices and run the
+        // active solver once per slice. Each call to `step_xpbd` / `step_mass_spring`
+        // resets its own Lagrange accumulators, so looping here gives independent
+        // projection at a finer time resolution without touching the solver internals.
+        // `substeps` is clamped to ≥1 so a 0 (or unset) value reproduces the single
+        // substep behaviour.
+        let n_sub = self.substeps.max(1) as usize;
+        let sub_dt = dt / n_sub as Real;
+        for _ in 0..n_sub {
+            match self.solver {
+                SoftSolver::MassSpring => self.step_mass_spring(sub_dt),
+                SoftSolver::Xpbd { .. } => self.step_xpbd(sub_dt),
+            }
         }
     }
 
