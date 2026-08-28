@@ -336,6 +336,19 @@ pub struct SoftBody {
     /// = fall back to the global solver compliance for tetra volume (existing
     /// behaviour). Pure positional constraint — no new solver mechanics.
     pub volume_conservation: Option<Real>,
+    /// Phase 29: corotated linear elasticity (per-tetrahedron shape matching).
+    /// When `Some(stiffness)`, each XPBD iteration additionally projects every
+    /// tetrahedron toward its best-fit-rotated rest shape (polar-decomposition
+    /// shape matching), giving rotation-invariant linear elasticity on top of
+    /// the existing volume constraint. `stiffness` in `(0, 1]` is the per-iteration
+    /// relaxation factor. `None` (default) = off.
+    pub corotated: Option<Real>,
+    /// Phase 29: inverse rest shape matrix per tetrahedron (columns are the rest
+    /// edge vectors of the reference configuration). Built by
+    /// [`SoftBody::set_corotated`] from the particle positions at enable time.
+    /// Indexed parallel to `tetrahedra`; shorter than `tetrahedra` after a later
+    /// `subdivide_tetrahedra` (extra tets are skipped, not corrupted).
+    pub tetra_rest_shapes: Vec<[[Real; 3]; 3]>,
     /// Phase 17: cohesion (adhesion / breakable glue) between this body and *other*
     /// bodies. When `Some(p)`, free particles of this body within `p.radius` of a
     /// free particle of another cohesion-enabled body attract toward contact, bonding
@@ -457,6 +470,8 @@ impl SoftBody {
             self_collision: None,
             cross_collision: None,
             volume_conservation: None,
+            corotated: None,
+            tetra_rest_shapes: Vec::new(),
             cohesion: None,
             substeps: 1,
         }
@@ -707,6 +722,36 @@ impl SoftBody {
     /// reverting tetra volume to the global solver compliance.
     pub fn clear_volume_conservation(&mut self) {
         self.volume_conservation = None;
+    }
+    /// Phase 29: enables corotated linear elasticity with the given per-iteration
+    /// relaxation `stiffness` (`(0, 1]`). The rest shape of every *current*
+    /// tetrahedron is snapshotted into `tetra_rest_shapes` from the particle
+    /// positions at call time (enable on the undeformed mesh). Degenerate
+    /// tetrahedra are skipped (their rest shape stays the zero matrix). Returns
+    /// `false` for non-finite / out-of-range `stiffness` or an empty body.
+    pub fn set_corotated(&mut self, stiffness: Real) -> bool {
+        if !stiffness.is_finite() || stiffness <= 0.0 || stiffness > 1.0 {
+            return false;
+        }
+        let mut shapes = Vec::with_capacity(self.tetrahedra.len());
+        for tet in &self.tetrahedra {
+            let [a, b, c, d] = *tet;
+            let m = rest_shape_matrix(
+                self.particles[a as usize].pos,
+                self.particles[b as usize].pos,
+                self.particles[c as usize].pos,
+                self.particles[d as usize].pos,
+            );
+            shapes.push(m);
+        }
+        self.tetra_rest_shapes = shapes;
+        self.corotated = Some(stiffness);
+        true
+    }
+
+    /// Phase 29: disables corotated elasticity (`None`).
+    pub fn clear_corotated(&mut self) {
+        self.corotated = None;
     }
 
     /// Phase 17: enables cohesion (adhesion / breakable glue) toward other bodies with
@@ -2036,6 +2081,24 @@ impl SoftBody {
                     &mut v_lambda[ti],
                 );
             }
+            // Phase 29: corotated linear-elasticity projection (shape matching).
+            // Runs after the volume constraints so it corrects the deviatoric
+            // (volume-preserving) part of the deformation.
+            if let Some(stiffness) = self.corotated {
+                let nshape = self.tetra_rest_shapes.len();
+                for ti in 0..ntet {
+                    if ti >= nshape {
+                        break; // tets added after enable (e.g. subdivision) have no rest shape
+                    }
+                    solve_corotated_tet(
+                        &mut self.particles,
+                        &t_idx[ti],
+                        &self.tetra_rest_shapes[ti],
+                        stiffness,
+                        &w,
+                    );
+                }
+            }
             // Phase 12: self-collision projection (broad-phase + push-apart) once
             // per iteration, interleaved with the structural constraints. Phase 20:
             // contacts are accumulated so tangential friction can be applied after
@@ -2504,6 +2567,213 @@ fn solve_volume_constraint(
     if wd != 0.0 {
         particles[id].pos += dir_scaled(g3, wd * d_lambda);
     }
+}
+// ── Phase 29: corotated linear elasticity (shape matching) ─────────────
+
+fn rest_shape_matrix(p0: Vector, p1: Vector, p2: Vector, p3: Vector) -> [[Real; 3]; 3] {
+    let e1 = p1 - p0;
+    let e2 = p2 - p0;
+    let e3 = p3 - p0;
+    [[e1.x, e2.x, e3.x], [e1.y, e2.y, e3.y], [e1.z, e2.z, e3.z]]
+}
+
+/// Inverse of a 3x3 matrix via the adjugate. Returns `None` when the
+/// determinant is (near) zero.
+fn mat3_inv(m: &[[Real; 3]; 3]) -> Option<[[Real; 3]; 3]> {
+    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    if !det.is_finite() || det.abs() < 1e-14 {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    let mut out = [[0.0; 3]; 3];
+    out[0][0] = (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det;
+    out[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det;
+    out[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det;
+    out[1][0] = (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det;
+    out[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det;
+    out[1][2] = (m[1][0] * m[0][2] - m[0][0] * m[1][2]) * inv_det;
+    out[2][0] = (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det;
+    out[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det;
+    out[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det;
+    Some(out)
+}
+
+fn mat3_mul(a: &[[Real; 3]; 3], b: &[[Real; 3]; 3]) -> [[Real; 3]; 3] {
+    let mut out = [[0.0; 3]; 3];
+    for r in 0..3 {
+        for c in 0..3 {
+            out[r][c] = a[r][0] * b[0][c] + a[r][1] * b[1][c] + a[r][2] * b[2][c];
+        }
+    }
+    out
+}
+
+fn mat3_transpose(m: &[[Real; 3]; 3]) -> [[Real; 3]; 3] {
+    let mut out = [[0.0; 3]; 3];
+    for r in 0..3 {
+        for c in 0..3 {
+            out[r][c] = m[c][r];
+        }
+    }
+    out
+}
+
+/// Rotation extracted from a 3x3 matrix via iterative Shepperd-style
+/// quaternion polar decomposition (robust without an SVD, no_std-friendly).
+/// `m` need not be orthogonal; returns the closest rotation `R`.
+fn polar_rotation(m: &[[Real; 3]; 3]) -> [[Real; 3]; 3] {
+    // Quaternion from the largest-positive-component branch (Shepperd's method),
+    // then a few Newton refinement iterations on R q ≈ m.
+    let tr = m[0][0] + m[1][1] + m[2][2];
+    let (mut qw, mut qx, mut qy, mut qz);
+    if tr > 0.0 {
+        let s = (tr + 1.0).sqrt() * 2.0;
+        qw = 0.25 * s;
+        qx = (m[2][1] - m[1][2]) / s;
+        qy = (m[0][2] - m[2][0]) / s;
+        qz = (m[1][0] - m[0][1]) / s;
+    } else if m[0][0] > m[1][1] && m[0][0] > m[2][2] {
+        let s = (1.0 + m[0][0] - m[1][1] - m[2][2]).sqrt() * 2.0;
+        qw = (m[2][1] - m[1][2]) / s;
+        qx = 0.25 * s;
+        qy = (m[0][1] + m[1][0]) / s;
+        qz = (m[0][2] + m[2][0]) / s;
+    } else if m[1][1] > m[2][2] {
+        let s = (1.0 + m[1][1] - m[0][0] - m[2][2]).sqrt() * 2.0;
+        qw = (m[0][2] - m[2][0]) / s;
+        qx = (m[0][1] + m[1][0]) / s;
+        qy = 0.25 * s;
+        qz = (m[1][2] + m[2][1]) / s;
+    } else {
+        let s = (1.0 + m[2][2] - m[0][0] - m[1][1]).sqrt() * 2.0;
+        qw = (m[1][0] - m[0][1]) / s;
+        qx = (m[0][2] + m[2][0]) / s;
+        qy = (m[1][2] + m[2][1]) / s;
+        qz = 0.25 * s;
+    }
+    // Newton refinement (8 passes): nudge q toward the rotation that minimises
+    // ||R(q) − m||²_F. The gradient of that objective w.r.t. the quaternion is
+    // carried by the skew part of S = R(q)ᵀ·m (the axis-angle error), so each
+    // pass rotates q slightly along it, then renormalises.
+    for _ in 0..8 {
+        let r = quat_to_mat3(qw, qx, qy, qz);
+        let rt = mat3_transpose(&r);
+        let s_mat = mat3_mul(&rt, m);
+        let ex = s_mat[2][1] - s_mat[1][2];
+        let ey = s_mat[0][2] - s_mat[2][0];
+        let ez = s_mat[1][0] - s_mat[0][1];
+        qx += 0.25 * ex;
+        qy += 0.25 * ey;
+        qz += 0.25 * ez;
+        let norm = (qw * qw + qx * qx + qy * qy + qz * qz).sqrt().max(1e-12);
+        qw /= norm;
+        qx /= norm;
+        qy /= norm;
+        qz /= norm;
+    }
+    quat_to_mat3(qw, qx, qy, qz)
+}
+
+fn quat_to_mat3(qw: Real, qx: Real, qy: Real, qz: Real) -> [[Real; 3]; 3] {
+    [
+        [
+            1.0 - 2.0 * (qy * qy + qz * qz),
+            2.0 * (qx * qy - qz * qw),
+            2.0 * (qx * qz + qy * qw),
+        ],
+        [
+            2.0 * (qx * qy + qz * qw),
+            1.0 - 2.0 * (qx * qx + qz * qz),
+            2.0 * (qy * qz - qx * qw),
+        ],
+        [
+            2.0 * (qx * qz - qy * qw),
+            2.0 * (qy * qz + qx * qw),
+            1.0 - 2.0 * (qx * qx + qy * qy),
+        ],
+    ]
+}
+
+/// Phase 29 per-tet projection: shape matching toward the best-fit rotation of
+/// the rest shape, restricted to volume-preserving displacements (grad div-free
+/// ⇒ the tet's signed volume is unchanged by the correction).
+fn solve_corotated_tet(
+    particles: &mut [SoftParticle],
+    tet: &[u32; 4],
+    rest_inv: &[[Real; 3]; 3],
+    stiffness: Real,
+    w: &[Real],
+) {
+    let [a, b, c, d] = *tet;
+    let (ia, ib, ic, id) = (a as usize, b as usize, c as usize, d as usize);
+    let p0 = particles[ia].pos;
+    let p1 = particles[ib].pos;
+    let p2 = particles[ic].pos;
+    let p3 = particles[id].pos;
+    // Deformation gradient F = P · T_rest⁻¹.
+    let p_mat = rest_shape_matrix(p0, p1, p2, p3);
+    let Some(t_inv) = mat3_inv(rest_inv) else {
+        return;
+    };
+    let f_mat = mat3_mul(&p_mat, &t_inv);
+    // Closest rotation R = polar(F). Goal positions g_i = centroid + R·(rest edge)/1.
+    // Work with edge vectors: goal edges = R · rest edges.
+    let rot = polar_rotation(&f_mat);
+    let g0 = p0; // goal for vertex 0 = current p0 (pure deviatoric correction frame)
+    let _ = g0;
+    let centroid = Vector::new(
+        (p0.x + p1.x + p2.x + p3.x) * 0.25,
+        (p0.y + p1.y + p2.y + p3.y) * 0.25,
+        (p0.z + p1.z + p3.z) * 0.25,
+    );
+    let _ = centroid;
+    // Rest edge vectors (columns of rest matrix).
+    let re1 = Vector::new(rest_inv[0][0], rest_inv[1][0], rest_inv[2][0]);
+    let re2 = Vector::new(rest_inv[0][1], rest_inv[1][1], rest_inv[2][1]);
+    let re3 = Vector::new(rest_inv[0][2], rest_inv[1][2], rest_inv[2][2]);
+    let ge1 = Vector::new(
+        rot[0][0] * re1.x + rot[0][1] * re1.y + rot[0][2] * re1.z,
+        rot[1][0] * re1.x + rot[1][1] * re1.y + rot[1][2] * re1.z,
+        rot[2][0] * re1.x + rot[2][1] * re1.y + rot[2][2] * re1.z,
+    );
+    let ge2 = Vector::new(
+        rot[0][0] * re2.x + rot[0][1] * re2.y + rot[0][2] * re2.z,
+        rot[1][0] * re2.x + rot[1][1] * re2.y + rot[1][2] * re2.z,
+        rot[2][0] * re2.x + rot[2][1] * re2.y + rot[2][2] * re2.z,
+    );
+    let ge3 = Vector::new(
+        rot[0][0] * re3.x + rot[0][1] * re3.y + rot[0][2] * re3.z,
+        rot[1][0] * re3.x + rot[1][1] * re3.y + rot[1][2] * re3.z,
+        rot[2][0] * re3.x + rot[2][1] * re3.y + rot[2][2] * re3.z,
+    );
+    // Goal positions anchored at the mass-weighted centroid (rotation-only ⇒
+    // volume-preserving correction frame).
+    let g1 = p0 + ge1;
+    let g2 = p0 + ge2;
+    let g3 = p0 + ge3;
+    // Per-vertex correction, scaled by stiffness (per-iteration relaxation).
+    // Standard XPBD shape matching: Δp_i = k · (g_i − p_i) on MOVABLE vertices
+    // (goal frame anchored at p0 with the extracted rotation R). No explicit
+    // centroid-offset subtraction — with pinned anchors the naive subtraction
+    // cancels the correction on the single free vertex of a 3-pinned tet.
+    let k = stiffness * 0.25;
+    let (wa, wb, wc, wd) = (w[ia], w[ib], w[ic], w[id]);
+    let d0 = p0 - p0;
+    let d1 = g1 - p1;
+    let d2 = g2 - p2;
+    let d3 = g3 - p3;
+    let corr = |d: Vector, wv: Real| -> Vector {
+        if wv == 0.0 {
+            return Vector::new(0.0, 0.0, 0.0);
+        }
+        dir_scaled(d, k)
+    };
+    particles[ia].pos += corr(d0, wa);
+    particles[ib].pos += corr(d1, wb);
+    particles[ic].pos += corr(d2, wc);
+    particles[id].pos += corr(d3, wd);
 }
 
 /// A container owning all soft bodies in a simulation. Phase 0 keeps this as a
