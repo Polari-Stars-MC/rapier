@@ -343,6 +343,15 @@ pub struct SoftBody {
     /// the existing volume constraint. `stiffness` in `(0, 1]` is the per-iteration
     /// relaxation factor. `None` (default) = off.
     pub corotated: Option<Real>,
+    /// Phase 30: Neo-Hookean logarithmic volume energy. When `Some(stiffness)`
+    /// and XPBD is active, each tetrahedron's volume constraint uses the
+    /// nonlinear residual `C = ln(J)` (`J = V/V₀`, clamped to a small positive
+    /// floor) and a `stiffness/dt²` compliance, replacing the linear
+    /// `V − V₀` residual + `volume_conservation` compliance for that tet.
+    /// The logarithmic form makes the volumetric resistance grow unboundedly as
+    /// the tet collapses (physically correct incompressibility) instead of the
+    /// linear response's finite push-back. `None` (default) = linear volume.
+    pub neo_hookean: Option<Real>,
     /// Phase 29: inverse rest shape matrix per tetrahedron (columns are the rest
     /// edge vectors of the reference configuration). Built by
     /// [`SoftBody::set_corotated`] from the particle positions at enable time.
@@ -471,6 +480,7 @@ impl SoftBody {
             cross_collision: None,
             volume_conservation: None,
             corotated: None,
+            neo_hookean: None,
             tetra_rest_shapes: Vec::new(),
             cohesion: None,
             substeps: 1,
@@ -752,6 +762,22 @@ impl SoftBody {
     /// Phase 29: disables corotated elasticity (`None`).
     pub fn clear_corotated(&mut self) {
         self.corotated = None;
+    }
+    /// Phase 30: enables the Neo-Hookean logarithmic volume energy with the
+    /// given volumetric `stiffness` (compliance = `stiffness/dt²`; larger =
+    /// closer to incompressible). Returns `false` for non-finite values or
+    /// `stiffness < 0`.
+    pub fn set_neo_hookean(&mut self, stiffness: Real) -> bool {
+        if !stiffness.is_finite() || stiffness < 0.0 {
+            return false;
+        }
+        self.neo_hookean = Some(stiffness);
+        true
+    }
+
+    /// Phase 30: disables the Neo-Hookean volume energy (back to linear).
+    pub fn clear_neo_hookean(&mut self) {
+        self.neo_hookean = None;
     }
 
     /// Phase 17: enables cohesion (adhesion / breakable glue) toward other bodies with
@@ -2072,14 +2098,28 @@ impl SoftBody {
                 );
             }
             for ti in 0..ntet {
-                solve_volume_constraint(
-                    &mut self.particles,
-                    &t_idx[ti],
-                    t_rest[ti],
-                    vol_alpha,
-                    &w,
-                    &mut v_lambda[ti],
-                );
+                // Phase 30: nonlinear (Neo-Hookean ln(J)) residual when enabled;
+                // otherwise the linear V − V₀ volume constraint.
+                if let Some(kh) = self.neo_hookean {
+                    let nh_alpha = kh / (dt * dt);
+                    solve_volume_constraint_nh(
+                        &mut self.particles,
+                        &t_idx[ti],
+                        t_rest[ti],
+                        nh_alpha,
+                        &w,
+                        &mut v_lambda[ti],
+                    );
+                } else {
+                    solve_volume_constraint(
+                        &mut self.particles,
+                        &t_idx[ti],
+                        t_rest[ti],
+                        vol_alpha,
+                        &w,
+                        &mut v_lambda[ti],
+                    );
+                }
             }
             // Phase 29: corotated linear-elasticity projection (shape matching).
             // Runs after the volume constraints so it corrects the deviatoric
@@ -2544,6 +2584,69 @@ fn solve_volume_constraint(
     let wc = w[ic];
     let wd = w[id];
     // Σ w_i |∇_i|²  (all four gradients; w=0 particles contribute 0).
+    let mut denom = alpha;
+    denom += wa * g0.dot(g0);
+    denom += wb * g1.dot(g1);
+    denom += wc * g2.dot(g2);
+    denom += wd * g3.dot(g3);
+    if denom == 0.0 {
+        return;
+    }
+    let d_lambda = (-c_val - alpha * *lambda) / denom;
+    *lambda += d_lambda;
+
+    if wa != 0.0 {
+        particles[ia].pos += dir_scaled(g0, wa * d_lambda);
+    }
+    if wb != 0.0 {
+        particles[ib].pos += dir_scaled(g1, wb * d_lambda);
+    }
+    if wc != 0.0 {
+        particles[ic].pos += dir_scaled(g2, wc * d_lambda);
+    }
+    if wd != 0.0 {
+        particles[id].pos += dir_scaled(g3, wd * d_lambda);
+    }
+}
+/// Phase 30: Neo-Hookean volume projection. Identical gradient structure to
+/// [`solve_volume_constraint`] but with the logarithmic residual
+/// `C = ln(J)`, `J = V/V₀` (J floored at `1e-6` so a fully-inverted/collapsed
+/// tet stays finite), giving unbounded resistance as `V → 0`.
+fn solve_volume_constraint_nh(
+    particles: &mut [SoftParticle],
+    tet: &[u32; 4],
+    rest_vol: Real,
+    alpha: Real,
+    w: &[Real],
+    lambda: &mut Real,
+) {
+    if rest_vol.abs() < 1e-12 {
+        return;
+    }
+    let [a, b, c, d] = *tet;
+    let (ia, ib, ic, id) = (a as usize, b as usize, c as usize, d as usize);
+    let p0 = particles[ia].pos;
+    let p1 = particles[ib].pos;
+    let p2 = particles[ic].pos;
+    let p3 = particles[id].pos;
+    let e1 = p1 - p0;
+    let e2 = p2 - p0;
+    let e3 = p3 - p0;
+
+    let vol = e1.cross(e2).dot(e3) / 6.0;
+    // J = V/V₀ floored at +1e-6: keeps ln finite even for inverted tets.
+    let j = (vol / rest_vol).max(1e-6);
+    let c_val = j.ln();
+
+    // ∇C = (1/J) · ∇J = (1/J) · ∇V/V₀ — chain rule on the log.
+    let inv_j = 1.0 / j;
+    let s = inv_j / (6.0 * rest_vol);
+    let g0 = e2.cross(e3) * -s;
+    let g1 = e3.cross(e1) * s;
+    let g2 = e1.cross(e2) * s;
+    let g3 = e1.cross(e3) * -s;
+
+    let (wa, wb, wc, wd) = (w[ia], w[ib], w[ic], w[id]);
     let mut denom = alpha;
     denom += wa * g0.dot(g0);
     denom += wb * g1.dot(g1);
