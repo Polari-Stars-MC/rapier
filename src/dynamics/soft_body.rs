@@ -114,6 +114,10 @@ pub struct Spring {
     pub stiffness: Real,
     /// Damping coefficient `c` (axial velocity damping).
     pub damping: Real,
+    /// Phase 31 — active-strain activation `γ ∈ [0, 1]`. Scales the effective rest
+    /// length toward zero (`rest_eff = rest_length * (1 - activation)`), pulling the
+    /// two endpoints together like a contracting muscle. `0` (default) = passive.
+    pub activation: Real,
 }
 
 /// A distance constraint (XPBD) between two particles — the edge of a deformable
@@ -141,6 +145,10 @@ pub struct DistanceConstraint {
     /// `add_bending_constraint`) so existing bodies stay isotropic unless the caller
     /// opts into anisotropy via `set_distance_constraint_compression`.
     pub compression: Real,
+    /// Phase 31 — active-strain activation `γ ∈ [0, 1]`. Scales the effective rest
+    /// length toward zero (`rest_eff = rest * (1 - activation)`), contracting the
+    /// edge like a muscle fibre. `0` (default) = passive.
+    pub activation: Real,
 }
 
 /// Phase 27 — fracture-mechanics tearing criterion.
@@ -1031,6 +1039,7 @@ impl SoftBody {
             rest_length: rest,
             stiffness,
             damping,
+            activation: 0.0,
         });
         Some(idx)
     }
@@ -1073,6 +1082,9 @@ impl SoftBody {
                 let strain_rate = (pb_vel - pa_vel).dot(dir) / len.max(1e-9);
                 k_eff *= 1.0 + ve.rate_coefficient * strain_rate.abs();
             }
+            // Phase 31: active-strain contraction — shrink the effective rest length
+            // toward zero as activation rises, pulling the endpoints together.
+            let rest_eff = rest_eff * (1.0 - s.activation.clamp(0.0, 1.0));
             let f_spring = k_eff * (len - rest_eff);
             let rel_vel = pb_vel - pa_vel;
             let f_damp = s.damping * rel_vel.dot(dir);
@@ -1362,6 +1374,7 @@ impl SoftBody {
             rest,
             compliance,
             compression: compliance,
+            activation: 0.0,
         });
         Some(idx)
     }
@@ -1571,6 +1584,7 @@ impl SoftBody {
                     // Default compliance; tune via configure_xpbd / explicit later.
                     compliance: 0.0,
                     compression: 0.0,
+                    activation: 0.0,
                 });
             }
         }
@@ -1599,6 +1613,7 @@ impl SoftBody {
             rest,
             compliance: 0.0,
             compression: 0.0,
+            activation: 0.0,
         });
         Some(idx)
     }
@@ -1632,6 +1647,57 @@ impl SoftBody {
     /// [`Self::anisotropy`]). `None` disables directional response.
     pub fn set_anisotropy(&mut self, axes: Option<Vector>) {
         self.anisotropy = axes;
+    }
+
+    /// Phase 31 — sets the body-wide active-strain activation `γ ∈ [0, 1]` on every
+    /// spring and distance constraint at once (the "muscle contraction" level). The
+    /// effective rest length of each edge becomes `rest * (1 - γ)`, so a positive
+    /// activation actively pulls endpoints together. Values are clamped to `[0, 1]`;
+    /// `activate(0)` is the passive baseline. Non-finite input is ignored (no-op).
+    pub fn set_activation(&mut self, gamma: Real) -> bool {
+        if !gamma.is_finite() || gamma < 0.0 || gamma > 1.0 {
+            return false;
+        }
+        for s in &mut self.springs {
+            s.activation = gamma;
+        }
+        for c in &mut self.distance_constraints {
+            c.activation = gamma;
+        }
+        true
+    }
+
+    /// Phase 31 — sets the active-strain activation of a single spring (by the index
+    /// returned from `add_spring`). Out-of-range or non-finite `activation` (or one
+    /// outside `[0, 1]`) is rejected. Returns `false` on any invalid input.
+    pub fn set_spring_activation(&mut self, index: usize, activation: Real) -> bool {
+        if !activation.is_finite() || activation < 0.0 || activation > 1.0 {
+            return false;
+        }
+        match self.springs.get_mut(index) {
+            Some(s) => {
+                s.activation = activation;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Phase 31 — sets the active-strain activation of a single distance constraint
+    /// (by the index returned from `add_distance_constraint`). Out-of-range or
+    /// non-finite `activation` (or one outside `[0, 1]`) is rejected. Returns
+    /// `false` on any invalid input.
+    pub fn set_distance_constraint_activation(&mut self, index: usize, activation: Real) -> bool {
+        if !activation.is_finite() || activation < 0.0 || activation > 1.0 {
+            return false;
+        }
+        match self.distance_constraints.get_mut(index) {
+            Some(c) => {
+                c.activation = activation;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Phase 9: removes every over-stretched structural edge. Called once at the
@@ -2020,7 +2086,9 @@ impl SoftBody {
         for c in &self.distance_constraints {
             d_a.push(c.a);
             d_b.push(c.b);
-            d_rest.push(c.rest);
+            // Phase 31: active-strain contraction — the effective rest length the
+            // distance solver targets shrinks toward zero as activation rises.
+            d_rest.push(c.rest * (1.0 - c.activation.clamp(0.0, 1.0)));
             // Phase 27: directional (orthotropic) compliance scaling.
             let factor = if self.anisotropy.is_some() {
                 let pa = match (self.particles.get(c.a), self.particles.get(c.b)) {
@@ -3166,6 +3234,7 @@ mod tests {
             rest_length: 1.0,
             stiffness: 50.0,
             damping: 0.5,
+            activation: 0.0,
         });
 
         let d0 = (body.particles[b].pos - body.particles[a].pos).length();
