@@ -3,6 +3,7 @@ use crate::dynamics::{
     CCDSolver, GenericJoint, ImpulseJoint, ImpulseJointHandle, ImpulseJointSet,
     IntegrationParameters, IslandManager, Multibody, MultibodyJointHandle, MultibodyJointSet,
     MultibodyLink, MultibodyLinkId, RigidBody, RigidBodyHandle, RigidBodySet,
+    fluid::FluidWorld,
     soft_body::{SoftBody, SoftBodyId, SoftBodySet},
 };
 use crate::geometry::{
@@ -93,6 +94,11 @@ pub struct PhysicsWorld {
     /// collisions with rigid bodies — that coupling arrives in later phases). Each
     /// body with its `sleeping` flag set is skipped, mirroring island sleeping.
     pub soft_bodies: SoftBodySet,
+    /// All fluid bodies (SPH particle clouds). Stepped independently after the
+    /// rigid-body pipeline, mirroring `soft_bodies` (Phase 0 of the fluid
+    /// roadmap; rigid-body coupling arrives later). See
+    /// `.hermes/plans/2026-08-30_fluid-sph-roadmap.md`.
+    pub fluids: Vec<FluidWorld>,
 }
 
 impl Default for PhysicsWorld {
@@ -110,6 +116,7 @@ impl Default for PhysicsWorld {
             multibody_joints: MultibodyJointSet::new(),
             ccd_solver: CCDSolver::new(),
             soft_bodies: SoftBodySet::new(),
+            fluids: Vec::new(),
         }
     }
 }
@@ -174,6 +181,12 @@ impl PhysicsWorld {
         // to their rigid bodies' new world transforms (so anchored cloth/flags
         // follow a moving body). Runs after step so followers see updated poses.
         self.soft_bodies.follow_rigid_bodies(&self.bodies);
+        // Phase 0 (fluid SPH): advance every fluid particle cloud independently,
+        // after the rigid-body pipeline. No rigid coupling yet.
+        let dt = self.integration_parameters.dt;
+        for fluid in &mut self.fluids {
+            fluid.step(dt);
+        }
     }
 
     /// The bodies and colliders automatically disabled during the last step because their
