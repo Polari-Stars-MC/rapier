@@ -118,6 +118,11 @@ pub struct Spring {
     /// length toward zero (`rest_eff = rest_length * (1 - activation)`), pulling the
     /// two endpoints together like a contracting muscle. `0` (default) = passive.
     pub activation: Real,
+    /// Phase 32 — muscle-fibre direction (unit vector). When `Some(dir)`, the active
+    /// contraction is oriented along `dir` instead of purely along the edge — i.e. the
+    /// spring acts as a muscle fibre with a defined orientation (anisotropic drive).
+    /// `None` (default) = contract along the edge (degenerates to Phase 31 behaviour).
+    pub fibre: Option<Vector>,
 }
 
 /// A distance constraint (XPBD) between two particles — the edge of a deformable
@@ -149,6 +154,10 @@ pub struct DistanceConstraint {
     /// length toward zero (`rest_eff = rest * (1 - activation)`), contracting the
     /// edge like a muscle fibre. `0` (default) = passive.
     pub activation: Real,
+    /// Phase 32 — muscle-fibre direction (unit vector). See [`Spring::fibre`]; when
+    /// `Some(dir)` the active contraction is oriented along `dir` rather than purely
+    /// along the edge. `None` (default) = contract along the edge.
+    pub fibre: Option<Vector>,
 }
 
 /// Phase 27 — fracture-mechanics tearing criterion.
@@ -1040,6 +1049,7 @@ impl SoftBody {
             stiffness,
             damping,
             activation: 0.0,
+            fibre: None,
         });
         Some(idx)
     }
@@ -1089,7 +1099,13 @@ impl SoftBody {
             let rel_vel = pb_vel - pa_vel;
             let f_damp = s.damping * rel_vel.dot(dir);
             let f_axial = f_spring + f_damp;
-            let f = dir * f_axial;
+            // Phase 32: the active-strain drive follows the muscle-fibre direction
+            // when one is set, otherwise the spring edge (Phase 31 default).
+            let dir_active = match s.fibre {
+                Some(fd) => fd,
+                None => dir,
+            };
+            let f = dir_active * f_axial;
             if pa_im != 0.0 {
                 out[s.a] += f;
             }
@@ -1375,6 +1391,7 @@ impl SoftBody {
             compliance,
             compression: compliance,
             activation: 0.0,
+            fibre: None,
         });
         Some(idx)
     }
@@ -1585,6 +1602,7 @@ impl SoftBody {
                     compliance: 0.0,
                     compression: 0.0,
                     activation: 0.0,
+                    fibre: None,
                 });
             }
         }
@@ -1614,6 +1632,7 @@ impl SoftBody {
             compliance: 0.0,
             compression: 0.0,
             activation: 0.0,
+            fibre: None,
         });
         Some(idx)
     }
@@ -1694,6 +1713,48 @@ impl SoftBody {
         match self.distance_constraints.get_mut(index) {
             Some(c) => {
                 c.activation = activation;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Phase 32 — sets the muscle-fibre direction of a single distance constraint
+    /// (by the index returned from `add_distance_constraint`). When `dir` is a
+    /// finite non-zero vector it is normalized and stored as the fibre orientation
+    /// for anisotropic active contraction; a zero vector clears the fibre (back to
+    /// edge-aligned contraction). Returns `false` for an unknown index.
+    pub fn set_fibre_direction(&mut self, index: usize, dir: Vector) -> bool {
+        if !dir.is_finite() {
+            return false;
+        }
+        match self.distance_constraints.get_mut(index) {
+            Some(c) => {
+                if dir.x == 0.0 && dir.y == 0.0 && dir.z == 0.0 {
+                    c.fibre = None;
+                } else {
+                    c.fibre = Some(dir.normalize());
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Phase 32 — sets the muscle-fibre direction of a single spring (by the index
+    /// returned from `add_spring`). See [`Self::set_fibre_direction`]; a zero vector
+    /// clears the fibre. Returns `false` for an unknown index.
+    pub fn set_spring_fibre_direction(&mut self, index: usize, dir: Vector) -> bool {
+        if !dir.is_finite() {
+            return false;
+        }
+        match self.springs.get_mut(index) {
+            Some(s) => {
+                if dir.x == 0.0 && dir.y == 0.0 && dir.z == 0.0 {
+                    s.fibre = None;
+                } else {
+                    s.fibre = Some(dir.normalize());
+                }
                 true
             }
             None => false,
@@ -3235,6 +3296,7 @@ mod tests {
             stiffness: 50.0,
             damping: 0.5,
             activation: 0.0,
+            fibre: None,
         });
 
         let d0 = (body.particles[b].pos - body.particles[a].pos).length();
@@ -3246,6 +3308,36 @@ mod tests {
         assert!(body.kinetic_energy().is_finite());
         assert!(body.particles[a].pos.is_finite());
         assert!(body.particles[b].pos.is_finite());
+    }
+
+    #[test]
+    fn fibre_direction_steers_active_contraction() {
+        // Two free particles on the x-axis (edge along x). Set the muscle fibre
+        // direction along +y and activate: the active-strain drive must pull the
+        // endpoints along the fibre (+y), not along the edge (+x).
+        use crate::math::Vector;
+        let mut body = SoftBody::new(Vector::new(0.0, 0.0, 0.0));
+        let a = body.add_particle(Vector::new(-0.5, 0.0, 0.0));
+        let b = body.add_particle(Vector::new(0.5, 0.0, 0.0));
+        let idx = body.add_spring(a, b, 50.0, 0.5).expect("spring");
+        body.set_spring_activation(idx, 1.0);
+        body.set_spring_fibre_direction(idx, Vector::new(0.0, 1.0, 0.0));
+        let pa0 = body.particles[a].pos;
+        let pb0 = body.particles[b].pos;
+        for _ in 0..200 {
+            body.step(0.005);
+        }
+        let pa1 = body.particles[a].pos;
+        let pb1 = body.particles[b].pos;
+        // Edge (x-gap) should stay ~unchanged; fibre (y) should pull them together.
+        let dx = (pb1.x - pa1.x) - (pb0.x - pa0.x);
+        let dy = (pb1.y - pa1.y) - (pb0.y - pa0.y);
+        assert!(
+            dy.abs() > 1e-3,
+            "fibre drive must move endpoints along y: dy={dy}"
+        );
+        assert!(dx.abs() < 1e-2, "edge (x) should stay ~unchanged: dx={dx}");
+        assert!(pa1.is_finite() && pb1.is_finite());
     }
 
     #[test]
