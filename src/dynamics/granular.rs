@@ -27,6 +27,7 @@
 
 use crate::alloc_prelude::Vec;
 use crate::math::{Real, Vector};
+use std::collections::HashMap;
 
 /// A single DEM granular particle.
 #[derive(Clone, Debug)]
@@ -138,48 +139,82 @@ impl GranularWorld {
         }
         let p = self.params;
 
-        // (1) Pairwise contact forces, symmetric application (Newton's third
-        // law): each pair is visited exactly once, forces applied to both.
+        // (1) Pairwise contact forces via a uniform spatial hash broad-phase
+        // (Phase 38): cell size = 2·r_max guarantees every touching pair lands
+        // in adjacent cells, so scanning the 27 neighbours of each particle
+        // finds all contacts. Determinism: buckets are filled in particle
+        // order and each unordered pair is handled exactly once (j > i), so
+        // the force sequence is reproducible run-to-run.
+        let mut r_max: Real = 0.0;
+        for part in &self.particles {
+            r_max = r_max.max(part.radius);
+        }
+        let cell = 2.0 * r_max;
+        let mut cells: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+        for (idx, part) in self.particles.iter().enumerate() {
+            let key = (
+                (part.pos.x / cell).floor() as i64,
+                (part.pos.y / cell).floor() as i64,
+                (part.pos.z / cell).floor() as i64,
+            );
+            cells.entry(key).or_default().push(idx);
+        }
         let mut accels: Vec<Vector> = Vec::new();
         accels.resize(n, Vector::ZERO);
         for i in 0..n {
             let pi = self.particles[i].pos;
             let vi = self.particles[i].vel;
             let ri = self.particles[i].radius;
-            for j in (i + 1)..n {
-                let pj = self.particles[j].pos;
-                let rij = pi - pj; // from j to i
-                let d2 = rij.length_squared();
-                let rsum = ri + self.particles[j].radius;
-                if d2 >= rsum * rsum {
-                    continue; // not touching
+            let cx = (pi.x / cell).floor() as i64;
+            let cy = (pi.y / cell).floor() as i64;
+            let cz = (pi.z / cell).floor() as i64;
+            for dx in -1..=1i64 {
+                for dy in -1..=1i64 {
+                    for dz in -1..=1i64 {
+                        let Some(bucket) = cells.get(&(cx + dx, cy + dy, cz + dz)) else {
+                            continue;
+                        };
+                        for &j in bucket {
+                            if j <= i {
+                                continue; // each unordered pair once
+                            }
+                            let pj = self.particles[j].pos;
+                            let rij = pi - pj; // from j to i
+                            let d2 = rij.length_squared();
+                            let rsum = ri + self.particles[j].radius;
+                            if d2 >= rsum * rsum {
+                                continue; // not touching
+                            }
+                            let d = d2.max(1e-18).sqrt();
+                            let n_hat = rij / d; // from j toward i
+                            let overlap = rsum - d;
+                            let vij = vi - self.particles[j].vel;
+                            let v_n = vij.dot(n_hat); // approaching when negative
+
+                            // Normal force on i: spring push apart + damping of approach.
+                            let f_n_mag =
+                                (p.normal_stiffness * overlap - p.normal_damping * v_n).max(0.0);
+                            let f_n = n_hat * f_n_mag;
+
+                            // Tangential relative velocity (slide direction).
+                            let v_t_vec = vij - n_hat * v_n;
+                            let v_t = v_t_vec.length();
+                            // Tangential force on i opposes the slide, capped by μ·|F_n|.
+                            let f_t = if v_t > 1e-12 {
+                                let t_hat = v_t_vec / v_t;
+                                let raw = p.tangential_damping * v_t;
+                                let cap = p.friction * f_n_mag;
+                                -t_hat * raw.min(cap)
+                            } else {
+                                Vector::ZERO
+                            };
+
+                            let f = f_n + f_t;
+                            accels[i] += f / self.particles[i].mass;
+                            accels[j] -= f / self.particles[j].mass;
+                        }
+                    }
                 }
-                let d = d2.max(1e-18).sqrt();
-                let n_hat = rij / d; // from j toward i
-                let overlap = rsum - d;
-                let vij = vi - self.particles[j].vel;
-                let v_n = vij.dot(n_hat); // approaching when negative
-
-                // Normal force on i: spring push apart + damping of approach.
-                let f_n_mag = (p.normal_stiffness * overlap - p.normal_damping * v_n).max(0.0);
-                let f_n = n_hat * f_n_mag;
-
-                // Tangential relative velocity (slide direction).
-                let v_t_vec = vij - n_hat * v_n;
-                let v_t = v_t_vec.length();
-                // Tangential force on i opposes the slide, capped by μ·|F_n|.
-                let f_t = if v_t > 1e-12 {
-                    let t_hat = v_t_vec / v_t;
-                    let raw = p.tangential_damping * v_t;
-                    let cap = p.friction * f_n_mag;
-                    -t_hat * raw.min(cap)
-                } else {
-                    Vector::ZERO
-                };
-
-                let f = f_n + f_t;
-                accels[i] += f / self.particles[i].mass;
-                accels[j] -= f / self.particles[j].mass;
             }
         }
 
