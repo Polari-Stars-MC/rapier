@@ -47,6 +47,12 @@ pub mod soft_body;
 #[cfg(feature = "alloc")]
 pub mod fluid;
 
+// Granular-body (DEM) support — Phase 0 foundation. Same scaffolding as
+// `fluid.rs` (particle cloud, naive O(n²) neighbours, semi-implicit Euler)
+// with a spring-damper + Coulomb-friction contact model.
+#[cfg(feature = "alloc")]
+pub mod granular;
+
 #[cfg(feature = "alloc")]
 mod ccd;
 mod coefficient_combine_rule;
