@@ -664,7 +664,8 @@ impl SoftConstraintsSet {
         // (`rest·(1 + α·ΔT)·(1 − γ)`), so they are folded in once per body and step.
         let fork = &sb.fork;
         let fork_rest_scale = fork.rest_scale();
-        let fork_stiffens = fork.anisotropy.is_some() || fork.viscoelastic.is_some();
+        let fork_stiffens =
+            fork.anisotropy.is_some() || fork.viscoelastic.is_some() || fork.thermal.is_some();
         for (ei, e) in sb
             .edges
             .iter()
@@ -696,6 +697,10 @@ impl SoftConstraintsSet {
                     // Strain rate along the edge, from the endpoints' relative velocity.
                     let rate = (pb.velocity - pa.velocity).dot(n) / len;
                     cfm /= 1.0 + viscoelastic.rate_coefficient * rate.abs();
+                }
+                if fork.thermal.is_some() {
+                    // Temperature softening: `k_eff = k·(1 − coeff·ΔT)` ⇒ `α_eff = α / softening`.
+                    cfm /= fork.thermal_softening().max(1.0e-3);
                 }
                 cfm
             } else {

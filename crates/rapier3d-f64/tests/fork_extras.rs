@@ -223,3 +223,27 @@ fn active_strain_contracts_the_rest_edge() {
         "active strain 0.5 should contract to 0.5 m, got {len}"
     );
 }
+
+#[test]
+fn tear_criteria_land_on_the_official_thresholds() {
+    let (_bodies, _colliders, mut soft_bodies, handle) = two_particle_body();
+    let sb = &mut soft_bodies[handle];
+
+    // Strain and stress have an exact upstream counterpart: they are written into the material,
+    // which is also what arms upstream's tearing pass (`material.tears()`).
+    sb.set_tear_criterion(Some(ForkTearCriterion::Strain(0.05)));
+    assert_eq!(sb.material().tear_strain, Some(0.05));
+    assert_eq!(sb.material().tear_force, None);
+    assert!(sb.material().tears());
+
+    sb.set_tear_criterion(Some(ForkTearCriterion::Stress(12.0)));
+    assert_eq!(sb.material().tear_force, Some(12.0));
+    assert_eq!(sb.material().tear_strain, None);
+    assert!(sb.material().tears());
+
+    // The energy criterion has no upstream equivalent: it stays in the fork layer and is
+    // evaluated by the solver as the elastic work over the current stretch.
+    sb.set_tear_criterion(Some(ForkTearCriterion::Energy(0.5)));
+    assert_eq!(sb.fork_extras().tear, Some(ForkTearCriterion::Energy(0.5)));
+    assert!(!sb.material().tears());
+}

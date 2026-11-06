@@ -43,15 +43,31 @@ impl SoftConstraintsSet {
                         if edge.plastic_flow(len, &material, dt) {
                             awake.plastic_flow.store(true, Ordering::Relaxed);
                         }
-                        if material.tears() {
+                        // Fork layer: the energy criterion (Griffith-style work threshold) has no
+                        // upstream counterpart, so it is evaluated here as ½·F·Δ; `Strain` and
+                        // `Stress` were already written into the official material thresholds.
+                        let fork_energy = match sb.fork.tear {
+                            Some(crate::dynamics::soft_body::ForkTearCriterion::Energy(
+                                threshold,
+                            )) if threshold > 0.0 => Some(threshold),
+                            _ => None,
+                        };
+                        if material.tears() || fork_energy.is_some() {
                             // The force is the step's peak substep impulse over the substep length
                             // (a spike must not hide behind the last substep); the stretch is
                             // measured against the initial rest length, so plastic flow counts.
                             let peak = constraint.peak_impulse.max(constraint.impulse);
                             let force = peak * crate::utils::inv(awake.substep_dt);
-                            let load =
-                                material.edge_tear_load(len, edge.initial_rest_length(), force)
-                                    * crate::utils::inv(resistance);
+                            let load = match fork_energy {
+                                Some(threshold) => {
+                                    let stretch = len - edge.initial_rest_length();
+                                    0.5 * force * stretch.abs() * crate::utils::inv(threshold)
+                                }
+                                None => {
+                                    material.edge_tear_load(len, edge.initial_rest_length(), force)
+                                        * crate::utils::inv(resistance)
+                                }
+                            };
                             edge.stress = material.smooth_stress(edge.stress, load, dt);
                             if edge.stress > 1.0 {
                                 edge.torn = true;

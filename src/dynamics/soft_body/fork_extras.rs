@@ -103,21 +103,24 @@ pub struct CohesionParams {
     pub break_distance: Real,
 }
 
-/// How an edge is judged torn. Upstream only has a strain threshold and a force
-/// threshold; this is the fork's superset (energy = Griffith-style proxy).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// How an edge is judged torn, with its threshold.
+///
+/// Upstream only has a strain threshold and a force threshold; this is the fork's superset.
+/// `Strain` and `Stress` map onto upstream's `material.tear_strain` / `material.tear_force`
+/// (the setters write them there), while `Energy` has no upstream equivalent and is evaluated
+/// by the solver as the work done over the current stretch.
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(
     feature = "serde-serialize",
     derive(serde::Serialize, serde::Deserialize)
 )]
 pub enum ForkTearCriterion {
     /// Tear when `(|len| − rest) / rest` exceeds the threshold.
-    #[default]
-    Strain,
-    /// Tear when `|k·(len − rest)|` exceeds the threshold.
-    Stress,
-    /// Tear when `0.5·k·(len − rest)²` exceeds the threshold.
-    Energy,
+    Strain(Real),
+    /// Tear when the edge force exceeds the threshold (newtons).
+    Stress(Real),
+    /// Tear when the elastic work `½·F·(|len| − rest)` exceeds the threshold (joules).
+    Energy(Real),
 }
 
 /// This fork's soft-body extensions attached to one official [`SoftBody`](super::SoftBody).
@@ -338,6 +341,26 @@ impl crate::dynamics::soft_body::SoftBody {
 
     /// Tearing criterion (`None` leaves tearing entirely to upstream's thresholds).
     pub fn set_tear_criterion(&mut self, criterion: Option<ForkTearCriterion>) {
+        // Strain and stress thresholds have an exact upstream counterpart: the official tear
+        // load is already normalized by them, so they are written into the material. The energy
+        // criterion has no upstream equivalent and is evaluated by the solver itself.
+        match criterion {
+            Some(ForkTearCriterion::Strain(threshold)) => {
+                self.material.tear_strain = Some(threshold);
+                self.material.tear_force = None;
+            }
+            Some(ForkTearCriterion::Stress(threshold)) => {
+                self.material.tear_force = Some(threshold);
+                self.material.tear_strain = None;
+            }
+            // The energy criterion replaces upstream's thresholds: it is evaluated by the solver,
+            // so a stale `tear_strain`/`tear_force` would also tear on the old rule.
+            Some(ForkTearCriterion::Energy(_)) => {
+                self.material.tear_strain = None;
+                self.material.tear_force = None;
+            }
+            None => {}
+        }
         self.fork.tear = criterion;
         self.fork_touch();
     }
