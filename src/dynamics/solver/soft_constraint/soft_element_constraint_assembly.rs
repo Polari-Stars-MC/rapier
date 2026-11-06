@@ -662,7 +662,9 @@ impl SoftConstraintsSet {
         let element_constraints = !sb.uses_fem();
         // Fork layer: thermal expansion and active strain both act on the rest lengths
         // (`rest·(1 + α·ΔT)·(1 − γ)`), so they are folded in once per body and step.
-        let fork_rest_scale = sb.fork.rest_scale();
+        let fork = &sb.fork;
+        let fork_rest_scale = fork.rest_scale();
+        let fork_stiffens = fork.anisotropy.is_some() || fork.viscoelastic.is_some();
         for (ei, e) in sb
             .edges
             .iter()
@@ -675,6 +677,29 @@ impl SoftConstraintsSet {
                 (Some(softness), _) => coeffs_of(&softness),
                 (None, SoftBodyEdgeKind::Structural) => (edge_erp, edge_cfm),
                 (None, SoftBodyEdgeKind::Bend) => (bend_erp, bend_cfm),
+            };
+            // Fork layer: the per-edge compliance is direction- and rate-dependent.
+            // - orthotropic axes: `α_eff = α / (nᵀ·diag(axes)·n)` (stiffer along a heavy axis);
+            // - viscoelastic: `k_eff = k·(1 + η·|dε/dt|)`, i.e. `α_eff = α / (1 + η·|dε/dt|)`.
+            let cfm = if fork_stiffens {
+                let (ia, ib) = (e.vertices[0] as usize, e.vertices[1] as usize);
+                let (pa, pb) = (sb.particles[ia], sb.particles[ib]);
+                let d = pb.position - pa.position;
+                let len = d.length().max(1.0e-9);
+                let n = d / len;
+                let mut cfm = cfm;
+                if let Some(axes) = fork.anisotropy {
+                    let projection = (n * n).dot(axes).max(1.0e-6);
+                    cfm /= projection;
+                }
+                if let Some(viscoelastic) = fork.viscoelastic {
+                    // Strain rate along the edge, from the endpoints' relative velocity.
+                    let rate = (pb.velocity - pa.velocity).dot(n) / len;
+                    cfm /= 1.0 + viscoelastic.rate_coefficient * rate.abs();
+                }
+                cfm
+            } else {
+                cfm
             };
             let mut constraint = base_constraint(
                 SoftScalarConstraintKind::Distance,
