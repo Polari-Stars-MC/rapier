@@ -1596,6 +1596,7 @@ mod moving_platform_tests {
                     &mut colliders,
                     &mut impulse_joints,
                     &mut multibody_joints,
+                    &mut crate::dynamics::SoftBodySet::new(),
                     &mut CCDSolver::new(),
                     &(),
                     &(),

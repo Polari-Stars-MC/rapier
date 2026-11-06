@@ -1023,6 +1023,7 @@ mod joint_query_force_tests {
             &mut colliders,
             &mut impulse_joints,
             &mut multibody_joints,
+            &mut crate::dynamics::SoftBodySet::new(),
             &mut ccd,
             &(),
             &(),
