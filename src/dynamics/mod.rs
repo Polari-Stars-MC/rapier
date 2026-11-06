@@ -73,10 +73,10 @@ mod rigid_body_handle;
 pub(crate) mod solver;
 
 #[cfg(feature = "alloc")]
+pub mod force_containers;
+#[cfg(feature = "alloc")]
 mod rigid_body;
 #[cfg(feature = "alloc")]
 mod rigid_body_set;
-#[cfg(feature = "alloc")]
-pub mod force_containers;
 #[cfg(feature = "alloc")]
 mod soft_body;

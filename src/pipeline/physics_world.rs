@@ -6,8 +6,8 @@ use crate::dynamics::{
     SoftBody, SoftBodyBuilder, SoftBodyHandle, SoftBodySet, SoftBodyTearEvent, SoftClusterRemoval,
     SoftMeshBinding,
     fluid::FluidWorld,
-    soft_body_fork::{SoftBody as ForkSoftBody, SoftBodyId as ForkSoftBodyId},
     soft_body_fork::SoftBodySet as ForkSoftBodySet,
+    soft_body_fork::{SoftBody as ForkSoftBody, SoftBodyId as ForkSoftBodyId},
 };
 use crate::geometry::{
     BroadPhaseBvh, Collider, ColliderHandle, ColliderSet, ContactPair, DefaultBroadPhase,

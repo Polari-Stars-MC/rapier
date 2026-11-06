@@ -259,8 +259,8 @@ impl PhysicsPipeline {
                 // loop) so we never iterate the whole set — which would bump the
                 // active-set epoch during steady state.
                 crate::dynamics::force_containers::drain_transient_forces(rb);
-                any_extra_iterations |= rb.additional_solver_iterations() > 0
-                    || rb.additional_pgs_iterations() > 0;
+                any_extra_iterations |=
+                    rb.additional_solver_iterations() > 0 || rb.additional_pgs_iterations() > 0;
                 bid(rb, &islands.persistent, &mut split_bid);
                 observe(rb, observations);
             }
