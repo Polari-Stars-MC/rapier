@@ -298,6 +298,32 @@ impl SoftConstraintsSet {
                     if let Some(forces) = &pressure_forces {
                         accel += forces[i] * p.inv_mass;
                     }
+                    // Fork layer: cohesion glues this body to the *other* soft bodies that also
+                    // enable it. The attraction ramps to zero at the break distance, so crossing
+                    // the cutoff never makes the force jump.
+                    if let Some(glue) = sb.fork.cohesion {
+                        let break_distance = glue.break_distance.max(glue.radius).max(1.0e-6);
+                        let this = awake.ptr as usize;
+                        for other in &self.awake {
+                            if other.ptr as usize == this {
+                                continue;
+                            }
+                            // SAFETY: read-only access to another awake soft body's particles.
+                            let ob = unsafe { &*other.ptr };
+                            if ob.fork.cohesion.is_none() {
+                                continue;
+                            }
+                            for q in &ob.particles {
+                                let d = q.position - p.position;
+                                let dist = d.length();
+                                if dist <= 1.0e-9 || dist > break_distance {
+                                    continue;
+                                }
+                                let weight = 1.0 - dist / break_distance;
+                                accel += d * (glue.stiffness * weight / dist);
+                            }
+                        }
+                    }
                     (p.velocity, accel * dt)
                 };
                 let pose = &mut bodies.poses[slot];

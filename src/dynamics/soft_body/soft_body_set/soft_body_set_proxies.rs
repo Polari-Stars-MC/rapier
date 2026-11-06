@@ -300,8 +300,12 @@ pub(super) fn sync_soft_body(
         current => current,
     };
     sb.load_extra_substeps = load_extra;
+    // Fork layer: `fork.substeps` asks for a fixed extra subdivision of the step on top of the
+    // impact- and load-adaptive ones (upstream caps all of them with `max_extra_substeps`).
+    let fork_extra = sb.fork.substeps.saturating_sub(1) as usize;
     let extra = impact_extra
         .max(load_extra as usize)
+        .max(fork_extra)
         .min(params.soft_bodies.max_extra_substeps);
     outcome.additional_solver_iterations =
         sb.particle_settings.additional_solver_iterations.max(extra);

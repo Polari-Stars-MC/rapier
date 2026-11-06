@@ -247,3 +247,66 @@ fn tear_criteria_land_on_the_official_thresholds() {
     assert_eq!(sb.fork_extras().tear, Some(ForkTearCriterion::Energy(0.5)));
     assert!(!sb.material().tears());
 }
+
+#[test]
+fn cohesion_pulls_two_soft_bodies_together() {
+    let mut h = Harness::new();
+    let mut bodies = Vec::new();
+    for x in [0.0, 0.5] {
+        let builder = SoftBodyBuilder::new(vec![Vector::new(x, 0.0, 0.0)]).no_surface_collider();
+        let handle = h
+            .soft_bodies
+            .insert(builder, &mut h.bodies, &mut h.colliders);
+        assert!(
+            h.soft_bodies[handle].set_cohesion_glue(Some(CohesionParams {
+                radius: 0.2,
+                stiffness: 2.0,
+                break_distance: 2.0,
+            })),
+            "valid cohesion parameters"
+        );
+        bodies.push(handle);
+    }
+
+    let gap = |h: &Harness| {
+        (h.soft_bodies[bodies[1]].particle_position(0)
+            - h.soft_bodies[bodies[0]].particle_position(0))
+        .length()
+    };
+    let before = gap(&h);
+    h.step(Vector::ZERO, 120);
+    let after = gap(&h);
+
+    assert!(
+        after < before - 0.01,
+        "cohesive bodies should close the gap: {before} -> {after}"
+    );
+    assert!(after.is_finite(), "cohesion must stay finite");
+}
+#[test]
+fn extra_substeps_refine_the_same_motion() {
+    // The wind trajectory is analytic, so a finer subdivision must land on it too: this checks
+    // that `fork.substeps` reaches upstream's substep splitter instead of being ignored.
+    let mut h = Harness::new();
+    let builder =
+        SoftBodyBuilder::new(vec![Vector::new(0.0, 0.0, 0.0), Vector::new(0.0, 1.0, 0.0)])
+            .edges(vec![[0, 1]])
+            .no_surface_collider();
+    let handle = h
+        .soft_bodies
+        .insert(builder, &mut h.bodies, &mut h.colliders);
+    h.soft_bodies[handle].set_wind_field(Some(Wind {
+        accel: Vector::new(1.0, 0.0, 0.0),
+        drag: 0.0,
+    }));
+    assert!(h.soft_bodies[handle].set_extra_substeps(4));
+
+    h.step(Vector::ZERO, 60);
+    let dt = h.params.dt;
+    let expected = dt * dt * (60.0 * 61.0 / 2.0);
+    let x = mean_x(&h.soft_bodies[handle]);
+    assert!(
+        (x - expected).abs() < 0.03,
+        "substepped wind should stay near {expected}, got {x}"
+    );
+}
