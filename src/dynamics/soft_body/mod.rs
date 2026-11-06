@@ -5,6 +5,10 @@ pub use self::collision_mesh::{
     SoftBindingError, SoftCollisionMesh, SoftMeshBinding, SoftMeshBindingMode, SoftMeshCellBinding,
     SoftMeshId, SoftMeshMapping, SoftMeshRef,
 };
+pub use self::fork_extras::{
+    CohesionParams, ForkExtras, ForkTearCriterion, SelfCollisionParams, ThermalParams,
+    ViscoelasticParams, Wind,
+};
 pub use self::soft_body::{SOFT_BODY_MAX_CONSTRAINT_PARTICLES, SoftBody};
 pub use self::soft_body_builder::{SoftBodyBuilder, SoftBodyParticleSettings};
 pub use self::soft_body_cluster::{SoftBodyCluster, SoftClusterRemoval};
@@ -37,6 +41,7 @@ pub use soft_body_settings::SoftBodiesSettings;
 pub use soft_body_settings::SoftFemParameters;
 
 pub(crate) mod collision_mesh;
+pub mod fork_extras;
 mod soft_body;
 mod soft_body_accessors;
 mod soft_body_builder;

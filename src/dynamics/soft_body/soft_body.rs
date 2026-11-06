@@ -71,6 +71,12 @@ pub struct SoftBody {
     #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub(crate) boundary_element_cells: Vec<u32>,
     pub(crate) material: SoftBodyMaterial,
+    /// This fork`s soft-body extensions (wind, pressure, thermal, viscoelastic,
+    /// anisotropy, active strain, cohesion, cross-body contacts, tearing criteria,
+    /// extra substeps). Inert by default: a body that never touches them behaves
+    /// exactly like upstream`s.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub(crate) fork: super::ForkExtras,
     pub(crate) cell_model: SoftBodyCellModel,
     /// Which solver simulates this body's elasticity.
     #[cfg(feature = "fem")]

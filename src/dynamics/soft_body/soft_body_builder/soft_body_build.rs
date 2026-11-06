@@ -226,6 +226,7 @@ impl SoftBodyBuilder {
             boundary_closed,
             boundary_element_cells,
             material: self.material,
+            fork: super::super::ForkExtras::default(),
             cell_model: self.cell_model,
             #[cfg(feature = "fem")]
             solver: self.solver,

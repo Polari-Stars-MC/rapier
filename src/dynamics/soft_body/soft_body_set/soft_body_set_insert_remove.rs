@@ -41,6 +41,7 @@ impl SoftBodySet {
             #[cfg(feature = "dim3")]
             dihedrals: Vec::new(),
             cells: Vec::new(),
+            fork: Default::default(),
             boundary: Vec::new(),
             boundary_closed: false,
             boundary_element_cells: Vec::new(),
