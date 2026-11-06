@@ -4,6 +4,7 @@
 #[allow(unused_imports)]
 use simba::scalar::{ComplexField as _, RealField as _};
 
+use crate::alloc_prelude::*;
 use crate::dynamics::SoftBody;
 use crate::dynamics::solver::solver_body::{SolverBodies, SolverPose, SolverVel};
 use crate::math::{AngVector, Matrix, Real, Vector};
@@ -276,7 +277,10 @@ impl SoftConstraintsSet {
             let slots = &self.slots[awake.slot_start..awake.slot_start + awake.num_particles];
             let dt = group_dt(awake.group as usize);
             let settings = &sb.particle_settings;
-            for (p, &slot) in sb.particles.iter().zip(slots) {
+            // Fork layer: the internal pressure is distributed over the boundary faces once per
+            // body and step; `None` when the layer is inert.
+            let pressure_forces = sb.fork.pressure.map(|p| pressure_forces(sb, p));
+            for (i, (p, &slot)) in sb.particles.iter().zip(slots).enumerate() {
                 let slot = slot as usize;
                 let (vel, incr) = if p.inv_mass == 0.0 {
                     let vel = match p.next_position {
@@ -285,10 +289,16 @@ impl SoftConstraintsSet {
                     };
                     (vel, Vector::ZERO)
                 } else {
-                    (
-                        p.velocity,
-                        (gravity * settings.gravity_scale + p.force * p.inv_mass) * dt,
-                    )
+                    // Fork layer: wind / air resistance is an acceleration on every free particle
+                    // (`a = a_wind − drag·v`), and the pressure acts as a per-particle force.
+                    let mut accel = gravity * settings.gravity_scale + p.force * p.inv_mass;
+                    if let Some(wind) = sb.fork.wind {
+                        accel += wind.accel - p.velocity * wind.drag;
+                    }
+                    if let Some(forces) = &pressure_forces {
+                        accel += forces[i] * p.inv_mass;
+                    }
+                    (p.velocity, accel * dt)
                 };
                 let pose = &mut bodies.poses[slot];
                 *pose = SolverPose::default();
@@ -413,4 +423,40 @@ pub(crate) fn soft_fem_amplification_cap() -> crate::math::Real {
     {
         crate::math::Real::MAX
     }
+}
+
+/// Fork layer: the internal pressure force on every particle, computed from the boundary
+/// geometry (2D segments or 3D triangles, oriented outward).
+///
+/// A uniform pressure `P` pushes every boundary element along its outward normal with
+/// `F = P·A`. The element's share is split evenly between its particles: mass-weighted
+/// splitting would bias regular grids and make a uniform balloon drift.
+fn pressure_forces(sb: &SoftBody, pressure: Real) -> Vec<Vector> {
+    let mut out: Vec<Vector> = Vec::new();
+    out.resize(sb.particles.len(), Vector::ZERO);
+    let pos = |i: u32| sb.particles[i as usize].position;
+
+    #[cfg(feature = "dim3")]
+    for elem in &sb.boundary {
+        let (a, b, c) = (pos(elem[0]), pos(elem[1]), pos(elem[2]));
+        // `n` is twice the triangle area, along the outward normal: `P·A·n̂ = P·n/2`.
+        let n = (b - a).cross(c - a);
+        let third = n * (pressure * (1.0 / 6.0));
+        out[elem[0] as usize] += third;
+        out[elem[1] as usize] += third;
+        out[elem[2] as usize] += third;
+    }
+
+    #[cfg(feature = "dim2")]
+    for elem in &sb.boundary {
+        let (a, b) = (pos(elem[0]), pos(elem[1]));
+        let d = b - a;
+        // Outward normal of a CCW boundary, whose length is the edge length.
+        let n = Vector::new(d.y, -d.x);
+        let half = n * (pressure * 0.5);
+        out[elem[0] as usize] += half;
+        out[elem[1] as usize] += half;
+    }
+
+    out
 }

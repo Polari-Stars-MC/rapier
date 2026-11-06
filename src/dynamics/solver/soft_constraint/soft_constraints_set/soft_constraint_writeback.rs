@@ -136,6 +136,9 @@ impl SoftConstraintsSet {
         let sb = unsafe { &mut *awake.ptr };
         let slots = &self.slots[awake.slot_start..awake.slot_start + awake.num_particles];
         let damping = crate::utils::inv(1.0 + step_dt * sb.particle_settings.linear_damping);
+        // Fork layer: a body-wide internal damping, applied on top of upstream's linear damping.
+        // It is a per-step velocity scale (not a rate), so it does not read `step_dt`.
+        let fork_damping = 1.0 - sb.fork.damping.clamp(0.0, 1.0);
         for (p, &slot) in sb.particles.iter_mut().zip(slots) {
             let vel = bodies.get_vel(slot).linear;
             if p.inv_mass == 0.0 {
@@ -147,7 +150,7 @@ impl SoftConstraintsSet {
                     None => bodies.get_pose(slot).translation,
                 };
             } else {
-                p.velocity = vel * damping;
+                p.velocity = vel * (damping * fork_damping);
                 p.position = bodies.get_pose(slot).translation;
             }
         }

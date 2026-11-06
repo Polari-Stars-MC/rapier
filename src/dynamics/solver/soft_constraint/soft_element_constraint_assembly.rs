@@ -660,6 +660,9 @@ impl SoftConstraintsSet {
         };
 
         let element_constraints = !sb.uses_fem();
+        // Fork layer: thermal expansion and active strain both act on the rest lengths
+        // (`rest·(1 + α·ΔT)·(1 − γ)`), so they are folded in once per body and step.
+        let fork_rest_scale = sb.fork.rest_scale();
         for (ei, e) in sb
             .edges
             .iter()
@@ -678,7 +681,7 @@ impl SoftConstraintsSet {
                 SoftScalarConstraintWriteback::Edge,
                 ei,
                 &e.vertices,
-                e.rest_length,
+                e.rest_length * fork_rest_scale,
                 erp,
                 cfm,
                 e.impulse,
