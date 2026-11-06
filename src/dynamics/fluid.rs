@@ -183,6 +183,15 @@ impl FluidWorld {
             let mi = self.particles[i].mass;
             let mut density = Self::poly6(0.0, h) * mi; // self contribution
             for j in 0..n {
+                // Skip the self term: it is already accounted for above, and
+                // `j == i` satisfies `d2 < h2` (d2 == 0), so without this the
+                // particle contributed its own kernel weight twice. Density came
+                // out as ρ_true + m·W(0), which pushed `pressure =
+                // max(k(ρ − ρ0), 0)` strictly positive even at rest density —
+                // the fluid expanded forever.
+                if i == j {
+                    continue;
+                }
                 let pj = self.particles[j].pos;
                 let mj = self.particles[j].mass;
                 let d2 = (pi - pj).length_squared();
