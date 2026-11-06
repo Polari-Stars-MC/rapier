@@ -18,10 +18,10 @@
 //! | 率相关粘弹性 | [`ViscoelasticParams`] | 边刚度乘 `1 + rate·|dε/dt|` |
 //! | 体级正交各向异性 | [`ForkExtras::anisotropy`] | 边柔度除以 `nᵀ·diag·n` |
 //! | 主动应变 / 肌纤维方向 | [`ForkExtras::activation`] / [`ForkExtras::fibre`] | 边静止长度 `rest·(1 − γ)`，沿纤维各向异性 |
-//! | 内聚（可断裂胶水） | [`CohesionParams`] | 跨体粒子对的距离约束 |
-//! | 自接触 / 跨体接触 | [`SelfCollisionParams`] | 官方 `self_contacts`，跨体走世界级接触对 |
-//! | 撕裂准则（应变/应力/能量） | [`ForkTearCriterion`] | 官方 `tear_strain` / `tear_force` |
-//! | 子步 | [`ForkExtras::substeps`] | 官方冲击自适应子步的额外细分 |
+//! | 内聚（可断裂胶水） | [`CohesionParams`] | **待接**：跨体粒子对的距离约束 |
+//! | 自接触 / 跨体接触 | [`SelfCollisionParams`] | **待接**：官方 `self_contacts` 只在建体时可设，需要上游暴露重编碰撞网格的入口 |
+//! | 撕裂准则（应变/应力/能量） | [`ForkTearCriterion`] | 应变/应力写进官方阈值；能量由求解器按 `½·F·Δ` 评估 |
+//! | 子步 | [`ForkExtras::substeps`] | **待接**：官方冲击自适应子步的额外细分 |
 //!
 //! Nothing in this module integrates anything by itself: every field is read by
 //! the official solver path (`soft_constraint_prepare`, the per-particle predict,

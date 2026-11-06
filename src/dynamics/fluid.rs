@@ -137,7 +137,7 @@ impl FluidWorld {
         if diff <= 0.0 {
             return 0.0;
         }
-        315.0 / (64.0 * std::f64::consts::PI * h.powi(9)) * diff.powi(3)
+        315.0 / (64.0 * core::f64::consts::PI as Real * h.powi(9)) * diff.powi(3)
     }
 
     /// SPH Spiky pressure-gradient kernel `∇W(r, h)` (points from neighbour to
@@ -150,7 +150,7 @@ impl FluidWorld {
         }
         let diff = h - distance;
         // -r̂ · (45 / (π h⁶)) · (h - r)²  — standard spiky gradient.
-        -offset / distance * (45.0 / (std::f64::consts::PI * h.powi(6)) * diff * diff)
+        -offset / distance * (45.0 / (core::f64::consts::PI as Real * h.powi(6)) * diff * diff)
     }
 
     /// SPH viscosity Laplacian `∇²W(r, h)`.
@@ -158,7 +158,7 @@ impl FluidWorld {
         if distance >= h {
             return 0.0;
         }
-        45.0 / (std::f64::consts::PI * h.powi(6)) * (h - distance)
+        45.0 / (core::f64::consts::PI as Real * h.powi(6)) * (h - distance)
     }
 
     /// Advance the fluid by one timestep `dt` using semi-implicit Euler.
