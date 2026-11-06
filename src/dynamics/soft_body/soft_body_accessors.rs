@@ -85,6 +85,23 @@ impl SoftBody {
         &self.edges
     }
 
+    /// The rest length of the `i`-th distance constraint.
+    pub fn edge_rest_length(&self, i: usize) -> Real {
+        self.edges[i].rest_length
+    }
+
+    /// Sets the rest length of the `i`-th distance constraint.
+    ///
+    /// The solver reads it every step, so this is the per-edge counterpart of the body-level
+    /// rest-length handling: a per-constraint active strain (`rest·(1 − γ)`) or a per-edge
+    /// thermal expansion is expressed with it.
+    pub fn set_edge_rest_length(&mut self, i: usize, rest_length: Real) {
+        if let Some(edge) = self.edges.get_mut(i) {
+            edge.rest_length = rest_length;
+            self.modified = true;
+        }
+    }
+
     /// The dihedral bending constraints of this soft body.
     #[cfg(feature = "dim3")]
     pub fn dihedrals(&self) -> &[SoftBodyDihedral] {
