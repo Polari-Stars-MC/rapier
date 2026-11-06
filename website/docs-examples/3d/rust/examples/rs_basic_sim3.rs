@@ -2,6 +2,32 @@
 use rapier3d::prelude::*;
 
 fn main() {
+    // The world owns every structure needed by the simulation.
+    let mut world = PhysicsWorld::new();
+    world.gravity = Vector::new(0.0, -9.81, 0.0);
+
+    /* Create the ground. */
+    world.insert_collider(ColliderBuilder::cuboid(100.0, 0.1, 100.0), None);
+
+    /* Create the bouncing ball. */
+    let (ball_body_handle, _) = world.insert(
+        RigidBodyBuilder::dynamic().translation(Vector::new(0.0, 10.0, 0.0)),
+        ColliderBuilder::ball(0.5).restitution(0.7),
+    );
+
+    /* Run the game loop, stepping the simulation once per frame. */
+    for _ in 0..200 {
+        world.step();
+
+        let ball_body = &world.bodies[ball_body_handle];
+        println!("Ball altitude: {}", ball_body.translation().y);
+    }
+}
+// DOCUSAURUS: basic_sim stop
+
+#[allow(dead_code)]
+// DOCUSAURUS: basic_sim_manual start
+fn manual_stepping() {
     let mut rigid_body_set = RigidBodySet::new();
     let mut collider_set = ColliderSet::new();
 
@@ -26,6 +52,7 @@ fn main() {
     let mut narrow_phase = NarrowPhase::new();
     let mut impulse_joint_set = ImpulseJointSet::new();
     let mut multibody_joint_set = MultibodyJointSet::new();
+    let mut soft_body_set = SoftBodySet::new();
     let mut ccd_solver = CCDSolver::new();
     let physics_hooks = ();
     let event_handler = ();
@@ -42,6 +69,7 @@ fn main() {
             &mut collider_set,
             &mut impulse_joint_set,
             &mut multibody_joint_set,
+            &mut soft_body_set,
             &mut ccd_solver,
             &physics_hooks,
             &event_handler,
@@ -51,4 +79,4 @@ fn main() {
         println!("Ball altitude: {}", ball_body.translation().y);
     }
 }
-// DOCUSAURUS: basic_sim stop
+// DOCUSAURUS: basic_sim_manual stop

@@ -1,0 +1,62 @@
+[package]
+name = "rapier-py-3d"
+version.workspace = true
+authors.workspace = true
+description = "PyO3 extension module wrapping rapier3d (f32)."
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+name = "_rapier3d"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[lints]
+# pyo3 0.22's `create_exception!` macro still references `cfg(feature = "gil-refs")`
+# which this crate doesn't have; mute that check alongside our own determinism cfg.
+rust.unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(rapier_py_determinism)',
+    'cfg(feature, values("gil-refs"))',
+] }
+
+[features]
+# Phase 11 — opt-in build flag. When enabled, rapier is compiled with
+# `enhanced-determinism` (libm-based transcendentals). The env-var-driven
+# entry point documented in the planning doc is
+# `RAPIER_PY_DETERMINISM=1` translated to `--features determinism` by the
+# build.rs.
+determinism = ["rapier3d/enhanced-determinism"]
+# Rapier's internal profiler: fills the timings of `Counters` (only measured while they are
+# enabled, so it costs nothing otherwise). On by default.
+default = ["profiler"]
+profiler = ["rapier3d/profiler"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39", "multiple-pymethods"] }
+numpy = "0.22"
+nalgebra.workspace = true
+thiserror.workspace = true
+# `fem` is always on: pip users can't pick cargo features, and the FEM soft-body solver is
+# only used by the bodies that select it.
+rapier3d = { workspace = true, features = [
+    "serde-serialize",
+    "debug-render",
+    "parallel",
+    "fem",
+] }
+# Phase 09 — Loaders. URDF + MJCF + mesh. Mesh-loader features are
+# explicitly enabled so .stl / .obj / .dae meshes referenced from URDF /
+# MJCF files work out of the box.
+rapier3d-urdf = { workspace = true, features = ["stl", "collada", "wavefront"] }
+rapier3d-mjcf = { workspace = true, features = ["stl", "wavefront", "msh"] }
+rapier3d-meshloader = { workspace = true, features = ["stl", "collada", "wavefront"] }
+mesh-loader.workspace = true
+urdf-rs.workspace = true
+# Phase 11 — Serialization, snapshots.
+serde = { workspace = true, features = ["derive", "std"] }
+bincode = { workspace = true }
+serde_json = { workspace = true, features = ["arbitrary_precision"] }

@@ -1,5 +1,11 @@
 [workspace]
 members = [
+    "bindings/c/testbed/tools/logo-mesh",
+    "bindings/c/rapier-c-macros",
+    "bindings/c/rapier2d-ffi",
+    "bindings/c/rapier3d-ffi",
+    "bindings/c/rapier2d-f64-ffi",
+    "bindings/c/rapier3d-f64-ffi",
     "crates/rapier2d",
     "crates/rapier2d-f64",
     "crates/rapier_testbed2d",
@@ -15,13 +21,14 @@ members = [
     "crates/rapier3d-meshloader",
     "crates/mjcf-rs",
     "crates/rapier3d-mjcf",
-    "python/rapier-py-3d",
+    "bindings/python/rapier-py-3d",
 ]
 # Bare `cargo build` / `cargo test` / `cargo clippy` only touches the
 # pure-Rust crates. The Python-binding crates need a Python build env
 # (pyo3 `extension-module`) and are exercised by the dedicated
 # `.github/workflows/python-bindings.yml` workflow via explicit
-# `-p rapier-py-*` invocations.
+# `-p rapier-py-*` invocations. C ABI crates are tested separately by
+# `.github/workflows/c-bindings.yml`, including native C/C++ consumers.
 default-members = [
     "crates/rapier2d",
     "crates/rapier2d-f64",
@@ -39,13 +46,15 @@ default-members = [
     "crates/mjcf-rs",
     "crates/rapier3d-mjcf",
 ]
-# `typescript/` is the JS/Wasm bindings' own Cargo workspace; keep it out of
-# this one so root-level `cargo` commands never try to absorb its crates.
-exclude = ["typescript", "parry", "nalgebra"]
+# `bindings/typescript/` and `bindings/bevy_rapier/` have their own Cargo workspaces; keep them out of
+# this one so root-level `cargo` commands never try to absorb their crates.
+# `parry/` is this fork's own checkout of parry (a git submodule) consumed through
+# path dependencies below; it is its own workspace, so keep it excluded as well.
+exclude = ["bindings/typescript", "bindings/bevy_rapier", "parry"]
 resolver = "2"
 
 [workspace.package]
-version = "0.35.3"
+version = "0.36.1"
 authors = ["Sébastien Crozet <sebcrozet@dimforge.com>"]
 homepage = "https://rapier.rs"
 repository = "https://github.com/dimforge/rapier"
@@ -66,7 +75,7 @@ needless_lifetimes = "allow"
 [workspace.dependencies]
 # Core math
 nalgebra = { version = "0.35", default-features = false, features = ["macros"] }
-glamx = { version = "0.3", default-features = false }
+glamx = { version = "0.3.1", default-features = false }
 simba = { version = "0.10.2", default-features = false }
 num-traits = { version = "0.2", default-features = false }
 # Bit-identical gemm backend (same crate nalgebra delegates to for dynamic matrices).
@@ -126,18 +135,18 @@ getrandom = { version = "0.2", features = ["js"] }
 wasm-bindgen = "0.2"
 
 # Internal crates (paths are relative to the workspace root)
-rapier2d = { version = "0.35.2", path = "crates/rapier2d" }
-rapier2d-f64 = { version = "0.35.2", path = "crates/rapier2d-f64" }
-rapier3d = { version = "0.35.2", path = "crates/rapier3d" }
-rapier3d-f64 = { version = "0.35.2", path = "crates/rapier3d-f64" }
-rapier_testbed2d = { version = "0.35.2", path = "crates/rapier_testbed2d" }
-rapier_testbed2d-f64 = { version = "0.35.2", path = "crates/rapier_testbed2d-f64" }
-rapier_testbed3d = { version = "0.35.2", path = "crates/rapier_testbed3d" }
-rapier_testbed3d-f64 = { version = "0.35.2", path = "crates/rapier_testbed3d-f64" }
-rapier3d-urdf = { version = "0.35.2", path = "crates/rapier3d-urdf" }
-rapier3d-meshloader = { version = "0.35.2", path = "crates/rapier3d-meshloader", default-features = false }
-mjcf-rs = { version = "0.35.2", path = "crates/mjcf-rs" }
-rapier3d-mjcf = { version = "0.35.2", path = "crates/rapier3d-mjcf" }
+rapier2d = { version = "0.36.1", path = "crates/rapier2d" }
+rapier2d-f64 = { version = "0.36.1", path = "crates/rapier2d-f64" }
+rapier3d = { version = "0.36.1", path = "crates/rapier3d" }
+rapier3d-f64 = { version = "0.36.1", path = "crates/rapier3d-f64" }
+rapier_testbed2d = { version = "0.36.1", path = "crates/rapier_testbed2d" }
+rapier_testbed2d-f64 = { version = "0.36.1", path = "crates/rapier_testbed2d-f64" }
+rapier_testbed3d = { version = "0.36.1", path = "crates/rapier_testbed3d" }
+rapier_testbed3d-f64 = { version = "0.36.1", path = "crates/rapier_testbed3d-f64" }
+rapier3d-urdf = { version = "0.36.1", path = "crates/rapier3d-urdf" }
+rapier3d-meshloader = { version = "0.36.1", path = "crates/rapier3d-meshloader", default-features = false }
+mjcf-rs = { version = "0.36.1", path = "crates/mjcf-rs" }
+rapier3d-mjcf = { version = "0.36.1", path = "crates/rapier3d-mjcf" }
 
 # Dev
 bincode = "1"
@@ -161,10 +170,11 @@ tempfile = "3"
 
 #kiss3d = { git = "https://github.com/sebcrozet/kiss3d", branch = "render-2d" }
 #nalgebra = { git = "https://github.com/dimforge/nalgebra", branch = "dev" }
-#parry2d = { git = "https://github.com/dimforge/parry", branch = "master" }
-#parry3d = { git = "https://github.com/dimforge/parry", branch = "master" }
-#parry2d-f64 = { git = "https://github.com/dimforge/parry", branch = "master" }
-#parry3d-f64 = { git = "https://github.com/dimforge/parry", branch = "master" }
+#glamx = { git = "https://github.com/dimforge/glamx", branch = "fix-lerp2" }
+#parry2d = { git = "https://github.com/dimforge/parry", branch = "soft-bodies" }
+#parry3d = { git = "https://github.com/dimforge/parry", branch = "soft-bodies" }
+#parry2d-f64 = { git = "https://github.com/dimforge/parry", branch = "soft-bodies" }
+#parry3d-f64 = { git = "https://github.com/dimforge/parry", branch = "soft-bodies" }
 
 # See https://github.com/EmbarkStudios/puffin/pull/234
 puffin_egui = { git = "https://github.com/tedsteen/puffin.git", rev = "11771ebe00fd257aedbb545df3339ad597b1cc34" }

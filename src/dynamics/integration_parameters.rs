@@ -108,16 +108,30 @@ impl<N: SimdRealField<Element = Real> + Copy> SpringCoefficients<N> {
         let one = N::one();
         let erp = self.erp(dt);
         let erp_is_not_zero = erp.simd_ne(N::zero());
-        let inv_erp_minus_one = one / erp - one;
 
-        // let stiffness = 4.0 * damping_ratio * damping_ratio * projected_mass
-        //     / (dt * dt * inv_erp_minus_one * inv_erp_minus_one);
-        // let damping = 4.0 * damping_ratio * damping_ratio * projected_mass
-        //     / (dt * inv_erp_minus_one);
-        // let cfm = 1.0 / (dt * dt * stiffness + dt * damping);
-        // NOTE: This simplifies to cfm = cfm_coeff / projected_mass:
-        let result = inv_erp_minus_one * inv_erp_minus_one
-            / ((one + inv_erp_minus_one) * N::splat(4.0) * self.damping_ratio * self.damping_ratio);
+        let damped = {
+            let inv_erp_minus_one = one / erp - one;
+
+            // let stiffness = 4.0 * damping_ratio * damping_ratio * projected_mass
+            //     / (dt * dt * inv_erp_minus_one * inv_erp_minus_one);
+            // let damping = 4.0 * damping_ratio * damping_ratio * projected_mass
+            //     / (dt * inv_erp_minus_one);
+            // let cfm = 1.0 / (dt * dt * stiffness + dt * damping);
+            // NOTE: This simplifies to cfm = cfm_coeff / projected_mass:
+            inv_erp_minus_one * inv_erp_minus_one
+                / ((one + inv_erp_minus_one)
+                    * N::splat(4.0)
+                    * self.damping_ratio
+                    * self.damping_ratio)
+        };
+        let undamped = {
+            // Undamped version if the damping ratio is zero.
+            let dt_omega = dt * self.angular_frequency();
+            one / (dt_omega * (dt_omega + N::splat(2.0) * self.damping_ratio))
+        };
+
+        let damping_is_zero = self.damping_ratio.simd_eq(N::zero());
+        let result = undamped.select(damping_is_zero, damped);
         result.select(erp_is_not_zero, N::zero())
     }
 
@@ -186,6 +200,11 @@ pub struct IntegrationParameters {
     /// - 120 FPS: `1.0 / 120.0` ≈ 0.0083 seconds
     ///
     /// Smaller timesteps are more accurate but require more CPU time per second of simulated time.
+    ///
+    /// With a zero (or negative) `dt`, [`PhysicsPipeline::step`](crate::pipeline::PhysicsPipeline::step)
+    /// only applies the user changes and updates the collision detection (contacts, collision
+    /// events, scene queries): no time passes, so no body moves (kinematic bodies included) and
+    /// velocities are left untouched.
     pub dt: Real,
     /// Minimum timestep size when using CCD with multiple substeps (default: `1.0 / 60.0 / 100.0`).
     ///
@@ -231,6 +250,14 @@ pub struct IntegrationParameters {
     /// with your chosen units.
     pub length_unit: Real,
 
+    /// Settings shared by every soft body: tangle recovery, strained-constraint re-sweep, impact
+    /// substeps, contact stiffening and FEM solver tuning (see [`SoftBodiesSettings`]).
+    ///
+    /// [`SoftBodiesSettings`]: crate::dynamics::SoftBodiesSettings
+    #[cfg(feature = "alloc")]
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub soft_bodies: crate::dynamics::SoftBodiesSettings,
+
     /// Geometric slop distance (default: `0.005`), e.g. the standoff kept
     /// by the CCD clamp. NOT a deadzone on the position-correction bias: penetrations are corrected
     /// all the way to zero; a deadzone would keep loaded piles wedging and creeping.
@@ -243,7 +270,7 @@ pub struct IntegrationParameters {
     /// Capping this recovery velocity keeps deep penetrations from being resolved explosively.
     /// This value is implicitly scaled by [`IntegrationParameters::length_unit`].
     pub normalized_max_corrective_velocity: Real,
-    /// The maximal distance separating two objects that will generate predictive contacts (default: `0.002m`).
+    /// The maximal distance separating two objects that will generate predictive contacts (default: `0.02`).
     ///
     /// This value is implicitly scaled by [`IntegrationParameters::length_unit`].
     pub normalized_prediction_distance: Real,
@@ -273,7 +300,7 @@ pub struct IntegrationParameters {
     /// into one "cluster" manifold before constraint generation (default: `true`, 3D only), so at
     /// most 4 contact points are solved per contact plane — a large solver win on composite shapes
     /// (meshes, heightfields, compounds, voxels) that emit one manifold per subshape. When clustering
-    /// applies, read solver contacts/impulses from [`crate::geometry::ContactPair::solver_clusters`],
+    /// applies, read solver contacts/impulses from [`crate::geometry::RigidPairContacts::solver_clusters`],
     /// not [`crate::geometry::ContactPair::manifolds`].
     pub contact_clustering: bool,
     /// If enabled, a contact pair whose relative pose moved less than [`Self::contact_recycle_distance`]
@@ -360,7 +387,7 @@ impl IntegrationParameters {
     }
 
     /// The maximal distance separating two objects that will generate predictive contacts
-    /// (default: `0.002m` multiped by [`Self::length_unit`]).
+    /// (default: `0.02` multiplied by [`Self::length_unit`]).
     pub fn prediction_distance(&self) -> Real {
         self.normalized_prediction_distance * self.length_unit
     }
@@ -410,6 +437,8 @@ impl Default for IntegrationParameters {
             friction_in_bias_pass: false,
             warmstart_joints: false,
             length_unit: 1.0,
+            #[cfg(feature = "alloc")]
+            soft_bodies: Default::default(),
             #[cfg(feature = "dim3")]
             friction_model: FrictionModel::default(),
             bridge_contact_forces: false,

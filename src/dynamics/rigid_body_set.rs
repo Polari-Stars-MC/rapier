@@ -1,7 +1,7 @@
 use crate::data::{Arena, HasModifiedFlag, ModifiedObjects};
 use crate::dynamics::{
     ImpulseJointSet, IslandManager, MultibodyJointSet, RigidBody, RigidBodyBuilder,
-    RigidBodyChanges, RigidBodyHandle,
+    RigidBodyChanges, RigidBodyHandle, SoftBodySet,
 };
 use crate::geometry::ColliderSet;
 use core::ops::{Index, IndexMut};
@@ -212,6 +212,7 @@ impl RigidBodySet {
     /// # let mut impulse_joints = ImpulseJointSet::new();
     /// # let mut multibody_joints = MultibodyJointSet::new();
     /// # let handle = bodies.insert(RigidBodyBuilder::dynamic());
+    /// # let mut soft_bodies = SoftBodySet::new();
     /// // Remove a body and everything attached to it
     /// if let Some(body) = bodies.remove(
     ///     handle,
@@ -219,6 +220,7 @@ impl RigidBodySet {
     ///     &mut colliders,
     ///     &mut impulse_joints,
     ///     &mut multibody_joints,
+    ///     &mut soft_bodies,
     ///     true  // Remove colliders too
     /// ) {
     ///     println!("Removed body at {:?}", body.translation());
@@ -232,8 +234,18 @@ impl RigidBodySet {
         colliders: &mut ColliderSet,
         impulse_joints: &mut ImpulseJointSet,
         multibody_joints: &mut MultibodyJointSet,
+        soft_bodies: &mut SoftBodySet,
         remove_attached_colliders: bool,
     ) -> Option<RigidBody> {
+        // Removing a soft-frame proxy removes its cluster: the particles only it covers, the
+        // elements attached to them, and their colliders. Dissolved before the body removal so the
+        // proxy (and its parenting of the cluster's colliders) is still intact meanwhile.
+        if let Some(rb) = self.bodies.get(handle.0) {
+            if let (Some(sb_handle), Some(cluster)) = (rb.soft_body(), rb.soft_cluster()) {
+                soft_bodies.on_proxy_removed(sb_handle, cluster, islands, self, colliders);
+            }
+        }
+
         let rb = self.bodies.remove(handle.0)?;
         if let Some(changes) = &mut self.spatial_changes {
             changes.push(handle.into_raw_parts().0);
@@ -248,7 +260,7 @@ impl RigidBodySet {
          */
         if remove_attached_colliders {
             for collider in rb.colliders() {
-                colliders.remove(*collider, islands, self, false);
+                colliders.remove(*collider, islands, self, soft_bodies, false);
             }
         } else {
             // If we don’t remove the attached colliders, simply detach them.

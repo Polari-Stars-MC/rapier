@@ -29,6 +29,10 @@ pub use parry::mass_properties::MassProperties;
 pub use self::rigid_body::{RigidBody, RigidBodyBuilder};
 #[cfg(feature = "alloc")]
 pub use self::rigid_body_set::{BodyPair, RigidBodySet};
+#[cfg(feature = "alloc")]
+pub(crate) use self::soft_body::soft_body_crossing_tests;
+#[cfg(feature = "alloc")]
+pub use self::soft_body::*;
 
 // Force containers: kind-classified, self-integrating {persistent, transient}
 // force model. Declared AFTER `rigid_body` so the `RigidBody` type it depends
@@ -36,11 +40,13 @@ pub use self::rigid_body_set::{BodyPair, RigidBodySet};
 #[cfg(feature = "alloc")]
 pub use self::force_containers::*;
 
-// Soft-body (deformable body) support — Phase 0 foundation. Independent of the
-// SoA SIMD solver boundary; wires into `World` / `PersistentIslands` in a later
-// phase (see `.hermes/plans/2026-08-24_soft-body-roadmap.md`).
+// Soft-body (deformable body) support — this fork's own implementation. Kept
+// under its own module name because upstream v0.36 shipped an independent
+// soft-body system as `dynamics::soft_body` (below); the two must not share a
+// module name (`soft_body.rs` vs `soft_body/mod.rs` is a hard error) and must
+// not both glob-export `SoftBody` into `dynamics`.
 #[cfg(feature = "alloc")]
-pub mod soft_body;
+pub mod soft_body_fork;
 
 // Fluid-body (SPH) support — Phase 0 foundation. Independent of the SoA SIMD
 // solver boundary; see `.hermes/plans/2026-08-30_fluid-sph-roadmap.md`.
@@ -67,9 +73,10 @@ mod rigid_body_handle;
 pub(crate) mod solver;
 
 #[cfg(feature = "alloc")]
+pub mod force_containers;
+#[cfg(feature = "alloc")]
 mod rigid_body;
 #[cfg(feature = "alloc")]
 mod rigid_body_set;
-
 #[cfg(feature = "alloc")]
-pub mod force_containers;
+mod soft_body;

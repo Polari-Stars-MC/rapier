@@ -116,6 +116,7 @@ fn ball_does_not_tunnel_into_voxel_block() {
             &mut colliders,
             &mut impulse_joints,
             &mut multibody_joints,
+            &mut crate::dynamics::SoftBodySet::new(),
             &mut ccd,
             &(),
             &(),

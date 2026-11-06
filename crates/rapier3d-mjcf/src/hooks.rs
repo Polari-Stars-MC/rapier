@@ -64,6 +64,16 @@ impl MjcfContactHooks {
     pub fn has_overrides(&self) -> bool {
         !self.overrides.is_empty()
     }
+
+    /// `true` if contacts between the colliders `a` and `b` are excluded.
+    pub fn is_excluded(&self, a: ColliderHandle, b: ColliderHandle) -> bool {
+        self.exclude.contains(&(a, b))
+    }
+
+    /// The override registered for the pair of colliders `a` and `b`, if any.
+    pub fn pair_override(&self, a: ColliderHandle, b: ColliderHandle) -> Option<PairOverride> {
+        self.overrides.get(&(a, b)).copied()
+    }
 }
 
 impl PhysicsHooks for MjcfContactHooks {
@@ -71,16 +81,16 @@ impl PhysicsHooks for MjcfContactHooks {
         if self.exclude.contains(&(ctx.collider1, ctx.collider2)) {
             None
         } else {
-            Some(SolverFlags::COMPUTE_IMPULSES)
+            Some(SolverFlags::COMPUTE_RIGID_IMPULSES)
         }
     }
 
     fn modify_solver_contacts(&self, ctx: &mut ContactModificationContext) {
         let key = (ctx.collider1, ctx.collider2);
         if let Some(ov) = self.overrides.get(&key) {
-            if let Some(f) = ov.friction {
+            if let (Some(f), Some(rigid)) = (ov.friction, ctx.rigid_mut()) {
                 // Contact materials are per-manifold since the solver-contact slimming.
-                *ctx.friction = f;
+                *rigid.friction = f;
             }
         }
     }

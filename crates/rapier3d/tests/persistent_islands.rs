@@ -1,6 +1,6 @@
 //! Structural tests for the persistent islands: eager merge on
 //! touch/joint-link, deferred split (one island per step) after constraint
-//! removals, and link refreshes on body lifecycle edits.
+//! removals, and link updates on body lifecycle edits.
 //!
 //! These tests observe island *equality* between bodies through the
 //! test-only `IslandManager::persistent_island_of` accessor; the heavy
@@ -105,6 +105,53 @@ fn joint_links_and_split_after_removal() {
         !same_island(&world, a, b),
         "the deferred split must separate joint-disconnected islands"
     );
+}
+
+/// Disabling a joint through `ImpulseJointSet::get_mut` must unlink it from the islands (so they
+/// can split), and re-enabling it must link them again.
+#[test]
+fn joint_enable_toggle_unlinks_and_relinks() {
+    let mut world = world_with_ground();
+    let a = insert_box(&mut world, 0.0, 0.5);
+    let b = insert_box(&mut world, 20.0, 0.5);
+    let joint = world.impulse_joints.insert(
+        a,
+        b,
+        RopeJointBuilder::new(30.0)
+            .local_anchor1(Vector::ZERO)
+            .local_anchor2(Vector::ZERO),
+        true,
+    );
+    world.step();
+    assert!(same_island(&world, a, b));
+
+    for wake_up in [false, true] {
+        world
+            .impulse_joints
+            .get_mut(joint, wake_up)
+            .unwrap()
+            .data
+            .set_enabled(false);
+        for _ in 0..SETTLE_STEPS {
+            world.step();
+        }
+        assert!(
+            !same_island(&world, a, b),
+            "a disabled joint must not keep the islands together"
+        );
+
+        world
+            .impulse_joints
+            .get_mut(joint, wake_up)
+            .unwrap()
+            .data
+            .set_enabled(true);
+        world.step();
+        assert!(
+            same_island(&world, a, b),
+            "a re-enabled joint must merge islands"
+        );
+    }
 }
 
 /// Removing the middle box of a touching row must split the sides apart.

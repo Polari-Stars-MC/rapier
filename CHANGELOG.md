@@ -1,3 +1,82 @@
+## v0.36.1 (4 October 2026)
+
+### Added
+
+- Python: a multibody's state and motors in reduced coordinates (`Multibody.generalized_position`,
+  `armature` / `set_armature`, `set_link_motor` and friends, `MultibodyLink.assembly_id` / `ndofs`),
+  MJCF body and joint names (`MjcfRobot.body_names`, `joint_name_to_idx`...) and MJCF actuator
+  parameters (`MjcfActuatorHandle.gear`, `ctrl_range`, `kp`, `kv`...).
+
+## v0.36.0 (24 September 2026)
+
+### Added
+
+- Soft bodies: `SoftBodySet`, `SoftBody` and `SoftBodyBuilder` (ropes, cloth, trimeshes, volumes…),
+  simulated together with rigid bodies, contacts and joints; also on `PhysicsWorld`.
+- Soft-body materials with plasticity, tearing and cutting (`SoftBodySet::tear`/`cut`); torn-off
+  pieces become soft bodies and report a `SoftBodyTearEvent`.
+- Soft-body clusters (`SoftBodySet::add_cluster`): rigid proxies that joints and colliders attach to.
+- Deformable colliders: `ColliderSet::insert_deformable` binds a `DEFORMABLE` trimesh (3D) or
+  polyline (2D) to a soft body through a `SoftMeshBinding`.
+- Experimental FEM soft-body solver behind the new `fem` feature (`SoftBodySolver::Fem`).
+- `IntegrationParameters::soft_bodies`, soft-body debug-render modes, and soft bodies in snapshots.
+- `RigidBody(Builder)::additional_pgs_iterations`: extra PGS iterations per substep for a body's island.
+- `DebugRenderMode::PSEUDO_NORMALS` draws the pseudo-normals of trimeshes and polylines.
+- `ColliderBuilder::polyline_with_flags`, `RigidBodyHandle::is_invalid`, and a public
+  `CoefficientCombineRule::combine`.
+- `PhysicsWorld::detect_collisions` (collision detection without stepping) and
+  `PhysicsWorld::remove_body_with_colliders`.
+- `CCDSolver::invalidate_fixed_targets_cache`, for users calling `CCDSolver::solve_continuous` directly.
+- `Multibody::remove_dof_coupling`, `retain_dof_couplings` and `clear_dof_couplings`.
+- `rapier3d-urdf`: `UrdfLink::urdf_link_index` and `UrdfJoint::urdf_joint_index` (and
+  `merged_urdf_joint_indices`) map loaded links and joints to their URDF counterparts.
+- `rapier3d-mjcf`: `MjcfContactHooks::is_excluded` and `pair_override` query a model's contact rules.
+- Testbed: drag bodies with the mouse, a "Debug" tab for the debug-render settings, and a
+  "Smooth mesh colliders" option (3D).
+- New C bindings (`bindings/c`): 2D/3D, f32/f64, a C11 header with C++ helpers, and a CMake package.
+
+### Modified
+
+- Update to parry 0.31: query results now report the hit sub-shape (e.g. the triangle of a trimesh).
+- `PhysicsPipeline::step`, `RigidBodySet::remove`, `ColliderSet::remove`, `DebugRenderPipeline::render`
+  and `CCDSolver::solve_continuous` take the `SoftBodySet`.
+- `EventHandler` has a new required method `handle_soft_body_tear_event`, and
+  `ChannelEventCollector::new` takes a sender for these events.
+- `ContactPair::manifolds` and `solver_clusters` moved to `ContactPair::contacts`: use
+  `pair.manifolds()` or `pair.rigid()`.
+- The rigid-contact fields of `ContactModificationContext` moved behind `ctx.rigid_mut()`.
+- `SolverFlags::COMPUTE_IMPULSES` is renamed `COMPUTE_RIGID_IMPULSES`.
+- `RigidBodyType::SoftFrame`: the rigid proxies of soft bodies, counted as dynamic by `is_dynamic`.
+- `DebugRenderObject::SoftBody` variant, and new fields in `IntegrationParameters`,
+  `DebugRenderStyle` and `PhysicsWorld` (`soft_bodies`, `collision_pipeline`).
+- `CCDSolver::solve_continuous` no longer takes `scene_changed`, and
+  `RigidBodyCcd::is_moving_fast` also takes the body's mass properties.
+- Snapshots serialized with previous versions can't be loaded anymore.
+- The `std` feature of `rapier2d` and `rapier2d-f64` now enables `parry2d/spade`.
+- The C, Python, and JavaScript/TypeScript bindings moved to the `bindings/` directory.
+- The `bevy_rapier2d` and `bevy_rapier3d` plugins now live in this repository, in `bindings/bevy_rapier`.
+- Testbed: rigid-body axes are shown by default and polylines are drawn as thick lines (2D) or tubes (3D).
+
+### Fixed
+
+- The CCD no longer sweeps against a stale list of fixed colliders after they were added, removed or
+  moved during a step where no body needed CCD.
+- `KinematicCharacterController::solve_character_collision_impulses` now pushes every dynamic body
+  touched by a compound character, not only the last one.
+- A step with `dt == 0` no longer produces NaNs: it only applies user changes and detects collisions.
+- `CollisionPipeline::step` no longer trips a debug assertion when a moving body touches a collider.
+- Enabling or disabling an impulse joint now updates the islands of its bodies.
+- Multibody DoF couplings are no longer lost when multibodies merge or split, and disabled
+  self-contacts are no longer re-enabled when they merge.
+- `PhysicsPipeline::counters` now fills the contact pair, contact and constraint counts.
+- With `max_ccd_substeps > 1`: end-of-step AABBs cover the full next step, the step splitter uses
+  the current velocity, and heavy bodies under gravity are no longer flagged as fast.
+- `SpringCoefficients` no longer divides by zero when `damping_ratio` is zero.
+- `rapier3d-urdf`: `<origin rpy>` angles are now composed as fixed-axis roll-pitch-yaw, as specified.
+- `rapier3d-urdf`: the fixed children of a squeezed empty link stay rigidly attached, and the joint
+  taking over the removed link's joint keeps its pivot.
+- Testbed (3D): `camera_rotation` and `camera_fwd_dir` return the actual camera orientation.
+
 ## v0.35.3 (28 August 2026)
 
 ### Fixed
@@ -36,7 +115,7 @@
 
 ### Added
 
-- `ContactForceEvent::first_tick`: `true` on the step a pair's total contact force first
+- `ContactForceEvent::started`: `true` on the step a pair's total contact force first
   exceeds its `contact_force_event_threshold` (coming from below it, or from separation),
   `false` while it stays above on consecutive steps — the analogue of PhysX's
   "threshold force found" vs "persists" report. The status resets when the force drops

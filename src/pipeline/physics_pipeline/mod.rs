@@ -5,7 +5,7 @@ use crate::alloc_prelude::*;
 use crate::counters::Counters;
 use crate::dynamics::{
     CCDSolver, ImpulseJointSet, IntegrationParameters, IslandManager, MultibodyJointSet,
-    RigidBodySet,
+    RigidBodySet, SoftBodySet,
 };
 use crate::geometry::{
     BroadPhaseBvh, BroadPhasePairEvent, ColliderHandle, ColliderSet, ContactManifoldIndex,
@@ -31,7 +31,7 @@ mod test_staged;
 /// resolving contacts so objects don't overlap, and updating positions and velocities.
 ///
 /// ## Performance note
-/// This structure only contains temporary working memory (scratch buffers). You can create
+/// This structure only contains temporary working memory (workspace buffers). You can create
 /// a new one anytime, but it's more efficient to reuse the same instance across frames
 /// since Rapier can reuse allocated memory.
 ///
@@ -53,15 +53,18 @@ pub struct PhysicsPipeline {
     joint_selection_primed: bool,
     broad_phase_events: Vec<BroadPhasePairEvent>,
     /// Colliders moved by the last `advance_to_final_positions` with their fresh broad-phase
-    /// AABBs, fed to the broad-phase refresh without the user-modification tracking. AABBs are
+    /// AABBs, fed to the broad-phase update without the user-modification tracking. AABBs are
     /// computed inside the advance loop while body/collider are in cache.
     end_step_collider_aabbs: Vec<(ColliderHandle, crate::geometry::Aabb)>,
+    /// Colliders the end-of-step soft-body sync deformed or moved to their cluster proxy's fresh
+    /// pose, whose broad-phase AABBs follow them.
+    soft_synced_colliders: Vec<ColliderHandle>,
     /// Non-finite state detected and neutralized during the last step.
     quarantine: Quarantine,
-    /// Scratch buffer holding the active body handles (parallel body update).
+    /// Workspace buffer holding the active body handles (parallel body update).
     #[cfg(feature = "parallel")]
     active_body_handles: Vec<crate::dynamics::RigidBodyHandle>,
-    /// Scratch: per-active-body sleep observations `(persistent island id, eligible)`,
+    /// Workspace: per-active-body sleep observations `(persistent island id, eligible)`,
     /// run-length compressed by the fused traversal, consumed by `IslandManager::
     /// update_islands`'s whole-island sleep decision — which never re-touches the body arena.
     sleep_observations: Vec<(u32, bool)>,
@@ -118,6 +121,7 @@ impl PhysicsPipeline {
             joint_selection_primed: false,
             broad_phase_events: vec![],
             end_step_collider_aabbs: vec![],
+            soft_synced_colliders: vec![],
             quarantine: Quarantine::default(),
         }
     }
@@ -159,9 +163,14 @@ impl PhysicsPipeline {
     /// * `colliders` - The collision shapes attached to your bodies (boxes, spheres, meshes, etc.)
     /// * `impulse_joints` - Regular joints connecting bodies (hinges, sliders, etc.)
     /// * `multibody_joints` - Articulated joints for robot-like structures (optional, can be empty)
+    /// * `soft_bodies` - Deformable particle bodies (optional, can be empty)
     /// * `ccd_solver` - Continuous collision detection to prevent fast objects from tunneling through thin walls
     /// * `hooks` - Optional callbacks to customize collision filtering and contact modification
     /// * `events` - Optional handler to receive collision events (when objects start/stop touching)
+    ///
+    /// A step with a zero [`IntegrationParameters::dt`] (e.g. the first frame of a variable
+    /// timestep) doesn't simulate anything: it only applies the user changes and updates the
+    /// collision detection.
     ///
     /// # Example
     ///
@@ -171,6 +180,7 @@ impl PhysicsPipeline {
     /// # let mut colliders = ColliderSet::new();
     /// # let mut impulse_joints = ImpulseJointSet::new();
     /// # let mut multibody_joints = MultibodyJointSet::new();
+    /// # let mut soft_bodies = SoftBodySet::new();
     /// # let mut islands = IslandManager::new();
     /// # let mut broad_phase = BroadPhaseBvh::new();
     /// # let mut narrow_phase = NarrowPhase::new();
@@ -188,6 +198,7 @@ impl PhysicsPipeline {
     ///     &mut colliders,
     ///     &mut impulse_joints,
     ///     &mut multibody_joints,
+    ///     &mut soft_bodies,
     ///     &mut ccd_solver,
     ///     &(),  // No custom hooks
     ///     &(),  // No event handler
@@ -204,6 +215,7 @@ impl PhysicsPipeline {
         colliders: &mut ColliderSet,
         impulse_joints: &mut ImpulseJointSet,
         multibody_joints: &mut MultibodyJointSet,
+        soft_bodies: &mut SoftBodySet,
         ccd_solver: &mut CCDSolver,
         hooks: &dyn PhysicsHooks,
         events: &dyn EventHandler,
@@ -238,6 +250,7 @@ impl PhysicsPipeline {
                     colliders,
                     impulse_joints,
                     multibody_joints,
+                    soft_bodies,
                     ccd_solver,
                     hooks,
                     events,
@@ -256,6 +269,7 @@ impl PhysicsPipeline {
             colliders,
             impulse_joints,
             multibody_joints,
+            soft_bodies,
             ccd_solver,
             hooks,
             events,

@@ -2,17 +2,21 @@ use crate::alloc_prelude::*;
 use crate::dynamics::{
     CCDSolver, GenericJoint, ImpulseJoint, ImpulseJointHandle, ImpulseJointSet,
     IntegrationParameters, IslandManager, Multibody, MultibodyJointHandle, MultibodyJointSet,
-    MultibodyLink, MultibodyLinkId, RigidBody, RigidBodyHandle, RigidBodySet,
+    MultibodyLink, MultibodyLinkId, RigidBody, RigidBodyHandle, RigidBodySet, SoftBindingError,
+    SoftBody, SoftBodyBuilder, SoftBodyHandle, SoftBodySet, SoftBodyTearEvent, SoftClusterRemoval,
+    SoftMeshBinding,
     fluid::FluidWorld,
-    soft_body::{SoftBody, SoftBodyId, SoftBodySet},
+    soft_body_fork::SoftBodySet as ForkSoftBodySet,
+    soft_body_fork::{SoftBody as ForkSoftBody, SoftBodyId as ForkSoftBodyId},
 };
 use crate::geometry::{
     BroadPhaseBvh, Collider, ColliderHandle, ColliderSet, ContactPair, DefaultBroadPhase,
     NarrowPhase,
 };
-use crate::math::{Real, Vector};
+use crate::math::{DIM, Real, Vector};
 use crate::pipeline::{
-    EventHandler, PhysicsHooks, PhysicsPipeline, Quarantine, QueryFilter, QueryPipeline,
+    CollisionPipeline, EventHandler, PhysicsHooks, PhysicsPipeline, Quarantine, QueryFilter,
+    QueryPipeline,
 };
 use parry::bounding_volume::{Aabb, BoundingVolume};
 use parry::partitioning::BvhNode;
@@ -68,6 +72,9 @@ pub struct PhysicsWorld {
     /// The main simulation pipeline that orchestrates each physics step.
     #[cfg_attr(feature = "serde-serialize", serde(skip))]
     pub physics_pipeline: PhysicsPipeline,
+    /// Workspace for collision-only updates that do not integrate positions or solve constraints.
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    pub collision_pipeline: CollisionPipeline,
     /// Manages active/sleeping body groups (islands) for efficient simulation.
     pub islands: IslandManager,
     /// The broad-phase acceleration structure for fast spatial queries.
@@ -82,18 +89,22 @@ pub struct PhysicsWorld {
     pub impulse_joints: ImpulseJointSet,
     /// All multibody joints (kinematic chains, articulations).
     pub multibody_joints: MultibodyJointSet,
+    /// All soft bodies (deformable particle bodies).
+    pub soft_bodies: SoftBodySet,
     /// The continuous collision detection solver.
     ///
     /// Workspace only: not part of a snapshot (see the type docs).
     #[cfg_attr(feature = "serde-serialize", serde(skip))]
     pub ccd_solver: CCDSolver,
-    /// All soft bodies (deformable / point-mass + spring structures).
+    /// All soft bodies of this fork's own implementation (deformable / point-mass
+    /// + spring structures).
     ///
-    /// Advanced after the rigid-body pipeline each step. Phase 0b wiring only:
-    /// soft bodies are stepped independently (they do not yet exchange forces or
-    /// collisions with rigid bodies — that coupling arrives in later phases). Each
-    /// body with its `sleeping` flag set is skipped, mirroring island sleeping.
-    pub soft_bodies: SoftBodySet,
+    /// Upstream v0.36 shipped its own soft-body system, which owns the
+    /// [`soft_bodies`](Self::soft_bodies) field and is simulated by the pipeline.
+    /// This fork's system is stepped separately, after the rigid-body pipeline.
+    /// Phase 0b wiring only: these soft bodies are stepped independently (they do
+    /// not exchange collisions with rigid bodies — only bound spring forces).
+    pub soft_bodies_fork: ForkSoftBodySet,
     /// All fluid bodies (SPH particle clouds). Stepped independently after the
     /// rigid-body pipeline, mirroring `soft_bodies` (Phase 0 of the fluid
     /// roadmap; rigid-body coupling arrives later). See
@@ -107,6 +118,7 @@ impl Default for PhysicsWorld {
             gravity: Vector::Y * -9.81,
             integration_parameters: IntegrationParameters::default(),
             physics_pipeline: PhysicsPipeline::new(),
+            collision_pipeline: CollisionPipeline::new(),
             islands: IslandManager::new(),
             broad_phase: DefaultBroadPhase::default(),
             narrow_phase: NarrowPhase::new(),
@@ -114,8 +126,9 @@ impl Default for PhysicsWorld {
             colliders: ColliderSet::new(),
             impulse_joints: ImpulseJointSet::new(),
             multibody_joints: MultibodyJointSet::new(),
-            ccd_solver: CCDSolver::new(),
             soft_bodies: SoftBodySet::new(),
+            ccd_solver: CCDSolver::new(),
+            soft_bodies_fork: ForkSoftBodySet::new(),
             fluids: Vec::new(),
         }
     }
@@ -146,7 +159,9 @@ impl PhysicsWorld {
     /// # use std::sync::mpsc::channel;
     /// let (collision_send, collision_recv) = channel();
     /// let (contact_force_send, contact_force_recv) = channel();
-    /// let event_handler = ChannelEventCollector::new(collision_send, contact_force_send);
+    /// let (soft_body_tear_send, soft_body_tear_recv) = channel();
+    /// let event_handler =
+    ///     ChannelEventCollector::new(collision_send, contact_force_send, soft_body_tear_send);
     ///
     /// world.step_with_events(&(), &event_handler);
     ///
@@ -159,7 +174,7 @@ impl PhysicsWorld {
         // bodies' `force_containers` *before* the pipeline integrates them, so the
         // soft forces act on the rigid bodies through the standard effective-force
         // path this step. Free (unbound) particles are integrated separately below.
-        self.soft_bodies.write_spring_forces(&mut self.bodies);
+        self.soft_bodies_fork.write_spring_forces(&mut self.bodies);
         self.physics_pipeline.step(
             self.gravity,
             &self.integration_parameters,
@@ -170,23 +185,41 @@ impl PhysicsWorld {
             &mut self.colliders,
             &mut self.impulse_joints,
             &mut self.multibody_joints,
+            &mut self.soft_bodies,
             &mut self.ccd_solver,
             hooks,
             events,
         );
         // Phase 0b: advance free soft-body particles after the rigid-body pipeline.
         // Sleeping bodies are skipped inside `SoftBodySet::step`.
-        self.soft_bodies.step(self.integration_parameters.dt);
+        self.soft_bodies_fork.step(self.integration_parameters.dt);
         // Phase 8: after the rigid pipeline integrates, snap bound soft particles
         // to their rigid bodies' new world transforms (so anchored cloth/flags
         // follow a moving body). Runs after step so followers see updated poses.
-        self.soft_bodies.follow_rigid_bodies(&self.bodies);
+        self.soft_bodies_fork.follow_rigid_bodies(&self.bodies);
         // Phase 0 (fluid SPH): advance every fluid particle cloud independently,
         // after the rigid-body pipeline. No rigid coupling yet.
         let dt = self.integration_parameters.dt;
         for fluid in &mut self.fluids {
             fluid.step(dt);
         }
+    }
+
+    /// Update broad-phase and narrow-phase collision detection without advancing simulation.
+    ///
+    /// Uses the prediction distance from this world's integration parameters. This is useful
+    /// after editing transforms when contacts and scene queries must be refreshed immediately.
+    pub fn detect_collisions(&mut self, hooks: &dyn PhysicsHooks, events: &dyn EventHandler) {
+        self.collision_pipeline.step(
+            self.integration_parameters.prediction_distance(),
+            &mut self.islands,
+            &mut self.broad_phase,
+            &mut self.narrow_phase,
+            &mut self.bodies,
+            &mut self.colliders,
+            hooks,
+            events,
+        );
     }
 
     /// The bodies and colliders automatically disabled during the last step because their
@@ -244,52 +277,65 @@ impl PhysicsWorld {
         self.bodies.insert(body)
     }
 
-    // ── Soft bodies ─────────────────────────────────────────────────────
+    // ── Soft bodies (this fork's own soft-body system) ──────────────────
 
-    /// Insert a soft body into the world and return its id.
+    /// Insert a soft body of this fork's own soft-body system and return its id.
     ///
-    /// The soft body is stepped automatically each [`step`](Self::step) after the
-    /// rigid-body pipeline (Phase 0b wiring).
-    pub fn insert_soft_body(&mut self, body: SoftBody) -> SoftBodyId {
-        self.soft_bodies.insert(body)
+    /// Stepped automatically each [`step`](Self::step) after the rigid-body
+    /// pipeline (Phase 0b wiring). Upstream v0.36 soft bodies go through
+    /// [`insert_soft_body`](Self::insert_soft_body) instead.
+    pub fn insert_soft_body_fork(&mut self, body: ForkSoftBody) -> ForkSoftBodyId {
+        self.soft_bodies_fork.insert(body)
     }
 
-    /// Immutable access to a soft body by id.
-    pub fn soft_body(&self, id: SoftBodyId) -> Option<&SoftBody> {
-        self.soft_bodies.get(id)
+    /// Immutable access to a fork soft body by id.
+    pub fn soft_body_fork(&self, id: ForkSoftBodyId) -> Option<&ForkSoftBody> {
+        self.soft_bodies_fork.get(id)
     }
 
-    /// Mutable access to a soft body by id.
-    pub fn soft_body_mut(&mut self, id: SoftBodyId) -> Option<&mut SoftBody> {
-        self.soft_bodies.get_mut(id)
+    /// Mutable access to a fork soft body by id.
+    pub fn soft_body_fork_mut(&mut self, id: ForkSoftBodyId) -> Option<&mut ForkSoftBody> {
+        self.soft_bodies_fork.get_mut(id)
     }
 
-    /// Mark a soft body as sleeping (its particles are not integrated until woken).
-    pub fn sleep_soft_body(&mut self, id: SoftBodyId) -> bool {
-        self.soft_bodies.sleep(id)
+    /// Mark a fork soft body as sleeping (its particles are not integrated until woken).
+    pub fn sleep_soft_body_fork(&mut self, id: ForkSoftBodyId) -> bool {
+        self.soft_bodies_fork.sleep(id)
     }
 
-    /// Wake a sleeping soft body.
-    pub fn wake_soft_body(&mut self, id: SoftBodyId) -> bool {
-        self.soft_bodies.wake(id)
+    /// Wake a sleeping fork soft body.
+    pub fn wake_soft_body_fork(&mut self, id: ForkSoftBodyId) -> bool {
+        self.soft_bodies_fork.wake(id)
     }
 
-    /// Whether a soft body is currently sleeping.
-    pub fn is_soft_body_sleeping(&self, id: SoftBodyId) -> bool {
-        self.soft_bodies.is_sleeping(id)
+    /// Whether a fork soft body is currently sleeping.
+    pub fn is_soft_body_fork_sleeping(&self, id: ForkSoftBodyId) -> bool {
+        self.soft_bodies_fork.is_sleeping(id)
     }
 
     /// Remove a rigid body and all its attached colliders and joints.
     ///
     /// Returns the removed body, or `None` if the handle was invalid.
     pub fn remove_body(&mut self, handle: RigidBodyHandle) -> Option<RigidBody> {
+        self.remove_body_with_colliders(handle, true)
+    }
+
+    /// Remove a rigid body and its joints, optionally preserving attached colliders.
+    ///
+    /// Preserved colliders become standalone colliders. Returns `None` for an invalid handle.
+    pub fn remove_body_with_colliders(
+        &mut self,
+        handle: RigidBodyHandle,
+        remove_attached_colliders: bool,
+    ) -> Option<RigidBody> {
         self.bodies.remove(
             handle,
             &mut self.islands,
             &mut self.colliders,
             &mut self.impulse_joints,
             &mut self.multibody_joints,
-            true,
+            &mut self.soft_bodies,
+            remove_attached_colliders,
         )
     }
 
@@ -351,8 +397,13 @@ impl PhysicsWorld {
     ///
     /// Returns the removed collider, or `None` if the handle was invalid.
     pub fn remove_collider(&mut self, handle: ColliderHandle) -> Option<Collider> {
-        self.colliders
-            .remove(handle, &mut self.islands, &mut self.bodies, true)
+        self.colliders.remove(
+            handle,
+            &mut self.islands,
+            &mut self.bodies,
+            &mut self.soft_bodies,
+            true,
+        )
     }
 
     // ── Impulse joints ──────────────────────────────────────────────────
@@ -450,6 +501,123 @@ impl PhysicsWorld {
         body: RigidBodyHandle,
     ) -> impl Iterator<Item = (RigidBodyHandle, RigidBodyHandle, MultibodyJointHandle)> + '_ {
         self.multibody_joints.attached_joints(body)
+    }
+
+    // ── Soft bodies ─────────────────────────────────────────────────────
+
+    /// Insert a soft body and return its handle; this creates its hidden root rigid body and its
+    /// colliders (a deformable surface, or one ball per surface particle), which
+    /// [`Self::remove_soft_body`] removes.
+    pub fn insert_soft_body(&mut self, soft_body: SoftBodyBuilder) -> SoftBodyHandle {
+        self.soft_bodies
+            .insert(soft_body, &mut self.bodies, &mut self.colliders)
+    }
+
+    /// Inserts a collider holding a soft body's deformable collision mesh, bound to the cluster
+    /// of `parent` (a cluster proxy: see
+    /// [`ColliderSet::insert_deformable`](crate::geometry::ColliderSet::insert_deformable)).
+    pub fn insert_deformable(
+        &mut self,
+        collider: impl Into<Collider>,
+        binding: SoftMeshBinding,
+        parent: RigidBodyHandle,
+    ) -> Result<ColliderHandle, SoftBindingError> {
+        self.colliders.insert_deformable(
+            collider,
+            binding,
+            parent,
+            &mut self.bodies,
+            &mut self.soft_bodies,
+        )
+    }
+
+    /// Remove a soft body, its root rigid body and its colliders.
+    pub fn remove_soft_body(&mut self, handle: SoftBodyHandle) -> Option<SoftBody> {
+        self.soft_bodies.remove(
+            handle,
+            &mut self.islands,
+            &mut self.bodies,
+            &mut self.colliders,
+            &mut self.impulse_joints,
+            &mut self.multibody_joints,
+        )
+    }
+
+    /// Cuts a soft body along a blade (a world segment in 2D, a triangle in 3D) at once, without
+    /// removing any material (see [`SoftBodySet::cut`]). Returns the tear event, or `None` when
+    /// the cut changed nothing.
+    pub fn cut_soft_body(
+        &mut self,
+        handle: SoftBodyHandle,
+        blade: &[Vector; DIM],
+    ) -> Option<SoftBodyTearEvent> {
+        self.soft_bodies.cut(
+            handle,
+            blade,
+            &mut self.islands,
+            &mut self.bodies,
+            &mut self.colliders,
+            &mut self.impulse_joints,
+            &mut self.multibody_joints,
+        )
+    }
+
+    /// Tears a soft body at once along the given edges and through the given cells, without
+    /// removing any material (see [`SoftBodySet::tear`] and [`SoftBody::tear_edge`]). Returns
+    /// the tear event, or `None` when nothing changed.
+    pub fn tear_soft_body(
+        &mut self,
+        handle: SoftBodyHandle,
+        edges: &[u32],
+        cells: &[u32],
+    ) -> Option<SoftBodyTearEvent> {
+        self.soft_bodies.tear(
+            handle,
+            edges,
+            cells,
+            &mut self.islands,
+            &mut self.bodies,
+            &mut self.colliders,
+            &mut self.impulse_joints,
+            &mut self.multibody_joints,
+        )
+    }
+
+    /// Adds a cluster to a soft body: a set of its particles backed by a fresh proxy rigid
+    /// body ([`crate::dynamics::RigidBodyType::SoftFrame`]) that impulse joints and colliders
+    /// can attach to.
+    /// Returns the cluster's index (see [`SoftBodySet::add_cluster`]).
+    pub fn add_soft_body_cluster(
+        &mut self,
+        handle: SoftBodyHandle,
+        particles: &[u32],
+    ) -> Option<u32> {
+        self.soft_bodies
+            .add_cluster(handle, particles, &mut self.bodies, &mut self.colliders)
+    }
+
+    /// Removes a soft body's cluster, its proxy rigid body, and the particles only that
+    /// cluster covered (see [`SoftBodySet::remove_cluster`]). Removing the proxy from the
+    /// [`RigidBodySet`] is equivalent.
+    pub fn remove_soft_body_cluster(
+        &mut self,
+        handle: SoftBodyHandle,
+        cluster: u32,
+    ) -> Option<SoftClusterRemoval> {
+        self.soft_bodies.remove_cluster(
+            handle,
+            cluster,
+            &mut self.islands,
+            &mut self.bodies,
+            &mut self.colliders,
+            &mut self.impulse_joints,
+            &mut self.multibody_joints,
+        )
+    }
+
+    /// Iterate over every soft body in the world.
+    pub fn soft_bodies(&self) -> impl Iterator<Item = (SoftBodyHandle, &SoftBody)> {
+        self.soft_bodies.iter()
     }
 
     // ── Scene queries ───────────────────────────────────────────────────
@@ -655,7 +823,10 @@ impl PhysicsWorld {
                 let (co, co_handle) = colliders.get_unknown_gen(leaf)?;
                 if filter.test(bodies, co_handle, co) {
                     let pos12 = shape_pos.inv_mul(co.position());
-                    if dispatcher.intersection_test(&pos12, shape, co.shape()) == Ok(true) {
+                    if dispatcher
+                        .intersection_test(&pos12, shape, co.shape())
+                        .is_ok_and(|hit| hit.intersecting)
+                    {
                         return Some((co_handle, co));
                     }
                 }
@@ -895,6 +1066,7 @@ impl PhysicsWorld {
             &self.impulse_joints,
             &self.multibody_joints,
             &self.narrow_phase,
+            &self.soft_bodies,
         );
     }
 }

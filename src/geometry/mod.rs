@@ -25,8 +25,8 @@ pub(crate) use self::contact_pair::relative_pose_drift;
 #[cfg(feature = "alloc")]
 pub use self::contact_pair::{
     ContactData, ContactId, ContactManifoldData, ContactPair, IntersectionPair, NEW_CONTACT_BIT,
-    SimdSolverContact, SolverContact, SolverContactGeneric, SolverContacts, SolverFlags, is_bouncy,
-    is_bouncy_simd,
+    PairContacts, RigidPairContacts, SimdSolverContact, SolverContact, SolverContactGeneric,
+    SolverContacts, SolverFlags, is_bouncy, is_bouncy_simd,
 };
 /// Direction-based convex hulls (k-DOP / FDH) and their preset enum.
 #[cfg(feature = "alloc")]
@@ -42,6 +42,13 @@ pub use self::interaction_groups::{Group, InteractionGroups, InteractionTestMode
 pub use self::mesh_converter::{MeshConverter, MeshConverterError};
 #[cfg(feature = "alloc")]
 pub use self::narrow_phase::NarrowPhase;
+#[cfg(feature = "alloc")]
+pub(crate) use self::narrow_phase::soft_contacts;
+#[cfg(feature = "alloc")]
+pub use self::narrow_phase::soft_contacts::{
+    SoftContactImpulse, SoftEdgeCandidate, SoftEdgePass, SoftPairContacts, SoftVertexCandidate,
+    SoftVertexHits, SoftVertexPass, SoftVolumePatch, VolumeBin,
+};
 /// User-space AABB spatial index (general R-tree over arbitrary `u64` ids).
 #[cfg(feature = "alloc")]
 pub use self::user_index::GenericAabbIndex;
@@ -255,6 +262,16 @@ impl ContactForceEvent {
             }
 
             result.total_force += m.data.normal * total_manifold_impulse;
+        }
+        // Two soft surfaces: their contacts are candidates, each reporting its impulse.
+        if let Some(soft) = pair.soft() {
+            for i in soft.impulses(pair.collider1) {
+                if i.impulse > result.max_force_magnitude {
+                    result.max_force_magnitude = i.impulse;
+                    result.max_force_direction = i.normal;
+                }
+                result.total_force += i.normal * i.impulse;
+            }
         }
 
         let inv_dt = crate::utils::inv(dt);
