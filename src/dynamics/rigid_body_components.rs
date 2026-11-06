@@ -53,6 +53,11 @@ pub enum RigidBodyType {
     /// Use for: Moving platforms, elevators, doors, player-controlled characters (when you want
     /// direct control rather than physics-based movement).
     KinematicVelocityBased = 3,
+
+    /// The proxy rigid body of a soft-body cluster, created internally, one per cluster, by
+    /// [`crate::dynamics::SoftBodySet::add_cluster`]; never built directly. Pose, velocity and mass
+    /// derive from the particles (setters, collider masses ignored); removal removes its cluster.
+    SoftFrame = 4,
     // Semikinematic, // A kinematic that performs automatic CCD with the fixed environment to avoid traversing it?
     // Disabled,
 }
@@ -64,8 +69,16 @@ impl RigidBodyType {
     }
 
     /// Is this rigid-body dynamic (i.e. can move and be affected by forces)?
+    ///
+    /// Soft-frame proxies count as dynamic: they move, have (derived) mass, and take part in
+    /// every dynamic interaction.
     pub fn is_dynamic(self) -> bool {
-        self == RigidBodyType::Dynamic
+        self == RigidBodyType::Dynamic || self == RigidBodyType::SoftFrame
+    }
+
+    /// Is this rigid-body the proxy of a soft-body cluster?
+    pub fn is_soft_frame(self) -> bool {
+        self == RigidBodyType::SoftFrame
     }
 
     /// Is this rigid-body kinematic (i.e. can move but is unaffected by forces)?
@@ -325,7 +338,7 @@ pub struct RigidBodyMassProps {
     pub additional_local_mprops: Option<Box<RigidBodyAdditionalMassProps>>,
     /// Conservative bound on the distance of any shape point from the local center of mass;
     /// the sleep metric and the CCD fast-body criterion use it to turn angular velocity into
-    /// a farthest-point speed. Refreshed with the mass properties; `0` for collider-less bodies.
+    /// a farthest-point speed. Updated with the mass properties; `0` for collider-less bodies.
     #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub(crate) max_extent: Real,
 }
@@ -425,6 +438,12 @@ impl RigidBodyMassProps {
         body_type: RigidBodyType,
         position: &Pose,
     ) {
+        if body_type.is_soft_frame() {
+            // A soft-frame proxy's mass properties are the cluster's reduced mass matrix,
+            // maintained by the soft-body sync; its colliders contribute none.
+            self.recompute_max_extent(colliders, attached_colliders);
+            return;
+        }
         let added_mprops = self
             .additional_local_mprops
             .as_ref()
@@ -488,7 +507,7 @@ impl RigidBodyMassProps {
         self.update_world_mass_properties(body_type, position);
     }
 
-    /// Refreshes [`Self::max_extent`] from the attached colliders' bounding
+    /// Updates [`Self::max_extent`] from the attached colliders' bounding
     /// spheres, measured about the local center of mass.
     pub(crate) fn recompute_max_extent(
         &mut self,
@@ -526,6 +545,11 @@ impl RigidBodyMassProps {
 
     /// Update the world-space mass properties of `self`, taking into account the new position.
     pub fn update_world_mass_properties(&mut self, body_type: RigidBodyType, position: &Pose) {
+        if body_type.is_soft_frame() {
+            // A soft-frame proxy's effective mass properties are the cluster's reduced mass
+            // matrix, written directly by the soft-body sync: nothing to derive here.
+            return;
+        }
         self.world_com = self.local_mprops.world_com(position);
         self.effective_inv_mass = Vector::splat(self.local_mprops.inv_mass);
         self.effective_world_inv_inertia = self.local_mprops.world_inv_inertia(&position.rotation);
@@ -1161,16 +1185,12 @@ impl RigidBodyCcd {
         &self,
         dt: Real,
         vels: &RigidBodyVelocity<Real>,
-        forces: Option<&RigidBodyForces>,
+        forces: Option<(&RigidBodyForces, &RigidBodyMassProps)>,
         max_extent: Real,
     ) -> bool {
-        let max_point_velocity = if let Some(forces) = forces {
-            let linear_part = (vels.linvel + forces.force * dt).length();
-            #[cfg(feature = "dim2")]
-            let angular_part = (vels.angvel + forces.torque * dt).abs() * max_extent;
-            #[cfg(feature = "dim3")]
-            let angular_part = (vels.angvel + forces.torque * dt).length() * max_extent;
-            linear_part + angular_part
+        // Same velocity prediction as the CCD sweep: forces divided by the mass and inertia.
+        let max_point_velocity = if let Some((forces, mprops)) = forces {
+            self.max_point_velocity(&forces.integrate(dt, vels, mprops), max_extent)
         } else {
             self.max_point_velocity(vels, max_extent)
         };
@@ -1285,12 +1305,16 @@ impl RigidBodyColliders {
             rb_ccd.ccd_thickness = rb_ccd.ccd_thickness.min(co_shape.ccd_thickness());
         }
 
-        let mass_properties = co_mprops
-            .mass_properties(&**co_shape)
-            .transform_by(&co_parent.pos_wrt_parent);
         self.0.push(co_handle);
-        rb_mprops.local_mprops += mass_properties;
-        rb_mprops.update_world_mass_properties(rb_type, &rb_pos.position);
+        // A soft-frame proxy's mass is derived from its cluster's particles: its colliders
+        // contribute none.
+        if !rb_type.is_soft_frame() {
+            let mass_properties = co_mprops
+                .mass_properties(&**co_shape)
+                .transform_by(&co_parent.pos_wrt_parent);
+            rb_mprops.local_mprops += mass_properties;
+            rb_mprops.update_world_mass_properties(rb_type, &rb_pos.position);
+        }
     }
 
     /// Update the positions of all the colliders attached to this rigid-body.
@@ -1491,6 +1515,14 @@ impl RigidBodyActivation {
         }
 
         let can_sleep = match body_type {
+            // A soft-frame proxy's pose is derived from its cluster's particles (fit noise
+            // included), so the drift rule applies to the fastest particle instead
+            // (`sq_linvel` is that speed squared, see `IslandManager::update_body_energy`).
+            RigidBodyType::SoftFrame => {
+                let linear_threshold = self.normalized_linear_threshold * length_unit;
+                self.normalized_linear_threshold >= 0.0
+                    && sq_linvel * 0.25 < linear_threshold * linear_threshold
+            }
             RigidBodyType::Dynamic => {
                 let linear_threshold = self.normalized_linear_threshold * length_unit;
                 let prev_pose = core::mem::replace(&mut self.sleep_prev_pose, *pose);
@@ -1532,6 +1564,33 @@ impl RigidBodyActivation {
 mod tests {
     use super::*;
     use crate::math::Real;
+
+    #[test]
+    fn heavy_body_under_gravity_is_not_moving_fast() {
+        let (dt, mass, extent) = (1.0 / 60.0, 1000.0, 0.5);
+        #[cfg(feature = "dim2")]
+        let local_mprops = MassProperties::new(Vector::ZERO, mass, 1.0);
+        #[cfg(feature = "dim3")]
+        let local_mprops = MassProperties::new(Vector::ZERO, mass, Vector::splat(1.0));
+        let mut mprops = RigidBodyMassProps::from(local_mprops);
+        mprops.update_world_mass_properties(RigidBodyType::Dynamic, &Pose::default());
+        let mut forces = RigidBodyForces::default();
+        forces.compute_effective_force_and_torque(Vector::Y * -9.81, Vector::splat(mass));
+        let ccd = RigidBodyCcd {
+            ccd_thickness: extent,
+            ..Default::default()
+        };
+
+        // Gravity alone moves a resting body by about 0.003 in one step, whatever its mass.
+        let resting = RigidBodyVelocity::default();
+        assert!(!ccd.is_moving_fast(dt, &resting, Some((&forces, &mprops)), extent));
+
+        let fast = RigidBodyVelocity {
+            linvel: Vector::X * 60.0,
+            ..Default::default()
+        };
+        assert!(ccd.is_moving_fast(dt, &fast, Some((&forces, &mprops)), extent));
+    }
 
     #[test]
     fn test_interpolate_velocity() {

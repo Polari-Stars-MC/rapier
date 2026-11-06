@@ -7,6 +7,7 @@ mod intersections;
 mod pair_management;
 mod pair_update;
 mod queries;
+pub(crate) mod soft_contacts;
 mod solver_graph;
 #[cfg(test)]
 #[cfg(feature = "f32")]
@@ -68,7 +69,7 @@ fn strong_wake_sleeping_side(
 }
 
 /// Packs a coloring body descriptor `(arena index, is_fixed)` into a `u32` for the
-/// deferred-coloring scratch list: `u32::MAX` = no body, else `(id << 1) | is_fixed`.
+/// deferred-coloring workspace list: `u32::MAX` = no body, else `(id << 1) | is_fixed`.
 fn pack_color_body_info(info: Option<(u32, bool)>) -> u32 {
     match info {
         None => u32::MAX,
@@ -98,6 +99,10 @@ fn assign_pair_solver_color(
         SOLVER_COLOR_OVERFLOW, SOLVER_COLOR_UNCOLORED, SOLVER_DYNAMIC_COLOR_COUNT,
     };
 
+    // A pair of two soft surfaces never reaches the rigid solver: no color.
+    let Some(pair) = pair.rigid_mut() else {
+        return;
+    };
     if pair.solver_color != SOLVER_COLOR_UNCOLORED {
         return;
     }
@@ -158,6 +163,9 @@ fn assign_pair_solver_color(
 fn clear_pair_solver_color(masks: &mut [u128], pair: &mut ContactPair) {
     use crate::geometry::contact_pair::{SOLVER_COLOR_OVERFLOW, SOLVER_COLOR_UNCOLORED};
 
+    let Some(pair) = pair.rigid_mut() else {
+        return;
+    };
     if pair.solver_color < SOLVER_COLOR_OVERFLOW {
         for id in pair.solver_color_bodies {
             if id != u32::MAX {
@@ -202,7 +210,7 @@ fn single_manifold_bucket_drift(pair: &ContactPair, selectable: bool) -> bool {
         && manifold
             .data
             .solver_flags
-            .contains(SolverFlags::COMPUTE_IMPULSES)
+            .contains(SolverFlags::COMPUTE_RIGID_IMPULSES)
         && manifold.data.num_active_contacts() != 0;
     let pos = manifold.data.graph_pos;
     if !qualifies {
@@ -216,7 +224,7 @@ fn single_manifold_bucket_drift(pair: &ContactPair, selectable: bool) -> bool {
     if pos.bucket() == GENERIC_BUCKET {
         return false;
     }
-    let mut color = pair.solver_color;
+    let mut color = pair.solver_color();
     if color == SOLVER_COLOR_UNCOLORED {
         color = SOLVER_COLOR_OVERFLOW;
     }
@@ -226,18 +234,12 @@ fn single_manifold_bucket_drift(pair: &ContactPair, selectable: bool) -> bool {
 /// The number of this pair's solver manifolds that the constraint solver must see
 /// (impulses to compute and at least one active contact).
 fn pair_qualified_manifold_count(pair: &ContactPair) -> u16 {
-    let solver_manifolds = if pair.solver_clusters.is_empty() {
-        &pair.manifolds
-    } else {
-        &pair.solver_clusters
-    };
-
     let mut count: u16 = 0;
-    for manifold in solver_manifolds {
+    for manifold in pair.solver_manifolds() {
         if manifold
             .data
             .solver_flags
-            .contains(SolverFlags::COMPUTE_IMPULSES)
+            .contains(SolverFlags::COMPUTE_RIGID_IMPULSES)
             && manifold.data.num_active_contacts() != 0
         {
             count = count.saturating_add(1);
@@ -293,7 +295,7 @@ fn collect_pairs_to_update<E>(
         push_edges_of(*handle, true);
     }
 
-    // Active bodies' colliders may have moved this step without carrying any
+    // Active bodies' colliders may have moved this step without having any
     // change flag (internal motion doesn't go through the user-modification
     // tracking), so their pairs are always candidates.
     for body_handle in islands.active_bodies() {
@@ -333,7 +335,7 @@ pub struct NarrowPhase {
     contact_graph: InteractionGraph<ColliderHandle, ContactPair>,
     intersection_graph: InteractionGraph<ColliderHandle, IntersectionPair>,
     graph_indices: Coarena<ColliderGraphIndices>,
-    /// Scratch buffer holding the edge indices of pairs to process during a step, so
+    /// Workspace buffer holding the edge indices of pairs to process during a step, so
     /// the per-step loops don’t have to iterate on the whole interaction graphs.
     #[cfg_attr(feature = "serde-serialize", serde(skip))]
     update_candidates: Vec<u32>,
@@ -342,13 +344,13 @@ pub struct NarrowPhase {
     /// so the solver never recolors its constraint graph from scratch.
     #[cfg_attr(feature = "serde-serialize", serde(default))]
     body_solver_color_masks: Vec<u128>,
-    /// Scratch: per-body packed qualification info (rigid-body arena index), rebuilt during
+    /// Workspace: per-body packed qualification info (rigid-body arena index), rebuilt during
     /// solver-graph maintenance. `u64::MAX` = missing/fixed/kinematic-or-sleeping;
     /// else `(active_set_id << 32) | is_dynamic`.
     #[cfg_attr(feature = "serde-serialize", serde(skip))]
     body_qualify_info: Vec<u64>,
-    /// Scratch: per-body awake bit (arena index), rebuilt each narrow-phase update.
-    /// Internal motion carries no change flags, so "the parent body is awake" is the
+    /// Workspace: per-body awake bit (arena index), rebuilt each narrow-phase update.
+    /// Internal motion sets no change flags, so "the parent body is awake" is the
     /// narrow-phase's it-may-have-moved signal for pair updates.
     #[cfg_attr(feature = "serde-serialize", serde(skip))]
     awake_body_mask: Vec<bool>,
@@ -372,7 +374,7 @@ pub struct NarrowPhase {
     /// A mismatch means bodies may have joined/left a multibody (manifolds can switch
     /// between color buckets and the generic list), forcing a full rebuild.
     solver_graph_mb_epoch: u32,
-    /// Scratch: edge indices fully updated this step (`OUTCOME_FULL`) — possible bucket
+    /// Workspace: edge indices fully updated this step (`OUTCOME_FULL`): possible bucket
     /// membership change. Consumed by the incremental maintenance in
     /// [`Self::maintain_solver_contact_graph`] and the force-event list reconciliation.
     #[cfg_attr(feature = "serde-serialize", serde(skip))]
@@ -385,7 +387,7 @@ pub struct NarrowPhase {
     /// O(1) membership reconciliation. Edge-index shifts (pair/collider removal) are covered
     /// by the full rebuild those removals already force via `solver_graph_valid`.
     force_event_pos: Vec<u32>,
-    /// Scratch: edges flagged for force-event membership reconciliation because a collider
+    /// Workspace: edges flagged for force-event membership reconciliation because a collider
     /// was user-modified this step (an `ActiveEvents`/threshold flip has no change flag
     /// and need not trigger a contact update, so it would otherwise go unnoticed mid-epoch).
     force_event_flagged: Vec<u32>,
@@ -393,11 +395,15 @@ pub struct NarrowPhase {
     /// through every transition, so it does NOT need epoch full rebuilds; `false`
     /// (a degenerate state) triggers the from-scratch scan.
     force_list_valid: bool,
-    /// Scratch: begin-touch pairs deferred for greedy coloring in canonical
+    /// Workspace: begin-touch pairs deferred for greedy coloring in canonical
     /// `(min, max body id)` order (discovery-order independent: ≈ Δ colors instead of ≈ 2Δ).
     /// Entries are `(edge id, packed body infos)`, see [`pack_color_body_info`].
     #[cfg_attr(feature = "serde-serialize", serde(skip))]
     solver_color_todo: Vec<(u32, u32, u32)>,
+    /// The self contact detection of the soft collision meshes (by collider), rebuilt by
+    /// every update for the awake bodies (see `soft_contacts`).
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
+    soft_self: parry::utils::hashmap::HashMap<ColliderHandle, soft_contacts::SoftSelfContacts>,
     /// Pool of retired [`ContactPair`]s, reused by [`Self::add_pair`] so
     /// pair-churn-heavy scenes (hundreds of broad-phase add/delete events per
     /// step) skip the buffer reallocation of freshly constructed pairs.
@@ -452,6 +458,7 @@ impl NarrowPhase {
             force_event_flagged: Vec::new(),
             force_list_valid: false,
             solver_color_todo: Vec::new(),
+            soft_self: Default::default(),
             disabled_collider_pairs: HashMap::default(),
         }
     }
@@ -501,7 +508,15 @@ impl NarrowPhase {
             .contains_key(&Self::normalized_pair(collider1, collider2))
     }
 
-    fn refresh_awake_body_mask(&mut self, islands: &IslandManager) {
+    /// Replaces the query dispatcher used by this narrow-phase.
+    pub fn set_query_dispatcher<D>(&mut self, d: D)
+    where
+        D: 'static + PersistentQueryDispatcher<ContactManifoldData, ContactData>,
+    {
+        self.query_dispatcher = Arc::new(d);
+    }
+
+    fn update_awake_body_mask(&mut self, islands: &IslandManager) {
         self.awake_body_mask.clear();
         let len = islands
             .active_bodies()

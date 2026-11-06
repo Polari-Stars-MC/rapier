@@ -43,6 +43,13 @@ impl CCDSolver {
         Self::default()
     }
 
+    /// Discards the cached fixed-target list used by the non-bullet continuous pass.
+    /// This must be called any time the fixed targets change. If using the physics pipeline,
+    /// it is called for you. If not, it must be called manually.
+    pub fn invalidate_fixed_targets_cache(&mut self) {
+        self.fixed_targets_cache = None;
+    }
+
     /// Updates the set of bodies that needs CCD to be resolved.
     ///
     /// Returns `true` if any rigid-body must have CCD resolved.
@@ -68,7 +75,7 @@ impl CCDSolver {
                     rb.ccd.is_moving_fast(
                         dt,
                         &rb.ccd_vels,
-                        Some(&rb.forces),
+                        Some((&rb.forces, &rb.mprops)),
                         rb.mprops.max_extent(),
                     )
                 } else {
@@ -295,9 +302,11 @@ impl CCDSolver {
                 let dispatcher = narrow_phase.query_dispatcher();
                 let intersect_before = dispatcher
                     .intersection_test(&prev_pos12, co1.shape.as_ref(), co2.shape.as_ref())
+                    .map(|i| i.intersecting)
                     .unwrap_or(false);
                 let intersect_after = dispatcher
                     .intersection_test(&next_pos12, co1.shape.as_ref(), co2.shape.as_ref())
+                    .map(|i| i.intersecting)
                     .unwrap_or(false);
 
                 if !intersect_before
