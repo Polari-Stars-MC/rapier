@@ -8,6 +8,7 @@ use super::{
     SoftVolumePiece,
 };
 use crate::dynamics::RigidBodyHandle;
+use crate::dynamics::integration_parameters::SpringCoefficients;
 use crate::math::{DIM, Real, Vector};
 
 impl SoftBody {
@@ -98,6 +99,18 @@ impl SoftBody {
     pub fn set_edge_rest_length(&mut self, i: usize, rest_length: Real) {
         if let Some(edge) = self.edges.get_mut(i) {
             edge.rest_length = rest_length;
+            self.modified = true;
+        }
+    }
+
+    /// Sets the softness of the `i`-th distance constraint, overriding the material's
+    /// `edge_softness` for that edge only (`None` restores the material value).
+    ///
+    /// This is the per-edge stiffness knob: a stiffer edge gets a higher natural frequency, while
+    /// an XPBD compliance is expressed by the matching (low) frequency.
+    pub fn set_edge_softness(&mut self, i: usize, softness: Option<SpringCoefficients<Real>>) {
+        if let Some(edge) = self.edges.get_mut(i) {
+            edge.softness = softness;
             self.modified = true;
         }
     }
