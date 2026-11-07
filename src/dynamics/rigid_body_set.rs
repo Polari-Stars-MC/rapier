@@ -388,7 +388,13 @@ impl RigidBodySet {
         }
     }
 
-    pub(crate) fn get_mut_internal(&mut self, handle: RigidBodyHandle) -> Option<&mut RigidBody> {
+    /// Mutable access **without** marking the body as user-modified (no entry in
+    /// `modified_bodies` / `spatial_changes`). For engine-internal and host-wrapper
+    /// sync paths (pipeline internals, proxy sync in wrappers) where the mutation is
+    /// not a user change and must not trigger change tracking. Public because
+    /// downstream wrapper crates (e.g. mps-core) need it; prefer `get_mut` for
+    /// user-visible modifications.
+    pub fn get_mut_internal(&mut self, handle: RigidBodyHandle) -> Option<&mut RigidBody> {
         self.bodies.get_mut(handle.0)
     }
 
