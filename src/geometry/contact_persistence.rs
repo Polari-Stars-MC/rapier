@@ -1,5 +1,6 @@
 #![allow(missing_docs)]
-use std::collections::HashMap;
+// Deterministic, no_std-friendly lookup table (foldhash `FixedState`).
+use parry::utils::hashmap::HashMap;
 
 /// Lightweight cache for persistent contact impulses.
 #[derive(Default)]

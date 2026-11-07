@@ -845,7 +845,7 @@ impl ColliderBuilder {
         Self::cylinder(half_height, radius).rotation(Vector::new(
             0.0,
             0.0,
-            std::f64::consts::FRAC_PI_2,
+            core::f64::consts::FRAC_PI_2 as Real,
         ))
     }
 
@@ -854,7 +854,7 @@ impl ColliderBuilder {
     #[cfg(feature = "dim3")]
     pub fn cylinder_z(half_height: Real, radius: Real) -> Self {
         Self::cylinder(half_height, radius).rotation(Vector::new(
-            std::f64::consts::FRAC_PI_2,
+            core::f64::consts::FRAC_PI_2 as Real,
             0.0,
             0.0,
         ))
@@ -879,7 +879,7 @@ impl ColliderBuilder {
         Self::round_cylinder(half_height, radius, border_radius).rotation(Vector::new(
             0.0,
             0.0,
-            std::f64::consts::FRAC_PI_2,
+            core::f64::consts::FRAC_PI_2 as Real,
         ))
     }
 
@@ -888,7 +888,7 @@ impl ColliderBuilder {
     #[cfg(feature = "dim3")]
     pub fn round_cylinder_z(half_height: Real, radius: Real, border_radius: Real) -> Self {
         Self::round_cylinder(half_height, radius, border_radius).rotation(Vector::new(
-            std::f64::consts::FRAC_PI_2,
+            core::f64::consts::FRAC_PI_2 as Real,
             0.0,
             0.0,
         ))
@@ -1109,30 +1109,79 @@ impl ColliderBuilder {
         indices: &[[u32; DIM]],
     ) -> Option<(Vec<Vector>, Vec<[u32; DIM]>)> {
         // 1. Deduplicate vertices within an epsilon; build old->new index map.
+        //    Spatial-hash the epsilon-quantized cells (checked ±1 per axis: two points
+        //    within `eps` differ by at most one cell per axis) instead of a linear scan
+        //    over the kept set — the linear scan is O(n²) and would stall the build
+        //    thread on large meshes (~5·10⁹ comparisons at 10⁵ vertices). A `BTreeMap`
+        //    (no iteration) keeps the pass allocation- and no_std-friendly.
         let eps = 1.0e-8; // relaxed tolerance to catch near-identical points
+        let inv_eps = 1.0 / eps;
+        let quant = |p: &Vector| -> (i64, i64, i64) {
+            #[cfg(feature = "dim3")]
+            {
+                (
+                    (p.x * inv_eps).floor() as i64,
+                    (p.y * inv_eps).floor() as i64,
+                    (p.z * inv_eps).floor() as i64,
+                )
+            }
+            #[cfg(feature = "dim2")]
+            {
+                (
+                    (p.x * inv_eps).floor() as i64,
+                    (p.y * inv_eps).floor() as i64,
+                    0,
+                )
+            }
+        };
+        let mut cells: alloc::collections::BTreeMap<(i64, i64, i64), Vec<usize>> =
+            alloc::collections::BTreeMap::new();
         let mut clean: Vec<Vector> = Vec::new();
         let mut remap = vec![0u32; vertices.len()];
         for (i, v) in vertices.iter().enumerate() {
+            let key = quant(v);
             let mut found = None;
-            for (j, c) in clean.iter().enumerate() {
-                let d2 = (c.x - v.x).powi(2) + (c.y - v.y).powi(2) + (c.z - v.z).powi(2);
-                if d2 <= eps * eps {
-                    found = Some(j as u32);
-                    break;
+            'search: for dx in -1..=1i64 {
+                for dy in -1..=1i64 {
+                    for dz in -1..=1i64 {
+                        let Some(bucket) = cells.get(&(key.0 + dx, key.1 + dy, key.2 + dz)) else {
+                            continue;
+                        };
+                        for &j in bucket {
+                            let c = &clean[j];
+                            let d2 = {
+                                #[cfg(feature = "dim2")]
+                                {
+                                    (c.x - v.x).powi(2) + (c.y - v.y).powi(2)
+                                }
+                                #[cfg(feature = "dim3")]
+                                {
+                                    (c.x - v.x).powi(2) + (c.y - v.y).powi(2) + (c.z - v.z).powi(2)
+                                }
+                            };
+                            if d2 <= eps * eps {
+                                found = Some(j as u32);
+                                break 'search;
+                            }
+                        }
+                    }
                 }
             }
             match found {
                 Some(j) => remap[i] = j,
                 None => {
                     remap[i] = clean.len() as u32;
+                    cells.entry(key).or_default().push(clean.len());
                     clean.push(*v);
                 }
             }
         }
 
-        // 2. Remap triangle indices, dropping triangles that reference duplicates of the same
-        //    vertex (fewer than 3 distinct indices => degenerate, no area).
+        // 2. Remap primitive indices, dropping primitives that reference duplicates of the
+        //    same vertex (dim3: fewer than 3 distinct indices => degenerate, no volume;
+        //    dim2: fewer than 2 distinct indices => degenerate, no area).
         let mut clean_idx: Vec<[u32; DIM]> = Vec::new();
+        #[cfg(feature = "dim3")]
         for tri in indices {
             let a = remap[tri[0] as usize];
             let b = remap[tri[1] as usize];
@@ -1141,10 +1190,23 @@ impl ColliderBuilder {
                 clean_idx.push([a, b, c]);
             }
         }
+        #[cfg(feature = "dim2")]
+        for segment in indices {
+            let a = remap[segment[0] as usize];
+            let b = remap[segment[1] as usize];
+            if a != b {
+                clean_idx.push([a, b]);
+            }
+        }
 
-        // 3. Need at least 4 distinct non-coplanar points to form a 3D convex hull; otherwise
-        //    parry's voxelization convex-hull has nothing valid to compute.
-        if clean.len() < 4 || clean_idx.is_empty() {
+        // 3. Need at least 4 distinct non-coplanar points to form a 3D convex hull (dim3) or
+        //    3 distinct points for a 2D polygon hull (dim2); otherwise parry's decomposition
+        //    has nothing valid to compute.
+        #[cfg(feature = "dim3")]
+        let min_points = 4;
+        #[cfg(feature = "dim2")]
+        let min_points = 3;
+        if clean.len() < min_points || clean_idx.is_empty() {
             return None;
         }
 

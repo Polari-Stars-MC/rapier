@@ -231,7 +231,16 @@ impl PhysicsPipeline {
         gravity_container.push(crate::dynamics::force_containers::ForceEntry {
             id: 1,
             force: gravity,
-            torque: crate::math::AngVector::ZERO,
+            torque: {
+                #[cfg(feature = "dim3")]
+                {
+                    crate::math::AngVector::ZERO
+                }
+                #[cfg(feature = "dim2")]
+                {
+                    0.0
+                }
+            },
             point: None,
         });
 

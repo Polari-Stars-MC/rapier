@@ -17,10 +17,11 @@
 //! they built AABB / OBB bounds.
 
 use crate::geometry::ColliderBuilder;
+use crate::math::Real;
 use alloc::vec::Vec;
 use parry::math::Vector;
 
-const EPSILON: f64 = 1.0e-9;
+const EPSILON: Real = 1.0e-9;
 
 /// Discrete-orientation polytope preset selecting the slab normal set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,8 +39,8 @@ pub enum KdopPreset {
 #[derive(Clone, Copy)]
 struct Slab {
     normal: Vector,
-    min: f64,
-    max: f64,
+    min: Real,
+    max: Real,
 }
 
 /// A hull defined by a set of slab directions.
@@ -126,8 +127,8 @@ fn slabs_from_points(points: &[Vector], directions: &[Vector]) -> Option<Vec<Sla
             continue;
         };
 
-        let mut min = f64::INFINITY;
-        let mut max = f64::NEG_INFINITY;
+        let mut min = Real::MAX;
+        let mut max = -Real::MAX;
         for point in points {
             let projection = normal.dot(*point);
             min = min.min(projection);
@@ -142,7 +143,7 @@ fn slabs_from_points(points: &[Vector], directions: &[Vector]) -> Option<Vec<Sla
     (slabs.len() >= 3).then_some(slabs)
 }
 
-fn solve_planes(a: Vector, da: f64, b: Vector, db: f64, c: Vector, dc: f64) -> Option<Vector> {
+fn solve_planes(a: Vector, da: Real, b: Vector, db: Real, c: Vector, dc: Real) -> Option<Vector> {
     let cross_bc = b.cross(c);
     let det = a.dot(cross_bc);
     if det.abs() <= EPSILON {
@@ -181,7 +182,7 @@ pub fn build_direction_hull(points: &[Vector], directions: &[Vector]) -> Option<
     }
 
     let slabs = slabs_from_points(points, directions)?;
-    let mut planes: Vec<(Vector, f64)> = Vec::with_capacity(slabs.len() * 2);
+    let mut planes: Vec<(Vector, Real)> = Vec::with_capacity(slabs.len() * 2);
     for slab in &slabs {
         planes.push((slab.normal, slab.max));
         planes.push((-slab.normal, -slab.min));

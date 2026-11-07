@@ -29,7 +29,7 @@ pub use self::contact_pair::{
     SolverContacts, SolverFlags, is_bouncy, is_bouncy_simd,
 };
 /// Direction-based convex hulls (k-DOP / FDH) and their preset enum.
-#[cfg(feature = "alloc")]
+#[cfg(all(feature = "alloc", feature = "dim3"))]
 pub use self::direction_hull::{
     DirectionHull, FdhHull, KdopHull, KdopPreset, build_direction_hull,
 };
@@ -50,7 +50,7 @@ pub use self::narrow_phase::soft_contacts::{
     SoftVertexHits, SoftVertexPass, SoftVolumePatch, VolumeBin,
 };
 /// User-space AABB spatial index (general R-tree over arbitrary `u64` ids).
-#[cfg(feature = "alloc")]
+#[cfg(all(feature = "alloc", feature = "dim3"))]
 pub use self::user_index::GenericAabbIndex;
 #[cfg(feature = "alloc")]
 pub use parry::utils::Array2;
@@ -301,6 +301,7 @@ mod collider_components;
 mod collider_handle;
 #[cfg(feature = "alloc")]
 pub(crate) mod contact_pair;
+#[cfg(feature = "alloc")]
 pub mod contact_persistence;
 #[cfg(feature = "alloc")]
 mod interaction_graph;
@@ -328,10 +329,11 @@ mod contact_clustering;
 
 /// User-space AABB spatial index (general R-tree over arbitrary `u64` ids).
 #[cfg(feature = "alloc")]
+#[cfg(all(feature = "alloc", feature = "dim3"))]
 pub mod user_index;
 
 /// Direction-based convex hulls (k-DOP / FDH).
-#[cfg(feature = "alloc")]
+#[cfg(all(feature = "alloc", feature = "dim3"))]
 pub mod direction_hull;
 
 #[cfg(all(test, feature = "dim3", feature = "alloc"))]

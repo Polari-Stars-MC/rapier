@@ -35,6 +35,11 @@ pub struct BakedCompound {
 }
 
 impl BakedCompound {
+    /// Maximum accepted payload size for [`Self::from_bytes`]. Guards against
+    /// allocation bombs: without it, bincode trusts length prefixes inside the
+    /// payload and can allocate up to that many bytes from a tiny input slice.
+    pub const MAX_BAKED_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+
     /// Serializes this baked compound to compact bytes (bincode little-endian).
     ///
     /// The payload includes the pre-built BVH, so loading the bytes is much cheaper
@@ -46,9 +51,23 @@ impl BakedCompound {
 
     /// Deserializes a baked compound previously produced by [`Self::to_bytes`].
     ///
-    /// Reuses the embedded BVH; no BVH construction is performed.
+    /// Reuses the embedded BVH; no BVH construction is performed. Only trusted
+    /// payloads should be loaded: the input is size-capped at
+    /// [`Self::MAX_BAKED_BYTES`] and bincode's own read limit is set to the same
+    /// bound so a hostile length prefix cannot trigger a huge allocation.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
-        bincode::deserialize(bytes)
+        use bincode::Options as _;
+        if bytes.len() > Self::MAX_BAKED_BYTES {
+            return Err(bincode::ErrorKind::Custom(alloc::format!(
+                "baked compound payload too large: {} bytes (max {})",
+                bytes.len(),
+                Self::MAX_BAKED_BYTES
+            ))
+            .into());
+        }
+        bincode::options()
+            .with_limit(Self::MAX_BAKED_BYTES as u64)
+            .deserialize(bytes)
     }
 }
 

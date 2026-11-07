@@ -17,11 +17,12 @@
 //! | 温度场（热膨胀 + 软化） | [`ThermalParams`] | 材质 `young_modulus` 与静止长度的乘子 |
 //! | 率相关粘弹性 | [`ViscoelasticParams`] | 边刚度乘 `1 + rate·|dε/dt|` |
 //! | 体级正交各向异性 | [`ForkExtras::anisotropy`] | 边柔度除以 `nᵀ·diag·n` |
-//! | 主动应变 / 肌纤维方向 | [`ForkExtras::activation`] / [`ForkExtras::fibre`] | 边静止长度 `rest·(1 − γ)`，沿纤维各向异性 |
-//! | 内聚（可断裂胶水） | [`CohesionParams`] | **待接**：跨体粒子对的距离约束 |
-//! | 自接触 / 跨体接触 | [`SelfCollisionParams`] | **待接**：官方 `self_contacts` 只在建体时可设，需要上游暴露重编碰撞网格的入口 |
+//! | 主动应变 | [`ForkExtras::activation`] | 边静止长度 `rest·(1 − γ)` |
+//! | 肌纤维方向 | [`ForkExtras::fibre`] | **未接线**：setter 只写字段，官方求解器当前不读取 |
+//! | 内聚（可断裂胶水） | [`CohesionParams`] | 预测阶段对跨体粒子对施加线性吸引（双方都开才生效） |
+//! | 自接触 / 跨体接触 | [`SelfCollisionParams`] | **未接线**：setter 只写字段，官方求解器当前不读取（官方 `self_contacts` 只在建体时可设） |
 //! | 撕裂准则（应变/应力/能量） | [`ForkTearCriterion`] | 应变/应力写进官方阈值；能量由求解器按 `½·F·Δ` 评估 |
-//! | 子步 | [`ForkExtras::substeps`] | **待接**：官方冲击自适应子步的额外细分 |
+//! | 子步 | [`ForkExtras::substeps`] | 叠加在官方自适应子步之上（`num_solver_iterations + extra`，受 `max_extra_substeps` 封顶） |
 //!
 //! Nothing in this module integrates anything by itself: every field is read by
 //! the official solver path (`soft_constraint_prepare`, the per-particle predict,
@@ -198,8 +199,10 @@ impl ForkExtras {
     }
 
     /// The effective rest-length multiplier: thermal expansion plus active strain.
+    /// Lower-bounded at a small positive value: `expansion·ΔT ≤ −1` would make the
+    /// rest length zero/negative, leaving the distance constraint permanently violated.
     pub fn rest_scale(&self) -> Real {
-        self.thermal_stretch() * (1.0 - self.activation.clamp(0.0, 1.0))
+        (self.thermal_stretch() * (1.0 - self.activation.clamp(0.0, 1.0))).max(1.0e-3)
     }
 }
 
@@ -277,13 +280,23 @@ impl crate::dynamics::soft_body::SoftBody {
 
     /// Body-level orthotropic stiffness axes (`None` makes every edge isotropic).
     pub fn set_anisotropy_axes(&mut self, axes: Option<Vector>) -> bool {
+        let anisotropy_valid = |a: &Vector| -> bool {
+            #[cfg(feature = "dim3")]
+            {
+                a.x >= 0.0
+                    && a.y >= 0.0
+                    && a.z >= 0.0
+                    && a.x.is_finite()
+                    && a.y.is_finite()
+                    && a.z.is_finite()
+            }
+            #[cfg(feature = "dim2")]
+            {
+                a.x >= 0.0 && a.y >= 0.0 && a.x.is_finite() && a.y.is_finite()
+            }
+        };
         if let Some(a) = axes
-            && !(a.x >= 0.0
-                && a.y >= 0.0
-                && a.z >= 0.0
-                && a.x.is_finite()
-                && a.y.is_finite()
-                && a.z.is_finite())
+            && !anisotropy_valid(&a)
         {
             return false;
         }

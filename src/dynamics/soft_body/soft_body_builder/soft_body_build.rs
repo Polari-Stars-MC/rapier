@@ -28,12 +28,24 @@ impl SoftBodyBuilder {
 
     /// Builds the soft body (not yet inserted in a set: its root rigid body and colliders are
     /// created by [`super::SoftBodySet::insert`]).
+    ///
+    /// Defensive against caller input: primitive entries referencing out-of-bounds particle
+    /// indices are dropped (instead of panicking), a `masses` slice of the wrong length or
+    /// with non-positive/non-finite entries falls back to the uniform `particle_mass`, and a
+    /// non-positive/non-finite `particle_mass` itself falls back to `1.0`.
     pub(crate) fn build(&self) -> SoftBody {
         let num_particles = self.positions.len();
-        let masses: Vec<Real> = if self.masses.len() == num_particles {
+        let masses: Vec<Real> = if self.masses.len() == num_particles
+            && self.masses.iter().all(|m| m.is_finite() && *m > 0.0)
+        {
             self.masses.clone()
         } else {
-            vec![self.particle_mass; num_particles]
+            let fallback = if self.particle_mass.is_finite() && self.particle_mass > 0.0 {
+                self.particle_mass
+            } else {
+                1.0
+            };
+            vec![fallback; num_particles]
         };
         let mut pinned = vec![false; num_particles];
         for &i in &self.pinned {
@@ -75,9 +87,13 @@ impl SoftBodyBuilder {
             .collect();
         let pos = |i: u32| self.positions[i as usize];
 
-        // Cells: positive orientation, rest matrices.
+        // Cells: positive orientation, rest matrices. Drop cells referencing
+        // out-of-bounds particle indices (would panic on `pos(vertices[k])`).
         let mut cells = Vec::with_capacity(self.cells.len());
         for c in &self.cells {
+            if c.iter().any(|&k| k as usize >= num_particles) {
+                continue;
+            }
             let mut vertices = *c;
             let mut x: [Vector; DIM + 1] = core::array::from_fn(|k| pos(vertices[k]));
             if SoftBody::cell_volume(x) < 0.0 {
@@ -106,9 +122,14 @@ impl SoftBodyBuilder {
             });
         }
 
-        // Surface: given, or the boundary of the cells.
+        // Surface: given, or the boundary of the cells. Drop surface primitives with
+        // out-of-bounds particle indices (same defensive rule as cells/edges).
         let surface = if !self.surface.is_empty() {
-            self.surface.clone()
+            self.surface
+                .iter()
+                .filter(|t| t.iter().all(|&k| (k as usize) < num_particles))
+                .copied()
+                .collect()
         } else {
             cell_boundary(&cells)
         };
@@ -139,10 +160,16 @@ impl SoftBodyBuilder {
             edge_list.extend(
                 self.edges
                     .iter()
+                    .filter(|e| (e[0] as usize) < num_particles && (e[1] as usize) < num_particles)
                     .map(|e| (*e, SoftBodyEdgeKind::Structural)),
             );
         }
-        edge_list.extend(self.bend_edges.iter().map(|e| (*e, SoftBodyEdgeKind::Bend)));
+        edge_list.extend(
+            self.bend_edges
+                .iter()
+                .filter(|e| (e[0] as usize) < num_particles && (e[1] as usize) < num_particles)
+                .map(|e| (*e, SoftBodyEdgeKind::Bend)),
+        );
         let mut edges: Vec<SoftBodyEdge> = edge_list
             .iter()
             .map(|(vertices, kind)| SoftBodyEdge {
@@ -179,6 +206,7 @@ impl SoftBodyBuilder {
         let mut dihedrals: Vec<SoftBodyDihedral> = self
             .dihedrals
             .iter()
+            .filter(|v| v.iter().all(|&k| (k as usize) < num_particles))
             .map(|v| SoftBodyDihedral {
                 vertices: *v,
                 rest_angle: dihedral_angle(pos(v[0]), pos(v[1]), pos(v[2]), pos(v[3])),

@@ -70,6 +70,10 @@ impl Quarantine {
         rb.forces.torque = Default::default();
         rb.forces.user_force = Vector::ZERO;
         rb.forces.user_torque = Default::default();
+        // Force containers hold persistent user-supplied entries; a NaN there would
+        // survive this sanitize and re-poison the body on every later step (and after
+        // a resurrection), so clear them along with the legacy force slots.
+        rb.force_containers.clear();
     }
 
     /// Step-start chokepoint: quarantines user-modified bodies and colliders whose new state is

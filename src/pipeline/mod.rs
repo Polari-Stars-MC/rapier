@@ -27,6 +27,9 @@ pub use self::debug_render_pipeline::{
     DebugRenderStyle,
 };
 
+#[cfg(all(feature = "debug-render", feature = "alloc"))]
+mod debug_render_pipeline;
+
 #[cfg(feature = "alloc")]
 mod collision_pipeline;
 mod event_handler;

@@ -1,13 +1,14 @@
 use crate::alloc_prelude::*;
+#[cfg(feature = "dim3")]
+use crate::dynamics::soft_body_fork::SoftBodySet as ForkSoftBodySet;
+#[cfg(feature = "dim3")]
+use crate::dynamics::soft_body_fork::{SoftBody as ForkSoftBody, SoftBodyId as ForkSoftBodyId};
 use crate::dynamics::{
     CCDSolver, GenericJoint, ImpulseJoint, ImpulseJointHandle, ImpulseJointSet,
     IntegrationParameters, IslandManager, Multibody, MultibodyJointHandle, MultibodyJointSet,
     MultibodyLink, MultibodyLinkId, RigidBody, RigidBodyHandle, RigidBodySet, SoftBindingError,
     SoftBody, SoftBodyBuilder, SoftBodyHandle, SoftBodySet, SoftBodyTearEvent, SoftClusterRemoval,
-    SoftMeshBinding,
-    fluid::FluidWorld,
-    soft_body_fork::SoftBodySet as ForkSoftBodySet,
-    soft_body_fork::{SoftBody as ForkSoftBody, SoftBodyId as ForkSoftBodyId},
+    SoftMeshBinding, fluid::FluidWorld,
 };
 use crate::geometry::{
     BroadPhaseBvh, Collider, ColliderHandle, ColliderSet, ContactPair, DefaultBroadPhase,
@@ -104,11 +105,13 @@ pub struct PhysicsWorld {
     /// This fork's system is stepped separately, after the rigid-body pipeline.
     /// Phase 0b wiring only: these soft bodies are stepped independently (they do
     /// not exchange collisions with rigid bodies — only bound spring forces).
+    #[cfg(feature = "dim3")]
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
     pub soft_bodies_fork: ForkSoftBodySet,
     /// All fluid bodies (SPH particle clouds). Stepped independently after the
     /// rigid-body pipeline, mirroring `soft_bodies` (Phase 0 of the fluid
-    /// roadmap; rigid-body coupling arrives later). See
-    /// `.hermes/plans/2026-08-30_fluid-sph-roadmap.md`.
+    /// roadmap; rigid-body coupling arrives later).
+    #[cfg_attr(feature = "serde-serialize", serde(skip))]
     pub fluids: Vec<FluidWorld>,
 }
 
@@ -128,6 +131,7 @@ impl Default for PhysicsWorld {
             multibody_joints: MultibodyJointSet::new(),
             soft_bodies: SoftBodySet::new(),
             ccd_solver: CCDSolver::new(),
+            #[cfg(feature = "dim3")]
             soft_bodies_fork: ForkSoftBodySet::new(),
             fluids: Vec::new(),
         }
@@ -174,6 +178,7 @@ impl PhysicsWorld {
         // bodies' `force_containers` *before* the pipeline integrates them, so the
         // soft forces act on the rigid bodies through the standard effective-force
         // path this step. Free (unbound) particles are integrated separately below.
+        #[cfg(feature = "dim3")]
         self.soft_bodies_fork.write_spring_forces(&mut self.bodies);
         self.physics_pipeline.step(
             self.gravity,
@@ -192,10 +197,12 @@ impl PhysicsWorld {
         );
         // Phase 0b: advance free soft-body particles after the rigid-body pipeline.
         // Sleeping bodies are skipped inside `SoftBodySet::step`.
+        #[cfg(feature = "dim3")]
         self.soft_bodies_fork.step(self.integration_parameters.dt);
         // Phase 8: after the rigid pipeline integrates, snap bound soft particles
         // to their rigid bodies' new world transforms (so anchored cloth/flags
         // follow a moving body). Runs after step so followers see updated poses.
+        #[cfg(feature = "dim3")]
         self.soft_bodies_fork.follow_rigid_bodies(&self.bodies);
         // Phase 0 (fluid SPH): advance every fluid particle cloud independently,
         // after the rigid-body pipeline. No rigid coupling yet.
@@ -284,31 +291,37 @@ impl PhysicsWorld {
     /// Stepped automatically each [`step`](Self::step) after the rigid-body
     /// pipeline (Phase 0b wiring). Upstream v0.36 soft bodies go through
     /// [`insert_soft_body`](Self::insert_soft_body) instead.
+    #[cfg(feature = "dim3")]
     pub fn insert_soft_body_fork(&mut self, body: ForkSoftBody) -> ForkSoftBodyId {
         self.soft_bodies_fork.insert(body)
     }
 
     /// Immutable access to a fork soft body by id.
+    #[cfg(feature = "dim3")]
     pub fn soft_body_fork(&self, id: ForkSoftBodyId) -> Option<&ForkSoftBody> {
         self.soft_bodies_fork.get(id)
     }
 
     /// Mutable access to a fork soft body by id.
+    #[cfg(feature = "dim3")]
     pub fn soft_body_fork_mut(&mut self, id: ForkSoftBodyId) -> Option<&mut ForkSoftBody> {
         self.soft_bodies_fork.get_mut(id)
     }
 
     /// Mark a fork soft body as sleeping (its particles are not integrated until woken).
+    #[cfg(feature = "dim3")]
     pub fn sleep_soft_body_fork(&mut self, id: ForkSoftBodyId) -> bool {
         self.soft_bodies_fork.sleep(id)
     }
 
     /// Wake a sleeping fork soft body.
+    #[cfg(feature = "dim3")]
     pub fn wake_soft_body_fork(&mut self, id: ForkSoftBodyId) -> bool {
         self.soft_bodies_fork.wake(id)
     }
 
     /// Whether a fork soft body is currently sleeping.
+    #[cfg(feature = "dim3")]
     pub fn is_soft_body_fork_sleeping(&self, id: ForkSoftBodyId) -> bool {
         self.soft_bodies_fork.is_sleeping(id)
     }
@@ -892,6 +905,18 @@ impl PhysicsWorld {
     ) {
         if enabled {
             self.narrow_phase.enable_collision(collider1, collider2);
+            // Re-enabling must re-arm the (possibly sleeping/settled) pair as a
+            // narrow-phase update candidate: while disabled the sweep clears the
+            // pair, and a settled pair is otherwise never revisited (it is neither
+            // user-modified nor on an active body), so contacts would never be
+            // recomputed. Mark both colliders as narrow-phase-modified (GROUPS is
+            // an NF-only flag with no broad-phase or user-change side effects) and
+            // put them in the modified set.
+            for h in [collider1, collider2] {
+                if let Some(co) = self.colliders.get_mut(h) {
+                    co.changes |= crate::geometry::ColliderChanges::GROUPS;
+                }
+            }
         } else {
             self.narrow_phase.disable_collision(collider1, collider2);
         }

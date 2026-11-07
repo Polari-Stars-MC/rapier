@@ -80,7 +80,6 @@ impl PhysicsPipeline {
             narrow_phase,
             hooks,
             events,
-            false,
         );
         self.counters.ccd.toi_computation_time.pause();
     }
@@ -493,6 +492,19 @@ impl PhysicsPipeline {
         let step_parameters = *integration_parameters;
         let mut integration_parameters = *integration_parameters;
 
+        // Step-start drain of the solver-emergent observation containers
+        // (`Friction` / `ContactReaction`): they are rebuilt by the contact-force
+        // bridge after the solve, so clearing them here removes last step's readout
+        // (including for pairs that no longer touch) without touching the user
+        // transient forces that must survive until end of step.
+        self.counters.stages.update_time.resume();
+        for handle in islands.active_bodies() {
+            if let Some(rb) = bodies.get_mut_internal(handle) {
+                crate::dynamics::force_containers::drain_contact_observation_containers(rb);
+            }
+        }
+        self.counters.stages.update_time.pause();
+
         // CCD substeps are only reported when the CCD had to act during the step.
         let mut num_passes = 0;
         let mut any_ccd_active = false;
@@ -674,6 +686,18 @@ impl PhysicsPipeline {
         if any_ccd_active {
             self.counters.ccd.num_substeps = num_passes;
         }
+
+        // Drain the transient (per-step) force containers once per step, after every
+        // CCD substep has consumed `rb.forces`. Draining inside the per-substep fused
+        // traversal instead would wipe one-shot/event forces after the first substep
+        // and shrink the impulse a full-step transient force is meant to deliver.
+        self.counters.stages.update_time.resume();
+        for handle in islands.active_bodies() {
+            if let Some(rb) = bodies.get_mut_internal(handle) {
+                crate::dynamics::force_containers::drain_transient_forces(rb);
+            }
+        }
+        self.counters.stages.update_time.pause();
 
         // Finally, make sure we update the world mass-properties of the rigid-bodies
         // that moved. Otherwise, users may end up applying forces with respect to an

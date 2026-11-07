@@ -42,6 +42,7 @@ impl NarrowPhase {
 
         let nodes = &self.intersection_graph.graph.nodes;
         let query_dispatcher = &*self.query_dispatcher;
+        let disabled_pairs = &self.disabled_collider_pairs;
 
         // Takes the hooks as an argument rather than capturing them, so that under
         // `unsync-callbacks` the workers can be handed a `&()` (a no-op `PhysicsHooks` that
@@ -57,6 +58,13 @@ impl NarrowPhase {
             let rb_handle2 = co2.parent.map(|p| p.handle);
 
             'emit_events: {
+                // Explicitly disabled pair: force no intersection. When the pair was
+                // previously intersecting, `had_intersection != intersecting` makes the
+                // deferred event path below emit `CollisionEvent::Stopped`.
+                if disabled_pairs.contains_key(&NarrowPhase::normalized_pair(handle1, handle2)) {
+                    edge.weight.intersecting = false;
+                    break 'emit_events;
+                }
                 let body_awake = |co: &crate::geometry::Collider| {
                     co.parent.as_ref().is_some_and(|p| {
                         awake_body_mask

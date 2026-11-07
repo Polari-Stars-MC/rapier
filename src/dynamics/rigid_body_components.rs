@@ -885,18 +885,20 @@ impl RigidBodyVelocity<Real> {
     /// Clamp the magnitude of this velocity to the given caps (issue #181): the linear part to
     /// `max_linvel` (its magnitude) and, in 3D, each angular-axis to the per-axis cap in
     /// `max_angvel`. `None` caps are treated as "no limit" for that component.
+    /// A negative or non-finite cap is ignored (a negative cap with a zero velocity would
+    /// otherwise scale by `-inf` and produce NaN).
     #[cfg(feature = "dim2")]
     pub fn clamp_magnitude(&self, max_linvel: Option<Real>, max_angvel: Option<Real>) -> Self {
         let mut linvel = self.linvel;
         if let Some(max) = max_linvel {
             let len = linvel.length();
-            if len > max {
+            if max.is_finite() && max >= 0.0 && len > max && len > 0.0 {
                 linvel *= max / len;
             }
         }
         let mut angvel = self.angvel;
         if let Some(max) = max_angvel {
-            if angvel.abs() > max {
+            if max.is_finite() && max >= 0.0 && angvel.abs() > max {
                 angvel = angvel.signum() * max;
             }
         }
@@ -906,20 +908,29 @@ impl RigidBodyVelocity<Real> {
     /// Clamp the magnitude of this velocity to the given caps (issue #181): the linear part to
     /// `max_linvel` (its magnitude) and each angular axis to the per-axis cap in `max_angvel`.
     /// `None` caps are treated as "no limit" for that component.
+    /// A negative or non-finite cap component is ignored (see the 2D doc).
     #[cfg(feature = "dim3")]
     pub fn clamp_magnitude(&self, max_linvel: Option<Real>, max_angvel: Option<AngVector>) -> Self {
         let mut linvel = self.linvel;
         if let Some(max) = max_linvel {
             let len = linvel.length();
-            if len > max {
+            if max.is_finite() && max >= 0.0 && len > max && len > 0.0 {
                 linvel *= max / len;
             }
         }
         let mut angvel = self.angvel;
         if let Some(max) = max_angvel {
-            let ax = angvel.x.abs().min(max.x).copysign(angvel.x);
-            let ay = angvel.y.abs().min(max.y).copysign(angvel.y);
-            let az = angvel.z.abs().min(max.z).copysign(angvel.z);
+            // Per-axis clamp, ignoring non-finite/negative caps on that axis.
+            let clamp_axis = |v: Real, m: Real| -> Real {
+                if m.is_finite() && m >= 0.0 {
+                    v.abs().min(m).copysign(v)
+                } else {
+                    v
+                }
+            };
+            let ax = clamp_axis(angvel.x, max.x);
+            let ay = clamp_axis(angvel.y, max.y);
+            let az = clamp_axis(angvel.z, max.z);
             angvel = AngVector::new(ax, ay, az);
         }
         RigidBodyVelocity { linvel, angvel }
@@ -1143,10 +1154,12 @@ pub struct RigidBodyCcd {
     /// World-space point of impact recorded by the CCD solver at the last continuous solve
     /// (issue #548). `Vector::ZERO` when the body swept freely (no CCD hit). The separating
     /// `normal` is in `Self::toi_normal`.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub toi_point: Vector,
     /// World-space separating normal recorded by the CCD solver at the last continuous solve
     /// (issue #548), pointing from this body toward the hit target. `Vector::ZERO` when the
     /// body swept freely (no CCD hit).
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub toi_normal: Vector,
 }
 

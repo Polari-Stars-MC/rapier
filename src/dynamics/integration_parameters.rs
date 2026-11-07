@@ -336,6 +336,7 @@ pub struct IntegrationParameters {
     /// solver already applies the impulses), so enabling this only exposes the
     /// per-step contact reaction / friction for inspection. Disable to keep the
     /// pre-existing contact behavior fully unchanged.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub bridge_contact_forces: bool,
 }
 

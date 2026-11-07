@@ -76,10 +76,12 @@ pub struct RigidBody {
     /// When set, the body's linear velocity is clamped to this magnitude during
     /// the integration step (after forces and the constraint solver have run), so
     /// no simulation can push it faster. `None` means no limit.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub(crate) max_linvel: Option<Real>,
     /// Optional maximum angular velocity magnitude (in radians/second), issue #181.
     ///
     /// See [`Self::max_linvel`]; applies to the angular velocity magnitude instead.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub(crate) max_angvel: Option<AngVector>,
     pub(crate) additional_pgs_iterations: usize,
     /// The soft body this rigid body is the root of (invalid for regular rigid bodies).
@@ -1154,7 +1156,13 @@ impl RigidBody {
     /// When `max_linvel` is `Some(limit)`, the body's linear velocity is clamped to magnitude
     /// `limit` every integration step (after forces and the solver have run), so collisions,
     /// motors, or gravity can never accelerate it beyond `limit`. Pass `None` to remove the cap.
+    ///
+    /// A non-finite or negative cap is rejected (the previous cap is kept): a negative
+    /// cap would flip the velocity direction in [`RigidBodyVelocity::clamp_magnitude`].
     pub fn set_max_linvel(&mut self, max_linvel: Option<Real>) {
+        if max_linvel.is_some_and(|v| !v.is_finite() || v < 0.0) {
+            return;
+        }
         self.max_linvel = max_linvel;
         self.changes |= RigidBodyChanges::IN_MODIFIED_SET;
     }
@@ -1164,8 +1172,12 @@ impl RigidBody {
     /// When `max_angvel` is `Some(limit)`, the body's angular velocity is clamped to magnitude
     /// `limit` every integration step. Per-axis limits are supported in 3D (the vector's each
     /// component is the cap on that axis). Pass `None` to remove the cap.
+    /// A non-finite or negative component is rejected (the previous cap is kept).
     #[cfg(feature = "dim2")]
     pub fn set_max_angvel(&mut self, max_angvel: Option<Real>) {
+        if max_angvel.is_some_and(|v| !v.is_finite() || v < 0.0) {
+            return;
+        }
         self.max_angvel = max_angvel;
         self.changes |= RigidBodyChanges::IN_MODIFIED_SET;
     }
@@ -1173,8 +1185,12 @@ impl RigidBody {
     /// Set the maximum angular velocity magnitude (in radians/second) of this rigid-body, issue #181.
     ///
     /// See [`Self::set_max_angvel`] (the 3D variant takes a per-axis [`AngVector`] cap).
+    /// A non-finite or negative component is rejected (the previous cap is kept).
     #[cfg(feature = "dim3")]
     pub fn set_max_angvel(&mut self, max_angvel: Option<AngVector>) {
+        if max_angvel.is_some_and(|v| !v.is_finite() || v.x < 0.0 || v.y < 0.0 || v.z < 0.0) {
+            return;
+        }
         self.max_angvel = max_angvel;
         self.changes |= RigidBodyChanges::IN_MODIFIED_SET;
     }
@@ -1467,6 +1483,12 @@ impl RigidBody {
         if self.body_type != RigidBodyType::Dynamic {
             return 0;
         }
+        // Reject non-finite input at the boundary: a NaN/inf entry would live in the
+        // (persistent) container and poison the effective-force sum every step, and
+        // the quarantine sanitize cannot see inside containers added after it ran.
+        if !force.is_finite() || !torque.is_finite() || point.is_some_and(|p| !p.is_finite()) {
+            return 0;
+        }
         let assigned = self
             .force_container_mut_with(ForceKind::Thrust, persistence)
             .push(ForceEntry {
@@ -1494,6 +1516,10 @@ impl RigidBody {
     ) -> u64 {
         use crate::dynamics::force_containers::{ForceEntry, Persistence};
         if self.body_type != RigidBodyType::Dynamic {
+            return 0;
+        }
+        // See `add_thrust`: reject non-finite input at the boundary.
+        if !force.is_finite() || !torque.is_finite() || point.is_some_and(|p| !p.is_finite()) {
             return 0;
         }
         let assigned = self
@@ -2308,23 +2334,35 @@ impl RigidBodyBuilder {
 
     /// Set the maximum linear velocity magnitude (units/second) of the rigid-body to be built,
     /// issue #181. `None` removes the cap (default). See [`RigidBody::set_max_linvel`].
+    /// A non-finite or negative cap is ignored (treated as no cap).
     pub fn max_linvel(mut self, max_linvel: Option<Real>) -> Self {
+        if max_linvel.is_some_and(|v| !v.is_finite() || v < 0.0) {
+            return self;
+        }
         self.max_linvel = max_linvel;
         self
     }
 
     /// Set the maximum angular velocity magnitude (radians/second) of the rigid-body to be built,
     /// issue #181. `None` removes the cap (default). See [`RigidBody::set_max_angvel`].
+    /// A non-finite or negative cap is ignored (treated as no cap).
     #[cfg(feature = "dim2")]
     pub fn max_angvel(mut self, max_angvel: Option<Real>) -> Self {
+        if max_angvel.is_some_and(|v| !v.is_finite() || v < 0.0) {
+            return self;
+        }
         self.max_angvel = max_angvel;
         self
     }
 
     /// Set the maximum angular velocity magnitude (radians/second) of the rigid-body to be built,
     /// issue #181. `None` removes the cap (default). See [`RigidBody::set_max_angvel`].
+    /// A non-finite or negative cap component is ignored (treated as no cap).
     #[cfg(feature = "dim3")]
     pub fn max_angvel(mut self, max_angvel: Option<AngVector>) -> Self {
+        if max_angvel.is_some_and(|v| !v.is_finite() || v.x < 0.0 || v.y < 0.0 || v.z < 0.0) {
+            return self;
+        }
         self.max_angvel = max_angvel;
         self
     }
