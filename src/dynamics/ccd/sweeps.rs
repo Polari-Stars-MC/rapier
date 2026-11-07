@@ -668,7 +668,7 @@ impl PhysicsHooks for HookProbe {
     ) -> Option<crate::geometry::SolverFlags> {
         self.0.store(true, core::sync::atomic::Ordering::Relaxed);
         // Irrelevant: reaching this discards the whole pass in favour of the serial redo.
-        Some(crate::geometry::SolverFlags::COMPUTE_IMPULSES)
+        Some(crate::geometry::SolverFlags::COMPUTE_RIGID_IMPULSES)
     }
 }
 

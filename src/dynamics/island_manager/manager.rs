@@ -435,12 +435,15 @@ impl IslandManager {
                 // per-island local map; the folded values are then merged serially
                 // via `apply_sleep_eligibility`, keeping the shared `sleep_scan_touched`
                 // Vec race-free (same two-pass pattern as `solve.rs`'s active-body loop).
+                // A BTreeMap (sorted by island id) keeps the merge — and therefore
+                // `sleep_scan_touched` / the order islands are committed to sleep —
+                // deterministic across processes, unlike a RandomState hash map.
                 use rayon::prelude::*;
-                let folded: Vec<std::collections::HashMap<u32, bool>> = sleep_observations
+                let folded: Vec<alloc::collections::BTreeMap<u32, bool>> = sleep_observations
                     .par_chunks(256)
                     .map(|chunk| {
-                        let mut local: std::collections::HashMap<u32, bool> =
-                            std::collections::HashMap::new();
+                        let mut local: alloc::collections::BTreeMap<u32, bool> =
+                            alloc::collections::BTreeMap::new();
                         for &(island_id, eligible) in chunk {
                             local
                                 .entry(island_id)

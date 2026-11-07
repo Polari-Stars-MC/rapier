@@ -23,9 +23,9 @@
 //! over mixed-row matrices (e.g. a 3-row view × 6-row matrix × 3-row view) work.
 
 use crate::alloc_prelude::*;
+use core::ops::Deref;
+use core::ops::DerefMut;
 use simba::scalar::ComplexField;
-use std::ops::Deref;
-use std::ops::DerefMut;
 
 /// A dynamically-sized column vector (`nalgebra::DVector<Real>` replacement).
 ///
@@ -258,7 +258,7 @@ impl<T: ComplexField<RealField = T> + Copy> DVector<T> {
     pub fn insert_rows(&self, i: usize, n: usize, value: T) -> DVector<T> {
         let mut data = Vec::with_capacity(self.data.len() + n);
         data.extend_from_slice(&self.data[..i]);
-        data.extend(std::iter::repeat_n(value, n));
+        data.extend(core::iter::repeat_n(value, n));
         data.extend_from_slice(&self.data[i..]);
         DVector { data }
     }
@@ -417,7 +417,7 @@ impl<'a, T: ComplexField<RealField = T> + Copy + PartialOrd> DVectorView<'a, T> 
     }
 }
 
-impl<T: ComplexField<RealField = T> + Copy> std::ops::Index<usize> for DVectorView<'_, T> {
+impl<T: ComplexField<RealField = T> + Copy> core::ops::Index<usize> for DVectorView<'_, T> {
     type Output = T;
     #[inline]
     fn index(&self, i: usize) -> &T {
@@ -557,7 +557,7 @@ impl<'a, T: ComplexField<RealField = T> + Copy> DVectorViewMut<'a, T> {
     }
 }
 
-impl<T: ComplexField<RealField = T> + Copy> std::ops::Index<usize> for DVectorViewMut<'_, T> {
+impl<T: ComplexField<RealField = T> + Copy> core::ops::Index<usize> for DVectorViewMut<'_, T> {
     type Output = T;
     #[inline]
     fn index(&self, i: usize) -> &T {
@@ -565,7 +565,7 @@ impl<T: ComplexField<RealField = T> + Copy> std::ops::Index<usize> for DVectorVi
     }
 }
 
-impl<T: ComplexField<RealField = T> + Copy> std::ops::IndexMut<usize> for DVectorViewMut<'_, T> {
+impl<T: ComplexField<RealField = T> + Copy> core::ops::IndexMut<usize> for DVectorViewMut<'_, T> {
     #[inline]
     fn index_mut(&mut self, i: usize) -> &mut T {
         &mut self.data[i]
@@ -885,14 +885,14 @@ impl<T: ComplexField<RealField = T> + Copy> DMatrix<T> {
                     nrows2,
                     ncols2,
                     ncols3,
-                    std::mem::transmute_copy(&alpha),
+                    core::mem::transmute_copy(&alpha),
                     a.as_ptr() as *const f64,
                     rsa as isize,
                     csa as isize,
                     b.as_ptr() as *const f64,
                     rsb as isize,
                     csb as isize,
-                    std::mem::transmute_copy(&beta),
+                    core::mem::transmute_copy(&beta),
                     self.as_mut_ptr() as *mut f64,
                     rsc as isize,
                     csc as isize,
@@ -1041,7 +1041,7 @@ impl<T: ComplexField<RealField = T> + Copy> DMatrix<T> {
 
     /// Returns a mutable view of the columns in `range` (e.g. `start..` or `a..b`).
     #[inline]
-    pub fn columns_range_mut(&mut self, range: std::ops::Range<usize>) -> MatrixViewMut<'_, T> {
+    pub fn columns_range_mut(&mut self, range: core::ops::Range<usize>) -> MatrixViewMut<'_, T> {
         let n = range.end - range.start;
         MatrixViewMut {
             data: &mut self.data
@@ -1053,7 +1053,7 @@ impl<T: ComplexField<RealField = T> + Copy> DMatrix<T> {
     }
 }
 
-impl<T: ComplexField<RealField = T> + Copy> std::ops::Index<(usize, usize)> for DMatrix<T> {
+impl<T: ComplexField<RealField = T> + Copy> core::ops::Index<(usize, usize)> for DMatrix<T> {
     type Output = T;
     #[inline]
     fn index(&self, (i, j): (usize, usize)) -> &T {
@@ -1061,7 +1061,7 @@ impl<T: ComplexField<RealField = T> + Copy> std::ops::Index<(usize, usize)> for 
     }
 }
 
-impl<T: ComplexField<RealField = T> + Copy> std::ops::IndexMut<(usize, usize)> for DMatrix<T> {
+impl<T: ComplexField<RealField = T> + Copy> core::ops::IndexMut<(usize, usize)> for DMatrix<T> {
     #[inline]
     fn index_mut(&mut self, (i, j): (usize, usize)) -> &mut T {
         &mut self.data[i + j * self.col_stride]
@@ -1218,7 +1218,7 @@ impl<'a, T: ComplexField<RealField = T> + Copy> MatrixView<'a, T> {
     }
 }
 
-impl<'a, T: ComplexField<RealField = T> + Copy> std::ops::Index<(usize, usize)>
+impl<'a, T: ComplexField<RealField = T> + Copy> core::ops::Index<(usize, usize)>
     for MatrixView<'a, T>
 {
     type Output = T;
@@ -1228,7 +1228,7 @@ impl<'a, T: ComplexField<RealField = T> + Copy> std::ops::Index<(usize, usize)>
     }
 }
 
-impl<'a, T: ComplexField<RealField = T> + Copy> std::ops::IndexMut<(usize, usize)>
+impl<'a, T: ComplexField<RealField = T> + Copy> core::ops::IndexMut<(usize, usize)>
     for MatrixViewMut<'a, T>
 {
     #[inline]
@@ -1237,7 +1237,7 @@ impl<'a, T: ComplexField<RealField = T> + Copy> std::ops::IndexMut<(usize, usize
     }
 }
 
-impl<'a, T: ComplexField<RealField = T> + Copy> std::ops::Index<(usize, usize)>
+impl<'a, T: ComplexField<RealField = T> + Copy> core::ops::Index<(usize, usize)>
     for MatrixViewMut<'a, T>
 {
     type Output = T;
@@ -1430,14 +1430,14 @@ impl<'a, T: ComplexField<RealField = T> + Copy> MatrixViewMut<'a, T> {
                     nrows2,
                     ncols2,
                     ncols3,
-                    std::mem::transmute_copy(&alpha),
+                    core::mem::transmute_copy(&alpha),
                     a.as_ptr() as *const f64,
                     rsa as isize,
                     csa as isize,
                     b.as_ptr() as *const f64,
                     rsb as isize,
                     csb as isize,
-                    std::mem::transmute_copy(&beta),
+                    core::mem::transmute_copy(&beta),
                     self.data.as_mut_ptr() as *mut f64,
                     rsc as isize,
                     csc as isize,
@@ -2133,7 +2133,7 @@ impl<T: ComplexField<RealField = T> + Copy + PartialOrd> DMatrix<T> {
     }
 }
 
-impl<T: ComplexField<RealField = T> + Copy> std::ops::Add for DMatrix<T> {
+impl<T: ComplexField<RealField = T> + Copy> core::ops::Add for DMatrix<T> {
     type Output = DMatrix<T>;
     #[inline]
     fn add(mut self, rhs: DMatrix<T>) -> DMatrix<T> {
@@ -2142,7 +2142,7 @@ impl<T: ComplexField<RealField = T> + Copy> std::ops::Add for DMatrix<T> {
     }
 }
 
-impl<T: ComplexField<RealField = T> + Copy> std::ops::AddAssign for DMatrix<T> {
+impl<T: ComplexField<RealField = T> + Copy> core::ops::AddAssign for DMatrix<T> {
     #[inline]
     fn add_assign(&mut self, rhs: DMatrix<T>) {
         assert_eq!(

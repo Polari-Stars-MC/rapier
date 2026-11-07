@@ -35,8 +35,8 @@
 //!   `ForceContribution`s. Knows its own `kind()` and `persistence()`, and
 //!   implements frame-end cleanup (`end_frame`/`clear`).
 
-use std::collections::HashMap;
-use std::vec::Vec;
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 
 #[cfg(feature = "serde-serialize")]
 use serde::{Deserialize, Serialize};
@@ -76,7 +76,7 @@ pub enum Persistence {
 ///
 /// New force kinds are added here; a container simply stores the matching
 /// `ForceKind` and a [`Persistence`] flag.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 #[non_exhaustive]
 pub enum ForceKind {
@@ -188,6 +188,11 @@ pub struct KindContainer {
     kind: ForceKind,
     persistence: Persistence,
     entries: Vec<ForceEntry>,
+    /// Monotonic counter backing auto-assigned ids, so an auto id is never reused
+    /// after a removal (`remove(id)` matches the *first* entry with that id; a
+    /// colliding reuse could delete the wrong contribution).
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    next_id: u64,
 }
 
 impl KindContainer {
@@ -197,16 +202,26 @@ impl KindContainer {
             kind,
             persistence,
             entries: Vec::new(),
+            next_id: 1,
         }
     }
 
     /// Push a contribution, returning its id (auto-assigned if `id == 0`).
     pub fn push(&mut self, mut entry: ForceEntry) -> u64 {
         if entry.id == 0 {
-            // Deterministic auto-id from current length + 1 (0 reserved as "auto").
-            entry.id = (self.entries.len() as u64).wrapping_add(1);
-            if entry.id == 0 {
-                entry.id = 1;
+            // Deterministic auto-id from a monotonic counter (0 reserved as "auto").
+            // Never reused, so a stale id can never address a newer entry.
+            entry.id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1);
+            if self.next_id == 0 {
+                // u64 wraparound: skip the reserved 0 sentinel.
+                self.next_id = 1;
+            }
+        } else if entry.id >= self.next_id {
+            // Explicit ids reserve their value so a later auto id cannot collide.
+            self.next_id = entry.id.wrapping_add(1);
+            if self.next_id == 0 {
+                self.next_id = 1;
             }
         }
         let id = entry.id;
@@ -249,7 +264,13 @@ impl ForceContainer for KindContainer {
 }
 
 /// Per-body map of force containers, classified by [`ForceKind`].
-pub type BodyForceContainers = HashMap<ForceKind, KindContainer>;
+///
+/// A `BTreeMap` (sorted by `ForceKind`) rather than a hash map so that
+/// [`compute_body_effective_forces`] sums containers in a **fixed, run-to-run
+/// identical order** — floating-point addition is not associative, so a
+/// randomly-ordered map would break bit-identical determinism whenever a body
+/// holds two or more force kinds.
+pub type BodyForceContainers = BTreeMap<ForceKind, KindContainer>;
 
 /// Sum all force contributions of a body into its effective force/torque.
 ///
@@ -298,28 +319,47 @@ pub fn compute_body_effective_forces(rb: &mut RigidBody, gravity_container: &Kin
     rb.forces.torque = eff.torque;
 }
 
-/// Drain every transient (per-step) force container on a body.
+/// Drain every transient (per-step) force container on a body, **except** the
+/// solver-emergent observation kinds (`Friction` / `ContactReaction`), which are
+/// never summed into the effective force and are managed by the contact-force
+/// bridge (see [`drain_contact_observation_containers`]).
 ///
-/// Called at frame end so one-shot / event / contact forces do not leak into
-/// the next step, while persistent containers (gravity, steady thrust) keep
-/// their entries — eliminating the manual `reset_forces` ritual.
+/// Called at frame end so one-shot / event forces do not leak into the next step,
+/// while persistent containers (gravity, steady thrust) keep their entries —
+/// eliminating the manual `reset_forces` ritual.
 pub fn drain_transient_forces(rb: &mut RigidBody) {
+    drain_transient_containers(rb, false);
+}
+
+/// Drain only the solver-emergent observation containers (`Friction` /
+/// `ContactReaction`) of a body. Runs at step start (before the CCD substep loop):
+/// those containers are rebuilt by the contact-force bridge after the solve, so
+/// clearing them at step start removes last step's readout without touching the
+/// user transient forces that must survive until end of step.
+pub fn drain_contact_observation_containers(rb: &mut RigidBody) {
+    drain_transient_containers(rb, true);
+}
+
+/// Shared drain: clears transient containers. When `only_observation` is set,
+/// only the solver-emergent observation kinds are cleared; otherwise they are
+/// the only ones *skipped* (they are never summed into the effective force).
+fn drain_transient_containers(rb: &mut RigidBody, only_observation: bool) {
     // No containers at all → nothing to drain. Early-return before taking any
     // mutable borrow so we never trip the body's "modified" flag during steady
     // state (which would force an island rebuild / active-set epoch bump).
     if rb.force_containers.is_empty() {
         return;
     }
-    let mut drained_any = false;
     for container in rb.force_containers.values_mut() {
+        let is_observation = container.kind() == ForceKind::Friction
+            || container.kind() == ForceKind::ContactReaction;
+        if is_observation != only_observation {
+            continue;
+        }
         if container.persistence() == Persistence::Transient && !container.entries.is_empty() {
             container.end_frame();
-            drained_any = true;
         }
     }
-    // If nothing was actually cleared, avoid leaving a dangling mutable borrow
-    // that some callers interpret as a modification.
-    let _ = drained_any;
 }
 
 /// Bridge the contact solver's *emergent* normal + friction impulses into the
@@ -399,10 +439,14 @@ pub fn bridge_solver_contact_forces(
         };
 
         // Body 1 gets +reaction / +friction; body 2 gets the opposite.
-        if let Some(rb) = bodies.get_mut(rb1) {
+        // `get_mut_internal` (not the public `get_mut`): this is an observation
+        // write-back, not a user change — the public getter would mark every
+        // touching body as modified each step, bumping the active-set epoch and
+        // forcing full solver-graph rebuilds.
+        if let Some(rb) = bodies.get_mut_internal(rb1) {
             write_contact_observation(rb, reaction, friction, r_torque, f_torque);
         }
-        if let Some(rb) = bodies.get_mut(rb2) {
+        if let Some(rb) = bodies.get_mut_internal(rb2) {
             write_contact_observation(rb, -reaction, -friction, -r_torque, -f_torque);
         }
     }

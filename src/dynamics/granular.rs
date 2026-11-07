@@ -27,7 +27,9 @@
 
 use crate::alloc_prelude::Vec;
 use crate::math::{Real, Vector};
-use std::collections::HashMap;
+// Deterministic, no_std-friendly lookup table (foldhash `FixedState`; buckets are
+// only ever `get`/`entry`-accessed, never iterated).
+use parry::utils::hashmap::HashMap;
 
 /// A single DEM granular particle.
 #[derive(Clone, Debug)]
@@ -137,6 +139,11 @@ impl GranularWorld {
         if n == 0 {
             return;
         }
+        // Same timestep contract as the rigid pipeline: a non-positive or
+        // non-finite dt must not integrate.
+        if !dt.is_finite() || dt <= 0.0 {
+            return;
+        }
         let p = self.params;
 
         // (1) Pairwise contact forces via a uniform spatial hash broad-phase
@@ -149,8 +156,10 @@ impl GranularWorld {
         for part in &self.particles {
             r_max = r_max.max(part.radius);
         }
-        let cell = 2.0 * r_max;
-        let mut cells: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+        // Floor the cell size: with all-zero radii cell would be 0 and `pos / 0`
+        // yields ±inf/NaN keys (saturating casts), collapsing the hash.
+        let cell = (2.0 * r_max).max(1.0e-6);
+        let mut cells: HashMap<(i64, i64, i64), Vec<usize>> = Default::default();
         for (idx, part) in self.particles.iter().enumerate() {
             let key = (
                 (part.pos.x / cell).floor() as i64,
@@ -182,11 +191,28 @@ impl GranularWorld {
                             let rij = pi - pj; // from j to i
                             let d2 = rij.length_squared();
                             let rsum = ri + self.particles[j].radius;
-                            if d2 >= rsum * rsum {
+                            // `!(d2 < rsum²)` (not `d2 >= rsum²`): a NaN d2 must be
+                            // skipped too, or one poisoned particle contaminates the
+                            // neighbours sharing its cell bucket.
+                            if !(d2 < rsum * rsum) {
                                 continue; // not touching
                             }
-                            let d = d2.max(1e-18).sqrt();
-                            let n_hat = rij / d; // from j toward i
+                            let (d, n_hat) = if d2 <= 1e-18 {
+                                // Exactly coincident pair: the normal direction is
+                                // undefined (0/0 → zero normal → zero repulsion, so
+                                // the pair overlaps forever). Pick a deterministic axis
+                                // by (i, j); the pair is handled once with equal and
+                                // opposite forces on i and j, conserving momentum.
+                                let axis = match (i + j) % 3 {
+                                    0 => Vector::new(1.0, 0.0, 0.0),
+                                    1 => Vector::new(0.0, 1.0, 0.0),
+                                    _ => Vector::new(0.0, 0.0, 1.0),
+                                };
+                                (1.0e-9, axis)
+                            } else {
+                                let d = d2.sqrt();
+                                (d, rij / d) // from j toward i
+                            };
                             let overlap = rsum - d;
                             let vij = vi - self.particles[j].vel;
                             let v_n = vij.dot(n_hat); // approaching when negative
@@ -210,8 +236,27 @@ impl GranularWorld {
                             };
 
                             let f = f_n + f_t;
-                            accels[i] += f / self.particles[i].mass;
-                            accels[j] -= f / self.particles[j].mass;
+                            // Guard the inverse mass: a non-positive/non-finite mass
+                            // would turn the force into inf/NaN. Such a particle is
+                            // treated as immovable (zero inverse mass).
+                            let inv_mi = {
+                                let m = self.particles[i].mass;
+                                if m.is_finite() && m > 0.0 {
+                                    1.0 / m
+                                } else {
+                                    0.0
+                                }
+                            };
+                            let inv_mj = {
+                                let m = self.particles[j].mass;
+                                if m.is_finite() && m > 0.0 {
+                                    1.0 / m
+                                } else {
+                                    0.0
+                                }
+                            };
+                            accels[i] += f * inv_mi;
+                            accels[j] -= f * inv_mj;
                         }
                     }
                 }
@@ -224,6 +269,18 @@ impl GranularWorld {
             let a = accels[i] + p.gravity;
             part.vel += a * dt;
             part.pos += part.vel * dt;
+        }
+
+        // Containment (mirrors the rigid pipeline's Quarantine): neutralize
+        // non-finite particle state so it cannot persist. With the NaN skip in the
+        // contact loop above, a poisoned particle only degrades itself.
+        for part in &mut self.particles {
+            if !part.vel.is_finite() {
+                part.vel = Vector::ZERO;
+            }
+            if !part.pos.is_finite() {
+                part.pos = Vector::ZERO;
+            }
         }
     }
 }

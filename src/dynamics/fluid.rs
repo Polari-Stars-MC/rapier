@@ -5,7 +5,9 @@
 //! intentionally independent of the SoA SIMD solver boundary so it can be
 //! compiled and unit-tested in isolation.
 //!
-//! ## Design notes (see `.hermes/plans/2026-08-30_fluid-sph-roadmap.md`)
+//! ## Design notes
+//!
+//! Roadmap history is tracked in the project's planning docs (not shipped).
 //!
 //! * A fluid is a cloud of `FluidParticle`s. Each carries position, velocity,
 //!   accumulated force, mass, and (per-step) density / pressure.
@@ -171,6 +173,11 @@ impl FluidWorld {
         if n == 0 {
             return;
         }
+        // Same timestep contract as the rigid pipeline: a non-positive or
+        // non-finite dt must not integrate.
+        if !dt.is_finite() || dt <= 0.0 {
+            return;
+        }
         let h = self.params.smoothing_radius;
         let h2 = h * h;
         let k = self.params.gas_constant;
@@ -227,12 +234,41 @@ impl FluidWorld {
                 let p_j = self.particles[j].pressure;
                 let rij = pi - pj; // from j to i
                 let d2 = rij.length_squared();
-                if d2 >= h2 || d2 <= 1e-18 {
+                // `!(d2 < h2)` (not `d2 >= h2`): a NaN d2 must be skipped too, or one
+                // poisoned particle would contaminate every neighbour's acceleration.
+                if !(d2 < h2) {
                     continue;
                 }
-                let d = d2.sqrt();
+                let (d, grad) = if d2 <= 1e-18 {
+                    // Exactly coincident pair: the spiky gradient direction is
+                    // undefined (0/0) and would be zero, so the pair would never
+                    // separate. Use a deterministic axis chosen by the (i, j) index
+                    // pair and a small nominal distance: the spiky magnitude at r≈0
+                    // is bounded (~45/(π h⁴)), and the (i,j)/(j,i) loop iterations
+                    // apply equal-and-opposite forces, conserving momentum.
+                    let axis = {
+                        #[cfg(feature = "dim3")]
+                        {
+                            match (i + j) % 3 {
+                                0 => Vector::new(1.0, 0.0, 0.0),
+                                1 => Vector::new(0.0, 1.0, 0.0),
+                                _ => Vector::new(0.0, 0.0, 1.0),
+                            }
+                        }
+                        #[cfg(feature = "dim2")]
+                        {
+                            Vector::new(1.0, 0.0)
+                        }
+                    };
+                    let dist = 1.0e-9;
+                    let diff = h - dist;
+                    let mag = 45.0 / (core::f64::consts::PI as Real * h.powi(6)) * diff * diff;
+                    (dist, -axis * mag)
+                } else {
+                    let d = d2.sqrt();
+                    (d, Self::spiky_gradient(rij, h))
+                };
                 // Pressure force (symmetrised): -Σ m_j (p_i/ρ_i² + p_j/ρ_j²) ∇W_ij
-                let grad = Self::spiky_gradient(rij, h);
                 pressure_force +=
                     self.particles[j].mass * (p_i / (rho_i * rho_i) + p_j / (rho_j * rho_j)) * grad;
                 // Viscosity force: μ Σ m_j (v_j − v_i)/ρ_j ∇²W_ij
@@ -258,6 +294,18 @@ impl FluidWorld {
             let p = &mut self.particles[i];
             p.vel += a * dt;
             p.pos += p.vel * dt;
+        }
+
+        // Containment (mirrors the rigid pipeline's Quarantine): a non-finite
+        // particle state must not persist — neutralize it. With the NaN skip in the
+        // force loop above, a poisoned particle only degrades itself.
+        for p in &mut self.particles {
+            if !p.vel.is_finite() {
+                p.vel = Vector::ZERO;
+            }
+            if !p.pos.is_finite() {
+                p.pos = Vector::ZERO;
+            }
         }
     }
 }

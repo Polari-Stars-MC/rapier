@@ -6,7 +6,9 @@
 //! the `velocities` / `accelerations` nalgebra buffers) so it can be compiled and
 //! unit-tested in isolation.
 //!
-//! ## Design notes (see `.hermes/plans/2026-08-24_soft-body-roadmap.md`)
+//! ## Design notes
+//!
+//! Roadmap history is tracked in the project's planning docs (not shipped).
 //!
 //! * A soft body is a cloud of point masses (`SoftParticle`) connected by
 //!   Hookean springs (`Spring`). Springs carry `stiffness` (`k`) and `damping`
@@ -30,8 +32,11 @@ use crate::dynamics::{
     force_containers::{ForceEntry, ForceKind, KindContainer, Persistence},
 };
 use crate::math::{AngVector, Real, Vector};
-use std::collections::{HashMap, HashSet};
-use std::vec::Vec;
+// Deterministic, no_std-friendly hash containers (foldhash `FixedState`: a fixed
+// seed, so lookup tables do not depend on per-process RandomState ordering).
+use alloc::vec::Vec;
+use parry::utils::hashmap::HashMap;
+use parry::utils::hashset::HashSet;
 
 /// `ForceKind::Custom` discriminator for soft-body internal spring/damping forces.
 /// Routed through `force_containers` so they share the same `Persistent` lifecycle
@@ -781,8 +786,8 @@ impl SoftBody {
         self.corotated = None;
     }
     /// Phase 30: enables the Neo-Hookean logarithmic volume energy with the
-    /// given volumetric `stiffness` (compliance = `stiffness/dt²`; larger =
-    /// closer to incompressible). Returns `false` for non-finite values or
+    /// given volumetric `stiffness` k (larger = closer to incompressible; the XPBD
+    /// compliance is α̃ = 1/(k·dt²)). Returns `false` for non-finite values or
     /// `stiffness < 0`.
     pub fn set_neo_hookean(&mut self, stiffness: Real) -> bool {
         if !stiffness.is_finite() || stiffness < 0.0 {
@@ -962,7 +967,7 @@ impl SoftBody {
         // Inverse-mass view aligned to particle order (read by the projection helper).
         let w: Vec<Real> = self.particles.iter().map(|p| p.inv_mass).collect();
         // Structural neighbour set: (min,max) of every distance-constraint edge.
-        let mut neighbours: HashSet<(usize, usize)> = HashSet::new();
+        let mut neighbours: HashSet<(usize, usize)> = Default::default();
         for c in &self.distance_constraints {
             let (a, b) = (c.a, c.b);
             let key = if a <= b { (a, b) } else { (b, a) };
@@ -970,7 +975,7 @@ impl SoftBody {
         }
         // Build spatial hash of free-particle indices.
         let cell = d;
-        let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+        let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = Default::default();
         let mut free: Vec<usize> = Vec::new();
         for (i, p) in self.particles.iter().enumerate() {
             if p.inv_mass == 0.0 {
@@ -1179,6 +1184,13 @@ impl SoftBody {
         if self.sleeping {
             return;
         }
+        // A zero/negative timestep would make XPBD compliance `α = c/dt²` infinite
+        // or sign-flipped and the velocity recovery `(pos-prev)/dt` divide by zero,
+        // poisoning every particle with NaN. The rigid pipeline early-returns for
+        // dt <= 0 (substep.rs); mirror that contract here.
+        if !dt.is_finite() || dt <= 0.0 {
+            return;
+        }
         // Phase 9: remove over-stretched structural edges before integrating.
         // (No-op unless `tear_strain` is `Some`.)
         self.tear();
@@ -1213,6 +1225,9 @@ impl SoftBody {
     pub fn step_mass_spring(&mut self, dt: Real) {
         if self.sleeping {
             return;
+        }
+        if !dt.is_finite() || dt <= 0.0 {
+            return; // avoid NaN from velocity recovery (pos-prev)/dt
         }
         self.compute_forces();
         self.integrate(dt);
@@ -1261,6 +1276,9 @@ impl SoftBody {
     pub fn step_implicit_euler(&mut self, dt: Real) {
         if self.sleeping {
             return;
+        }
+        if !dt.is_finite() || dt <= 0.0 {
+            return; // avoid 1/dt NaN in the linear solve
         }
         // Assemble fₙ (gravity + springs + pressure + wind) into the per-particle force.
         self.compute_forces();
@@ -1500,6 +1518,7 @@ impl SoftBody {
     pub fn subdivide_tetrahedra(&mut self, max_edge_len: Real) -> usize {
         let src_tets: Vec<[u32; 4]> = self.tetrahedra.clone();
         let src_rests: Vec<Real> = self.tetra_rest_volumes.clone();
+        let src_shapes: Vec<[[Real; 3]; 3]> = self.tetra_rest_shapes.clone();
         if src_tets.is_empty() {
             return 0;
         }
@@ -1507,6 +1526,7 @@ impl SoftBody {
         let adaptive = max_edge_len.is_finite();
         let mut new_tets: Vec<[u32; 4]> = Vec::with_capacity(src_tets.len() * 4);
         let mut new_rests: Vec<Real> = Vec::with_capacity(src_tets.len() * 4);
+        let mut new_shapes: Vec<[[Real; 3]; 3]> = Vec::with_capacity(src_tets.len() * 4);
         let mut split_count = 0usize;
         for (ti, &tet) in src_tets.iter().enumerate() {
             let [a, b, c, d] = tet;
@@ -1527,6 +1547,9 @@ impl SoftBody {
                 // Keep the parent tet unchanged.
                 new_tets.push(tet);
                 new_rests.push(src_rests[ti]);
+                if src_shapes.len() == src_tets.len() {
+                    new_shapes.push(src_shapes[ti]);
+                }
                 continue;
             }
             // Centroid particle (mean position + mean inverse mass).
@@ -1545,16 +1568,37 @@ impl SoftBody {
                 bound_body: None,
                 bound_local: Vector::ZERO,
             });
-            // Four sub-tetrahedra; each sub-rest-volume = 1/4 of the parent.
-            let sub_rest = src_rests[ti] * 0.25;
+            // Four sub-tetrahedra. Their rest volumes are each sub-tet's *current*
+            // signed volume, not a blanket `parent/4`: the sub-tet vertex orderings
+            // (`[m,a,b,c]` vs `[m,a,b,d]`, …) alternate orientation, so a signed
+            // `C = V_signed − V0` constraint with a uniform positive rest would arm
+            // every other sub-tet with a constant violation at split time. The
+            // current signed volume preserves the parent's orientation convention
+            // exactly, and the four values sum to the parent's signed volume.
             for sub in [[m, a, b, c], [m, a, b, d], [m, a, c, d], [m, b, c, d]] {
+                let (p0, p1, p2, p3) = (
+                    self.particles[sub[0] as usize].pos,
+                    self.particles[sub[1] as usize].pos,
+                    self.particles[sub[2] as usize].pos,
+                    self.particles[sub[3] as usize].pos,
+                );
+                let sub_rest = (p1 - p0).cross(p2 - p0).dot(p3 - p0) / 6.0;
                 new_tets.push(sub);
                 new_rests.push(sub_rest);
+                // Corotated rest shapes: snapshot the split-time sub-tet so the
+                // shapes stay index-aligned with the new tetrahedra (a misaligned
+                // shape would apply one tet's rest state to a different tet).
+                if src_shapes.len() == src_tets.len() {
+                    new_shapes.push(rest_shape_matrix(p0, p1, p2, p3));
+                }
             }
             split_count += 1;
         }
         self.tetrahedra = new_tets;
         self.tetra_rest_volumes = new_rests;
+        if new_shapes.len() == self.tetrahedra.len() {
+            self.tetra_rest_shapes = new_shapes;
+        }
         split_count
     }
 
@@ -1639,25 +1683,25 @@ impl SoftBody {
 
     /// Phase 9: enables/disables tearing. `strain` is the max allowed strain
     /// `(|len| − rest)/rest` before a structural edge snaps. Pass `None` to
-    /// disable (default). A value ≤ 0 tears immediately on any stretch.
+    /// disable (default). A value ≤ 0 is treated as inert (no tearing): tearing
+    /// on every edge at the first step would destroy the body outright.
     /// Phase 9/27: enables/disables tearing by **strain** threshold. `strain` is
     /// the max allowed strain `(|len| − rest)/rest` before a structural edge
-    /// snaps. Pass `None` to disable (default). A value ≤ 0 tears immediately on
-    /// any stretch.
+    /// snaps. Pass `None` to disable (default). A value ≤ 0 is treated as inert.
     pub fn set_tear_strain(&mut self, strain: Option<Real>) {
         self.tear = strain.map(TearCriterion::Strain);
     }
 
     /// Phase 27: enables/disables tearing by **axial stress** threshold. `stress`
     /// is the max allowed `|k·(len − rest)|` before an edge snaps. Pass `None` to
-    /// disable. A value ≤ 0 tears immediately.
+    /// disable. A value ≤ 0 is treated as inert (no tearing).
     pub fn set_tear_stress(&mut self, stress: Option<Real>) {
         self.tear = stress.map(TearCriterion::Stress);
     }
 
     /// Phase 27: enables/disables tearing by **strain-energy** (fracture-toughness)
     /// threshold. `energy` is the max allowed `½·k·(len − rest)²` before an edge
-    /// snaps. Pass `None` to disable. A value ≤ 0 tears immediately.
+    /// snaps. Pass `None` to disable. A value ≤ 0 is treated as inert (no tearing).
     pub fn set_tear_energy(&mut self, energy: Option<Real>) {
         self.tear = energy.map(TearCriterion::Energy);
     }
@@ -1805,7 +1849,7 @@ impl SoftBody {
             }
         }
         let broken_dc: HashSet<usize> = {
-            let mut s = HashSet::new();
+            let mut s: HashSet<usize> = Default::default();
             for i in 0..self.distance_constraints.len() {
                 if !keep_dc.iter().any(|(ki, _)| *ki == i) {
                     s.insert(i);
@@ -2022,6 +2066,23 @@ impl SoftBody {
             .collect();
         self.tetrahedra = remapped;
         self.tetra_rest_volumes = kept_volumes;
+        // Corotated rest shapes must stay index-aligned with the surviving
+        // tetrahedra: a misaligned shape would apply one tet's rest state to a
+        // different tet (silent wrong elasticity). `keep` is indexed by the
+        // pre-filter tet order, and `tetra_rest_shapes` is parallel to it, so the
+        // same filter applies. Only maintained when the snapshot exists
+        // (`set_corotated` was called); otherwise `set_corotated` re-snapshots
+        // from scratch on enable.
+        if self.tetra_rest_shapes.len() == keep.len() {
+            let kept_shapes: Vec<[[Real; 3]; 3]> = self
+                .tetra_rest_shapes
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| keep[*i])
+                .map(|(_, s)| *s)
+                .collect();
+            self.tetra_rest_shapes = kept_shapes;
+        }
 
         // Triangles: drop any containing `index`; otherwise shift each index down.
         let keep_tri: Vec<bool> = self
@@ -2049,7 +2110,8 @@ impl SoftBody {
         true
     }
 
-    /// Total (sum of absolute) signed volume of all tetrahedra — a finite,
+    /// Sum of per-tetrahedron **volume ratios** `|V_current| / |V_rest|` over all
+    /// tetrahedra (at rest the value is the tetrahedron count) — a finite,
     /// deformation-sensitive scalar useful for regression tests.
     pub fn total_volume(&self) -> Real {
         self.tetra_rest_volumes
@@ -2086,6 +2148,9 @@ impl SoftBody {
     pub fn step_xpbd(&mut self, dt: Real) {
         if self.sleeping {
             return;
+        }
+        if !dt.is_finite() || dt <= 0.0 {
+            return; // XPBD compliance α/dt² would be inf/sign-flipped
         }
         let iterations = match self.solver {
             SoftSolver::Xpbd { iterations, .. } => iterations,
@@ -2230,7 +2295,15 @@ impl SoftBody {
                 // Phase 30: nonlinear (Neo-Hookean ln(J)) residual when enabled;
                 // otherwise the linear V − V₀ volume constraint.
                 if let Some(kh) = self.neo_hookean {
-                    let nh_alpha = kh / (dt * dt);
+                    // The setter documents the parameter as volumetric *stiffness*
+                    // (larger = closer to incompressible), so convert to XPBD
+                    // compliance: α̃ = 1/(k·dt²). kh = 0 → α̃ = ∞ (no correction);
+                    // very large k → α̃ → 0 (rigid volume projection).
+                    let nh_alpha = if kh > 0.0 {
+                        1.0 / (kh * dt * dt)
+                    } else {
+                        Real::INFINITY
+                    };
                     solve_volume_constraint_nh(
                         &mut self.particles,
                         &t_idx[ti],
@@ -2357,7 +2430,7 @@ pub fn solve_cross_body_collisions(set: &mut SoftBodySet, dt: Real) {
                 let compliance = stiffness / (dt * dt);
                 let mut pos_a: Vec<Vector> = Vec::new();
                 let mut w_a: Vec<Real> = Vec::new();
-                let mut map_a: HashMap<usize, usize> = HashMap::new();
+                let mut map_a: HashMap<usize, usize> = Default::default();
                 for (oi, p) in pa.particles.iter().enumerate() {
                     if p.inv_mass != 0.0 {
                         map_a.insert(oi, pos_a.len());
@@ -2367,7 +2440,7 @@ pub fn solve_cross_body_collisions(set: &mut SoftBodySet, dt: Real) {
                 }
                 let mut pos_b: Vec<Vector> = Vec::new();
                 let mut w_b: Vec<Real> = Vec::new();
-                let mut map_b: HashMap<usize, usize> = HashMap::new();
+                let mut map_b: HashMap<usize, usize> = Default::default();
                 for (oi, p) in pb.particles.iter().enumerate() {
                     if p.inv_mass != 0.0 {
                         map_b.insert(oi, pos_b.len());
@@ -2376,7 +2449,7 @@ pub fn solve_cross_body_collisions(set: &mut SoftBodySet, dt: Real) {
                     }
                 }
                 let cell = d;
-                let mut grid: HashMap<(i64, i64, i64), Vec<(usize, bool)>> = HashMap::new();
+                let mut grid: HashMap<(i64, i64, i64), Vec<(usize, bool)>> = Default::default();
                 for (si, p) in pos_a.iter().enumerate() {
                     let key = (
                         (p.x / cell).floor() as i64,
@@ -2512,7 +2585,7 @@ pub fn solve_cohesion(set: &mut SoftBodySet, dt: Real) {
                 let compliance = stiffness / (dt * dt);
                 let mut pos_a: Vec<Vector> = Vec::new();
                 let mut w_a: Vec<Real> = Vec::new();
-                let mut map_a: HashMap<usize, usize> = HashMap::new();
+                let mut map_a: HashMap<usize, usize> = Default::default();
                 for (oi, p) in pa.particles.iter().enumerate() {
                     if p.inv_mass != 0.0 {
                         map_a.insert(oi, pos_a.len());
@@ -2522,7 +2595,7 @@ pub fn solve_cohesion(set: &mut SoftBodySet, dt: Real) {
                 }
                 let mut pos_b: Vec<Vector> = Vec::new();
                 let mut w_b: Vec<Real> = Vec::new();
-                let mut map_b: HashMap<usize, usize> = HashMap::new();
+                let mut map_b: HashMap<usize, usize> = Default::default();
                 for (oi, p) in pb.particles.iter().enumerate() {
                     if p.inv_mass != 0.0 {
                         map_b.insert(oi, pos_b.len());
@@ -2531,7 +2604,7 @@ pub fn solve_cohesion(set: &mut SoftBodySet, dt: Real) {
                     }
                 }
                 let cell = capture;
-                let mut grid: HashMap<(i64, i64, i64), Vec<(usize, bool)>> = HashMap::new();
+                let mut grid: HashMap<(i64, i64, i64), Vec<(usize, bool)>> = Default::default();
                 for (si, p) in pos_a.iter().enumerate() {
                     let key = (
                         (p.x / cell).floor() as i64,
@@ -2678,9 +2751,10 @@ fn solve_distance_constraint(
 /// place and accumulating the Lagrange multiplier into `*lambda`.
 ///
 /// Constraint: `C = V − V0` where `V` is the current signed volume. Gradients
-/// (Müller et al.):
-/// `∇_0 = −(e2×e3)/6`, `∇_1 = (e3×e1)/6`, `∇_2 = (e1×e2)/6`, `∇_3 = −(e1×e3)/6`
-/// (with `e_i = p_i − p_0`). The correction `Δp_i = w_i · Δλ · ∇_i`.
+/// (matching the official `cell_volume_gradients`):
+/// `∇_1 = (e2×e3)/6`, `∇_2 = (e3×e1)/6`, `∇_3 = (e1×e2)/6`, `∇_0 = −(∇_1+∇_2+∇_3)`
+/// (with `e_i = p_i − p_0`), so `Σ∇ = 0` and the projection conserves momentum.
+/// The correction `Δp_i = w_i · Δλ · ∇_i`.
 #[inline]
 fn solve_volume_constraint(
     particles: &mut [SoftParticle],
@@ -2703,10 +2777,13 @@ fn solve_volume_constraint(
     let vol = e1.cross(e2).dot(e3) / 6.0;
     let c_val = vol - rest_vol;
 
-    let g0 = e2.cross(e3) / -6.0;
-    let g1 = e3.cross(e1) / 6.0;
-    let g2 = e1.cross(e2) / 6.0;
-    let g3 = e1.cross(e3) / -6.0;
+    // Gradients of V = (e1·(e2×e3))/6 w.r.t. each vertex (matches the official
+    // `cell_volume_gradients`): ∇p1 = e2×e3/6, ∇p2 = e3×e1/6, ∇p3 = e1×e2/6,
+    // ∇p0 = −(∇p1+∇p2+∇p3), so Σ∇ = 0 (translation invariance / momentum conservation).
+    let g1 = e2.cross(e3) / 6.0;
+    let g2 = e3.cross(e1) / 6.0;
+    let g3 = e1.cross(e2) / 6.0;
+    let g0 = -(g1 + g2 + g3);
 
     let wa = w[ia];
     let wb = w[ib];
@@ -2764,16 +2841,28 @@ fn solve_volume_constraint_nh(
 
     let vol = e1.cross(e2).dot(e3) / 6.0;
     // J = V/V₀ floored at +1e-6: keeps ln finite even for inverted tets.
-    let j = (vol / rest_vol).max(1e-6);
+    let j_raw = vol / rest_vol;
+    let j = j_raw.max(1e-6);
     let c_val = j.ln();
 
-    // ∇C = (1/J) · ∇J = (1/J) · ∇V/V₀ — chain rule on the log.
-    let inv_j = 1.0 / j;
-    let s = inv_j / (6.0 * rest_vol);
-    let g0 = e2.cross(e3) * -s;
-    let g1 = e3.cross(e1) * s;
-    let g2 = e1.cross(e2) * s;
-    let g3 = e1.cross(e3) * -s;
+    // ∇C = (1/J) · ∇J = (1/J) · ∇V/V₀ — chain rule on the log. The ∇V factors match
+    // the official `cell_volume_gradients` (Σ∇ = 0, translation invariant). Below the
+    // J floor the clamped residual no longer varies with J, so the consistent
+    // sub-gradient is zero: keeping the residual-independent 1/ε direction there
+    // would inject a large constant push and oscillate instead of converging.
+    let g1 = e2.cross(e3) / 6.0;
+    let g2 = e3.cross(e1) / 6.0;
+    let g3 = e1.cross(e2) / 6.0;
+    let g0 = -(g1 + g2 + g3);
+    let s = if j_raw > 1e-6 {
+        1.0 / (j_raw * 6.0 * rest_vol)
+    } else {
+        0.0
+    };
+    let g1 = g1 * s;
+    let g2 = g2 * s;
+    let g3 = g3 * s;
+    let g0 = g0 * s;
 
     let (wa, wb, wc, wd) = (w[ia], w[ib], w[ic], w[id]);
     let mut denom = alpha;
@@ -2929,8 +3018,11 @@ fn quat_to_mat3(qw: Real, qx: Real, qy: Real, qz: Real) -> [[Real; 3]; 3] {
 }
 
 /// Phase 29 per-tet projection: shape matching toward the best-fit rotation of
-/// the rest shape, restricted to volume-preserving displacements (grad div-free
-/// ⇒ the tet's signed volume is unchanged by the correction).
+/// the rest shape. Goals are rigid rotations of the rest configuration about the
+/// tet's current centroid, and the correction is distributed over the movable
+/// vertices by inverse-mass share (XPBD convention: heavier vertices move less,
+/// pinned vertices do not move). A partial per-iteration relaxation, not a
+/// hard projection — the applied correction is *not* exactly volume-preserving.
 fn solve_corotated_tet(
     particles: &mut [SoftParticle],
     tet: &[u32; 4],
@@ -2950,49 +3042,43 @@ fn solve_corotated_tet(
         return;
     };
     let f_mat = mat3_mul(&p_mat, &t_inv);
-    // Closest rotation R = polar(F). Goal positions g_i = centroid + R·(rest edge)/1.
-    // Work with edge vectors: goal edges = R · rest edges.
+    // Closest rotation R = polar(F).
     let rot = polar_rotation(&f_mat);
-    let g0 = p0; // goal for vertex 0 = current p0 (pure deviatoric correction frame)
-    let _ = g0;
-    let centroid = Vector::new(
-        (p0.x + p1.x + p2.x + p3.x) * 0.25,
-        (p0.y + p1.y + p2.y + p3.y) * 0.25,
-        (p0.z + p1.z + p3.z) * 0.25,
-    );
-    let _ = centroid;
-    // Rest edge vectors (columns of rest matrix).
+    let rot_vec = |r: Vector| -> Vector {
+        Vector::new(
+            rot[0][0] * r.x + rot[0][1] * r.y + rot[0][2] * r.z,
+            rot[1][0] * r.x + rot[1][1] * r.y + rot[1][2] * r.z,
+            rot[2][0] * r.x + rot[2][1] * r.y + rot[2][2] * r.z,
+        )
+    };
+    // Rest edge vectors (columns of the stored rest matrix).
     let re1 = Vector::new(rest_inv[0][0], rest_inv[1][0], rest_inv[2][0]);
     let re2 = Vector::new(rest_inv[0][1], rest_inv[1][1], rest_inv[2][1]);
     let re3 = Vector::new(rest_inv[0][2], rest_inv[1][2], rest_inv[2][2]);
-    let ge1 = Vector::new(
-        rot[0][0] * re1.x + rot[0][1] * re1.y + rot[0][2] * re1.z,
-        rot[1][0] * re1.x + rot[1][1] * re1.y + rot[1][2] * re1.z,
-        rot[2][0] * re1.x + rot[2][1] * re1.y + rot[2][2] * re1.z,
+    // Rest positions relative to the rest centroid: with vertex 0 at the origin
+    // the rest centroid sits at (e1+e2+e3)/4, so r_i = e_i − (e1+e2+e3)/4 and
+    // r_0 = −(e1+e2+e3)/4. Rotating these about the *current* centroid gives
+    // rigid goals for every vertex — including vertex 0.
+    let rest_centroid_edge = (re1 + re2 + re3) * 0.25;
+    let centroid = Vector::new(
+        (p0.x + p1.x + p2.x + p3.x) * 0.25,
+        (p0.y + p1.y + p2.y + p3.y) * 0.25,
+        (p0.z + p1.z + p2.z + p3.z) * 0.25,
     );
-    let ge2 = Vector::new(
-        rot[0][0] * re2.x + rot[0][1] * re2.y + rot[0][2] * re2.z,
-        rot[1][0] * re2.x + rot[1][1] * re2.y + rot[1][2] * re2.z,
-        rot[2][0] * re2.x + rot[2][1] * re2.y + rot[2][2] * re2.z,
-    );
-    let ge3 = Vector::new(
-        rot[0][0] * re3.x + rot[0][1] * re3.y + rot[0][2] * re3.z,
-        rot[1][0] * re3.x + rot[1][1] * re3.y + rot[1][2] * re3.z,
-        rot[2][0] * re3.x + rot[2][1] * re3.y + rot[2][2] * re3.z,
-    );
-    // Goal positions anchored at the mass-weighted centroid (rotation-only ⇒
-    // volume-preserving correction frame).
-    let g1 = p0 + ge1;
-    let g2 = p0 + ge2;
-    let g3 = p0 + ge3;
-    // Per-vertex correction, scaled by stiffness (per-iteration relaxation).
-    // Standard XPBD shape matching: Δp_i = k · (g_i − p_i) on MOVABLE vertices
-    // (goal frame anchored at p0 with the extracted rotation R). No explicit
-    // centroid-offset subtraction — with pinned anchors the naive subtraction
-    // cancels the correction on the single free vertex of a 3-pinned tet.
-    let k = stiffness * 0.25;
+    let g0 = centroid + rot_vec(-rest_centroid_edge);
+    let g1 = centroid + rot_vec(re1 - rest_centroid_edge);
+    let g2 = centroid + rot_vec(re2 - rest_centroid_edge);
+    let g3 = centroid + rot_vec(re3 - rest_centroid_edge);
+    // Per-vertex correction distributed by inverse-mass share: Δp_i = k · w_i/Σw · (g_i − p_i).
+    // Equal masses give each vertex the k/4 share (matching the historical
+    // relaxation magnitude); pinned vertices (w = 0) receive nothing.
     let (wa, wb, wc, wd) = (w[ia], w[ib], w[ic], w[id]);
-    let d0 = p0 - p0;
+    let w_sum = wa + wb + wc + wd;
+    if w_sum <= 0.0 {
+        return; // fully pinned tet
+    }
+    let k = stiffness / w_sum;
+    let d0 = g0 - p0;
     let d1 = g1 - p1;
     let d2 = g2 - p2;
     let d3 = g3 - p3;
@@ -3000,7 +3086,7 @@ fn solve_corotated_tet(
         if wv == 0.0 {
             return Vector::new(0.0, 0.0, 0.0);
         }
-        dir_scaled(d, k)
+        dir_scaled(d, k * wv)
     };
     particles[ia].pos += corr(d0, wa);
     particles[ib].pos += corr(d1, wb);
@@ -3018,6 +3104,12 @@ pub struct SoftBodySet {
     /// indices, so removal is id-preserving and never reshuffles live bodies
     /// (important for the FFI layer that hands `SoftBodyId`s to callers).
     bodies: Vec<Option<SoftBody>>,
+    /// Rigid bodies whose soft-spring container was written by the last
+    /// [`SoftBodySet::write_spring_forces`] call. Cleared at the start of the next
+    /// call so bodies that lost all bindings (soft body destroyed / particle
+    /// detached / soft body asleep) do not keep a stale, never-drained
+    /// `Persistent` spring force.
+    last_spring_bodies: Vec<RigidBodyHandle>,
 }
 
 impl SoftBodySet {
@@ -3112,6 +3204,10 @@ impl SoftBodySet {
 
     /// Advances every live soft body by `dt` (sleeping bodies are skipped).
     pub fn step(&mut self, dt: Real) {
+        // See `SoftBody::step`: dt <= 0 / non-finite must not integrate.
+        if !dt.is_finite() || dt <= 0.0 {
+            return;
+        }
         for body in self.bodies.iter_mut().flatten() {
             body.step(dt);
         }
@@ -3185,12 +3281,29 @@ impl SoftBodySet {
     /// force through the standard `compute_body_effective_forces` path — no new
     /// solver code, identical lifecycle handling to gravity/thrust.
     ///
-    /// The soft container for each body is cleared and rebuilt each call so the
-    /// forces stay in sync with the current particle positions (a `Persistent`
-    /// container survives frame-end draining, but we own it and overwrite it).
-    /// Sleeping soft bodies are skipped entirely.
-    pub fn write_spring_forces(&self, bodies: &mut RigidBodySet) {
+    /// Each bound rigid body's soft container is cleared and rebuilt **once per
+    /// call** (entries accumulate per body, not per particle), so a body bound by
+    /// several particles keeps every contribution. Bodies that received a container
+    /// last call but have no bound particle this call (soft body destroyed, particle
+    /// detached, soft body asleep) get their container removed, so no stale spring
+    /// force survives. Sleeping soft bodies are skipped entirely.
+    ///
+    /// Uses `get_mut_internal` so this observation/write pass does not mark bodies as
+    /// user-modified (which would bump the active-set epoch and force solver-graph
+    /// rebuilds every step).
+    pub fn write_spring_forces(&mut self, bodies: &mut RigidBodySet) {
         let kind = ForceKind::Custom(SOFT_SPRING_CUSTOM_ID);
+        // Clear the containers written by the previous call first, so bodies that
+        // lost all bindings do not keep a stale force.
+        let prev = core::mem::take(&mut self.last_spring_bodies);
+        for h in prev {
+            if let Some(rb) = bodies.get_mut_internal(h) {
+                rb.force_containers.remove(&kind);
+            }
+        }
+
+        // Accumulate one entry per bound particle, grouped by rigid body.
+        let mut per_body: Vec<(RigidBodyHandle, Vec<ForceEntry>)> = Vec::new();
         for body in self.bodies.iter().flatten() {
             if body.sleeping {
                 continue;
@@ -3198,24 +3311,38 @@ impl SoftBodySet {
             let spring = body.spring_damping_forces();
             for (i, p) in body.particles.iter().enumerate() {
                 let Some(h) = p.bound_body else { continue };
-                let rb = match bodies.get_mut(h) {
-                    Some(rb) => rb,
-                    None => continue,
-                };
-                // Clear + rebuild this body's soft-spring container.
-                rb.force_containers.remove(&kind);
                 let entry = ForceEntry {
                     id: i as u64 + 1,
                     force: spring[i],
                     torque: AngVector::ZERO,
                     point: Some(p.pos),
                 };
-                rb.force_containers
-                    .entry(kind)
-                    .or_insert_with(|| KindContainer::new(kind, Persistence::Persistent))
-                    .push(entry);
+                match per_body.iter_mut().find(|(bh, _)| *bh == h) {
+                    Some((_, entries)) => entries.push(entry),
+                    None => {
+                        let mut entries = Vec::new();
+                        entries.push(entry);
+                        per_body.push((h, entries));
+                    }
+                }
             }
         }
+
+        // Rebuild each affected body's soft-spring container once, in deterministic
+        // (handle) order.
+        per_body.sort_by_key(|(h, _)| h.into_raw_parts());
+        for (h, entries) in &per_body {
+            if let Some(rb) = bodies.get_mut_internal(*h) {
+                let container = rb
+                    .force_containers
+                    .entry(kind)
+                    .or_insert_with(|| KindContainer::new(kind, Persistence::Persistent));
+                for entry in entries {
+                    container.push(*entry);
+                }
+            }
+        }
+        self.last_spring_bodies = per_body.into_iter().map(|(h, _)| h).collect();
     }
 }
 

@@ -14,6 +14,7 @@
 //! AABB.
 
 use crate::geometry::Aabb;
+use crate::math::Real;
 use crate::parry::bounding_volume::BoundingVolume;
 use alloc::vec::Vec;
 use parry::math::Vector;
@@ -169,7 +170,7 @@ fn aabb_union(a: Aabb, b: Aabb) -> Aabb {
     )
 }
 
-fn aabb_center_axis(b: &Aabb, axis: usize) -> f64 {
+fn aabb_center_axis(b: &Aabb, axis: usize) -> Real {
     match axis {
         0 => (b.mins.x + b.maxs.x) * 0.5,
         1 => (b.mins.y + b.maxs.y) * 0.5,
@@ -177,7 +178,7 @@ fn aabb_center_axis(b: &Aabb, axis: usize) -> f64 {
     }
 }
 
-fn aabb_extent_axis(b: &Aabb, axis: usize) -> f64 {
+fn aabb_extent_axis(b: &Aabb, axis: usize) -> Real {
     match axis {
         0 => b.maxs.x - b.mins.x,
         1 => b.maxs.y - b.mins.y,

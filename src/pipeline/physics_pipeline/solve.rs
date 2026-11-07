@@ -253,12 +253,10 @@ impl PhysicsPipeline {
                     rb,
                     gravity_container,
                 );
-                // Drain transient (per-step) force containers now that their
-                // contributions were summed into `rb.forces`. Persistent
-                // containers keep their entries. Done here (inside the active-body
-                // loop) so we never iterate the whole set — which would bump the
-                // active-set epoch during steady state.
-                crate::dynamics::force_containers::drain_transient_forces(rb);
+                // NOTE: transient (per-step) force containers are NOT drained here.
+                // This traversal runs once per CCD substep; draining here would kill
+                // one-shot/event forces after the first substep. They are drained once
+                // per step at step level (substep.rs), after the CCD substep loop.
                 any_extra_iterations |=
                     rb.additional_solver_iterations() > 0 || rb.additional_pgs_iterations() > 0;
                 bid(rb, &islands.persistent, &mut split_bid);
@@ -293,7 +291,8 @@ impl PhysicsPipeline {
                             rb,
                             gravity_container,
                         );
-                        crate::dynamics::force_containers::drain_transient_forces(rb);
+                        // Transient containers are drained once per step (substep.rs),
+                        // not per CCD substep — see the serial branch note above.
                         any_extra |= rb.additional_solver_iterations() > 0
                             || rb.additional_pgs_iterations() > 0;
                         bid(rb, persistent, &mut chunk_bid);

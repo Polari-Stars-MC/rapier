@@ -47,6 +47,9 @@ impl WheelJoint {
             JointAxesMask::LIN_X | JointAxesMask::LIN_Z | JointAxesMask::ANG_Z,
         )
         .coupled_axes(JointAxesMask::LIN_Y)
+        // The suspension axis must carry limits so `suspension_rest_length()` can read
+        // them back; `motor_position` alone only sets the motor, not the limit range.
+        .limits(JointAxis::LinY, [0.0, rest_length])
         .motor_position(JointAxis::LinY, rest_length, stiffness, damping)
         .motor_model(JointAxis::LinY, MotorModel::ForceBased)
         .build();

@@ -3,7 +3,7 @@ use crate::dynamics::{IntegrationParameters, IslandManager, RigidBodySet};
 use crate::geometry::{
     BroadPhaseBvh, Collider, ColliderHandle, ColliderSet, CollisionEvent, NarrowPhase,
 };
-use crate::math::Real;
+use crate::math::{Real, Vector};
 use crate::parry::bounding_volume::Aabb;
 use crate::pipeline::{EventHandler, PhysicsHooks, QueryFilter};
 use crate::prelude::{ActiveEvents, CollisionEventFlags};
@@ -71,10 +71,13 @@ impl CCDSolver {
             if rb.is_dynamic() {
                 let moving_fast = if include_forces {
                     // Pre-solve (substep splitter): `next_position` isn't solved yet, use
-                    // the velocity-based estimate including forces.
+                    // the current velocity with forces, like `find_first_impact`. The last
+                    // solved motion (`ccd_vels`) is stale, or zero on a body's first step,
+                    // which would under-estimate speed and skip the substep split for
+                    // exactly the fast-moving bodies CCD exists for.
                     rb.ccd.is_moving_fast(
                         dt,
-                        &rb.ccd_vels,
+                        &rb.vels,
                         Some((&rb.forces, &rb.mprops)),
                         rb.mprops.max_extent(),
                     )
@@ -172,13 +175,19 @@ impl CCDSolver {
         narrow_phase: &NarrowPhase,
         hooks: &dyn PhysicsHooks,
         events: &dyn EventHandler,
-        // `true` when colliders/bodies were added, removed or modified by the
-        // user since the last step: the only ways a fixed target can appear,
-        // vanish or move, hence the fixed-target cache invalidation signal.
-        scene_changed: bool,
     ) {
         let dt = params.dt;
         let linear_slop = params.allowed_linear_error();
+
+        // Reset the per-step TOI witness: a body that swept freely this step must not keep
+        // reporting the previous step's hit — `ccd_point_of_impact`'s contract is "the last
+        // solve", not "the last hit ever". (Only the active bodies participate in this pass.)
+        for h in islands.active_bodies() {
+            if let Some(rb) = bodies.get_mut_internal(h) {
+                rb.ccd.toi_point = Vector::ZERO;
+                rb.ccd.toi_normal = Vector::ZERO;
+            }
+        }
 
         // NOTE: broad-phase AABBs are NOT enlarged to the swept volumes: only the fast body's
         // query box is swept; stationary targets keep their fat AABBs. Swept AABBs in
@@ -201,14 +210,15 @@ impl CCDSolver {
             );
             let (bvh, dispatcher) = (query_pipeline.bvh, query_pipeline.dispatcher);
             // Non-bullet fast bodies only hit fixed targets: sweep against the (small) cached
-            // fixed-collider list instead of the full BVH. Rebuilt — a full collider scan —
-            // only on scene changes, since fixed targets can't move otherwise.
+            // fixed-collider list instead of the full BVH. The cache is invalidated explicitly
+            // via `invalidate_fixed_targets_cache` (called by the pipeline on every user change
+            // and by hand for direct callers), so it only needs rebuilding when the prediction
+            // distance changes or after an invalidation.
             let prediction = params.prediction_distance();
-            let cache_valid = !scene_changed
-                && self
-                    .fixed_targets_cache
-                    .as_ref()
-                    .is_some_and(|(p, _)| *p == prediction);
+            let cache_valid = self
+                .fixed_targets_cache
+                .as_ref()
+                .is_some_and(|(p, _)| *p == prediction);
             if !cache_valid {
                 self.fixed_targets_cache = Some((
                     prediction,
@@ -445,7 +455,6 @@ mod ccd_tests {
             &narrow_phase,
             &(),
             &(),
-            true,
         );
 
         let a_pos = bodies.get(a_h).unwrap().pos.next_position.translation.x;
@@ -533,7 +542,6 @@ mod ccd_tests {
             &narrow_phase,
             &(),
             &(),
-            true,
         );
 
         let a_toi = bodies.get(a_h).unwrap().ccd_point_of_impact();

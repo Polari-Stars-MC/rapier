@@ -97,6 +97,12 @@ path = "../../src/lib.rs"
 required-features = ["dim3", "f64"]
 doctest = false # All doctests are written assuming the 3D f32 version.
 
+# The cross-thread-count determinism test drives `configure_thread_pool`,
+# which only exists under the `parallel` feature (the consumed configuration).
+[[test]]
+name = "force_container_determinism"
+required-features = ["dim3", "f64", "parallel"]
+
 [dependencies]
 glamx.workspace = true
 parry3d-f64.workspace = true

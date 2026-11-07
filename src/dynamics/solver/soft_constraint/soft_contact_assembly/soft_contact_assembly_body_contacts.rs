@@ -518,7 +518,9 @@ impl SoftConstraintsSet {
                                     point.fid1
                                 };
                                 let dominant = (0..element.len())
-                                    .max_by(|&a, &b| weights[a].partial_cmp(&weights[b]).unwrap())
+                                    // `total_cmp`: `partial_cmp` would panic if a weight
+                                    // were NaN (degenerate triangle / extreme coords).
+                                    .max_by(|&a, &b| weights[a].total_cmp(&weights[b]))
                                     .map(|k| element[k])
                                     .unwrap_or(0);
                                 Some((fid.0, dominant))

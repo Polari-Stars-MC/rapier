@@ -97,6 +97,11 @@ impl SoftBody {
     /// rest-length handling: a per-constraint active strain (`rest·(1 − γ)`) or a per-edge
     /// thermal expansion is expressed with it.
     pub fn set_edge_rest_length(&mut self, i: usize, rest_length: Real) {
+        // Reject non-finite / negative rest lengths: a NaN would poison the constraint
+        // rhs every step, a negative one is geometrically meaningless.
+        if !rest_length.is_finite() || rest_length < 0.0 {
+            return;
+        }
         if let Some(edge) = self.edges.get_mut(i) {
             edge.rest_length = rest_length;
             self.modified = true;

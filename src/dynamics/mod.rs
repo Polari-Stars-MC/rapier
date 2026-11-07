@@ -45,11 +45,11 @@ pub use self::force_containers::*;
 // soft-body system as `dynamics::soft_body` (below); the two must not share a
 // module name (`soft_body.rs` vs `soft_body/mod.rs` is a hard error) and must
 // not both glob-export `SoftBody` into `dynamics`.
-#[cfg(feature = "alloc")]
+#[cfg(all(feature = "alloc", feature = "dim3"))]
 pub mod soft_body_fork;
 
 // Fluid-body (SPH) support — Phase 0 foundation. Independent of the SoA SIMD
-// solver boundary; see `.hermes/plans/2026-08-30_fluid-sph-roadmap.md`.
+// solver boundary (roadmap history lives in the project's planning docs).
 #[cfg(feature = "alloc")]
 pub mod fluid;
 
@@ -57,6 +57,7 @@ pub mod fluid;
 // `fluid.rs` (particle cloud, naive O(n²) neighbours, semi-implicit Euler)
 // with a spring-damper + Coulomb-friction contact model.
 #[cfg(feature = "alloc")]
+#[cfg(all(feature = "alloc", feature = "dim3"))]
 pub mod granular;
 
 #[cfg(feature = "alloc")]

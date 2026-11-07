@@ -37,6 +37,11 @@ impl NarrowPhase {
         let mut contact_id_remap = HashMap::default();
 
         for collider in removed_colliders {
+            // Purge any explicitly-disabled pair referencing the removed collider:
+            // its handle generation never repeats, so the stale entry is dead weight
+            // (and would keep the sweep running forever otherwise).
+            self.disabled_collider_pairs
+                .retain(|pair, _| pair.collider1 != *collider && pair.collider2 != *collider);
             // NOTE: if the collider does not have any graph indices currently, there is nothing
             // to remove in the narrow-phase for this collider.
             if let Some(graph_idx) = self
@@ -696,27 +701,79 @@ impl NarrowPhase {
         broad_phase_events: &[BroadPhasePairEvent],
         events: &dyn EventHandler,
     ) {
-        // Phase B: clear any *existing* contact pair whose endpoints were explicitly
-        // disabled, regardless of whether its colliders were user-modified this step.
-        // `compute_contacts` only revisits pairs touching a modified collider, so a
-        // disabled pair between two settled bodies would otherwise keep its stale
-        // manifold forever. This runs over the whole live contact graph every step
-        // (cheap: only existing edges), mirroring the per-step joint `contacts_enabled`
-        // sweep done in `process_pair`.
+        // Phase B: clear any *existing* contact or intersection pair whose endpoints
+        // were explicitly disabled, regardless of whether its colliders were
+        // user-modified this step. The pair-update passes only revisit pairs touching
+        // a modified collider or an active body, so a disabled pair between two
+        // settled bodies would otherwise keep its stale manifold / intersecting flag
+        // forever. This runs over both live graphs every step (cheap: only existing
+        // edges), mirroring the per-step joint `contacts_enabled` sweep done in
+        // `process_pair`. The teardown mirrors `remove_pair`'s user-visible
+        // semantics (solver color cleared, partners woken, `Stopped` emitted,
+        // persistent-island link removed) so disabling a pair behaves like the pair
+        // stopping to touch — the edge itself stays, so re-enabling rebuilds it
+        // without a broad-phase round-trip.
         if !self.disabled_collider_pairs.is_empty() {
             let mut cleared_any = false;
-            for edge in self.contact_graph.graph.edges.iter_mut() {
+            for (edge_id, edge) in self.contact_graph.graph.edges.iter_mut().enumerate() {
                 let (c1, c2) = (edge.weight.collider1, edge.weight.collider2);
-                let key = if c1.0 <= c2.0 {
-                    ColliderPair::new(c1, c2)
-                } else {
-                    ColliderPair::new(c2, c1)
-                };
-                if self.disabled_collider_pairs.contains_key(&key) {
-                    clear_filtered_pair(&mut edge.weight);
+                let key = Self::normalized_pair(c1, c2);
+                if !self.disabled_collider_pairs.contains_key(&key) {
+                    continue;
+                }
+                let had_active = edge.weight.has_any_active_contact();
+                clear_pair_solver_color(&mut self.body_solver_color_masks, &mut edge.weight);
+                if had_active {
+                    let (co1, co2) = (&colliders[c1], &colliders[c2]);
+                    if let Some(islands) = islands.as_deref_mut() {
+                        if let Some(parent1) = &co1.parent {
+                            islands.wake_up(bodies, parent1.handle, true);
+                        }
+                        if let Some(parent2) = &co2.parent {
+                            islands.wake_up(bodies, parent2.handle, true);
+                        }
+                    }
+                    if (co1.flags.active_events | co2.flags.active_events)
+                        .contains(ActiveEvents::COLLISION_EVENTS)
+                    {
+                        edge.weight.emit_stop_event(bodies, colliders, events);
+                    }
+                    // The pair stopped touching (if it was): unlink it so the
+                    // persistent islands' connectivity matches the contact state.
+                    if let Some(islands) = islands.as_deref_mut() {
+                        islands.persistent.unlink_contact(edge_id as u32);
+                    }
+                }
+                clear_filtered_pair(&mut edge.weight);
+                cleared_any = true;
+            }
+
+            // Sensor (intersection) pairs: same sweep on the intersection graph. A
+            // disabled pair must report no intersection; when it was intersecting,
+            // emit the matching `Stopped` (sensor) event directly — a settled pair
+            // is not an update candidate, so `compute_intersections` would never
+            // revisit it.
+            let nodes = &self.intersection_graph.graph.nodes;
+            for edge in self.intersection_graph.graph.edges.iter_mut() {
+                let handle1 = nodes[edge.source().index()].weight;
+                let handle2 = nodes[edge.target().index()].weight;
+                let key = Self::normalized_pair(handle1, handle2);
+                if !self.disabled_collider_pairs.contains_key(&key) {
+                    continue;
+                }
+                if edge.weight.intersecting {
+                    edge.weight.intersecting = false;
+                    let (co1, co2) = (&colliders[handle1], &colliders[handle2]);
+                    if (co1.flags.active_events | co2.flags.active_events)
+                        .contains(ActiveEvents::COLLISION_EVENTS)
+                    {
+                        edge.weight
+                            .emit_stop_event(bodies, colliders, handle1, handle2, events);
+                    }
                     cleared_any = true;
                 }
             }
+
             if cleared_any {
                 // `clear_filtered_pair` destroys the `graph_pos` back-references the
                 // incremental solver-graph reconcile relies on, so rebuild from scratch
