@@ -158,6 +158,10 @@ pub struct SoftBodyEdge {
     /// Softness of this edge, overriding the material's (`edge_softness` / `bend_softness`)
     /// when set: anisotropic cloth (warp, weft and shear stiffness), stiffer seams...
     pub softness: Option<SpringCoefficients<Real>>,
+    /// Softness used when the edge is in compression (length < rest), enabling anisotropic
+    /// compliance (stretch vs compression). `None` falls back to `softness`.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub compression_softness: Option<SpringCoefficients<Real>>,
     /// Multiplier of the material's tear thresholds for this edge (default `1.0`): a seam that
     /// holds, a perforation that gives. Usually set through [`crate::dynamics::SoftBody::set_edge_tear_resistance`]
     /// or [`crate::dynamics::SoftBody::set_cluster_tear_resistance`].

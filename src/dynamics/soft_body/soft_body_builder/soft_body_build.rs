@@ -178,6 +178,7 @@ impl SoftBodyBuilder {
                 kind: *kind,
                 tension_only: false,
                 softness: None,
+                compression_softness: None,
                 tear_resistance: 1.0,
                 impulse: 0.0,
                 plastic_strain: 0.0,

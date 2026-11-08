@@ -120,6 +120,19 @@ impl SoftBody {
         }
     }
 
+    /// Sets the compression-side softness of the `i`-th distance constraint, used when the edge
+    /// is shorter than its rest length. `None` falls back to the edge's (tension) softness.
+    pub fn set_edge_compression_softness(
+        &mut self,
+        i: usize,
+        softness: Option<SpringCoefficients<Real>>,
+    ) {
+        if let Some(edge) = self.edges.get_mut(i) {
+            edge.compression_softness = softness;
+            self.modified = true;
+        }
+    }
+
     /// The dihedral bending constraints of this soft body.
     #[cfg(feature = "dim3")]
     pub fn dihedrals(&self) -> &[SoftBodyDihedral] {

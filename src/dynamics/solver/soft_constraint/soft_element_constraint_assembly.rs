@@ -674,7 +674,18 @@ impl SoftConstraintsSet {
             .skip(edges.start)
             .filter(|_| element_constraints)
         {
-            let (erp, cfm) = match (e.softness, e.kind) {
+            // Anisotropic compliance: pick compression-side softness when the edge is
+            // currently shorter than its rest length.
+            let len_now = {
+                let (ia, ib) = (e.vertices[0] as usize, e.vertices[1] as usize);
+                (sb.particles[ib].position - sb.particles[ia].position).length()
+            };
+            let chosen_softness = if len_now + 1.0e-12 < e.rest_length {
+                e.compression_softness.or(e.softness)
+            } else {
+                e.softness
+            };
+            let (erp, cfm) = match (chosen_softness, e.kind) {
                 (Some(softness), _) => coeffs_of(&softness),
                 (None, SoftBodyEdgeKind::Structural) => (edge_erp, edge_cfm),
                 (None, SoftBodyEdgeKind::Bend) => (bend_erp, bend_cfm),
