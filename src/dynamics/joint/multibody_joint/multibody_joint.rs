@@ -36,6 +36,17 @@ pub struct MultibodyJoint {
     /// (same convention as [`Self::coords`]). Only meaningful where
     /// `spring_stiffness` is non-zero.
     pub(crate) spring_ref: SpatialVector,
+    /// Per-DoF spring damping coefficient [N·m·s/rad or N·s/m] — the `c` in
+    /// `F = −k·(q − rest) − c·v`, integrated implicitly like the stiffness.
+    ///
+    /// Independent of `spring_stiffness` on purpose. The spring already carries
+    /// an implicit `−k·dt·v` term (required for backward-Euler consistency), so
+    /// its damping is locked to `c = k`; that makes a stiff position servo
+    /// critically-underdamped by construction, and there was no way to ask for a
+    /// *brake* (high damping, low stiffness) instead of a *servo*.
+    ///
+    /// Zero by default, which reproduces the pre-existing behaviour exactly.
+    pub(crate) spring_damping: SpatialVector,
 }
 
 impl MultibodyJoint {
@@ -48,21 +59,55 @@ impl MultibodyJoint {
             joint_rot: Rotation::IDENTITY,
             spring_stiffness: Default::default(),
             spring_ref: Default::default(),
+            spring_damping: Default::default(),
         }
     }
 
     /// Sets a passive joint spring on `axis` (an index into the 6-DoF spatial
     /// layout: `0..DIM` linear, `DIM..SPATIAL_DIM` angular). The spring applies
     /// a generalized force `-stiffness · (q − rest)` integrated implicitly.
+    ///
+    /// Leaves any damping previously set by [`Self::set_spring_damping`] alone.
     pub fn set_spring(&mut self, axis: usize, stiffness: Real, rest: Real) {
         self.spring_stiffness[axis] = stiffness;
         self.spring_ref[axis] = rest;
+    }
+
+    /// Sets the damping coefficient of the passive spring on `axis`.
+    ///
+    /// The generalized force becomes `−k·(q − rest) − c·v`, integrated
+    /// implicitly (backward-Euler in `v⁺`), so it is unconditionally stable for
+    /// any `c ≥ 0`. `c = 0` restores the plain position spring; a large `c` with
+    /// `k = 0` is a pure brake, which removes angular velocity without pulling
+    /// the joint toward any target angle.
+    ///
+    /// This is the knob a motor needs in order to *stop*: a servo (`k > 0`) can
+    /// only drive toward a target, so releasing it leaves whatever target was
+    /// last written in force and the joint oscillates around it.
+    pub fn set_spring_damping(&mut self, axis: usize, damping: Real) {
+        self.spring_damping[axis] = damping;
     }
 
     /// The passive joint spring on `axis` as `(stiffness, rest)`, as set by
     /// [`Self::set_spring`]. `(0, 0)` if no spring is set on that axis.
     pub fn spring(&self, axis: usize) -> (Real, Real) {
         (self.spring_stiffness[axis], self.spring_ref[axis])
+    }
+
+    /// The damping coefficient of the passive spring on `axis`, as set by
+    /// [`Self::set_spring_damping`]. `0` when unset.
+    pub fn spring_damping(&self, axis: usize) -> Real {
+        self.spring_damping[axis]
+    }
+
+    /// The joint's current generalized coordinate along `axis`, in the same
+    /// units as [`Self::spring`]'s rest position.
+    ///
+    /// Exposed so callers can "re-anchor" a spring to where the joint currently
+    /// is — the operation a brake needs, since a spring anchored to a stale rest
+    /// position keeps pulling even when its stiffness is meant to be idle.
+    pub fn coordinate(&self, axis: usize) -> Real {
+        self.coords[axis]
     }
 
     pub(crate) fn free(pos: Pose) -> Self {
@@ -98,7 +143,12 @@ impl MultibodyJoint {
         self.joint_rot
     }
 
-    fn num_free_lin_dofs(&self) -> usize {
+    /// Number of translational DoFs left free by this joint's locked-axes mask.
+    ///
+    /// Public because callers that map a spatial axis onto an assembly index
+    /// (see Multibody::damping_index) need the same free-DoF accounting the
+    /// solver uses; re-deriving it outside would drift.
+    pub fn num_free_lin_dofs(&self) -> usize {
         let locked_bits = self.data.locked_axes.bits();
         DIM - (locked_bits & ((1 << DIM) - 1)).count_ones() as usize
     }

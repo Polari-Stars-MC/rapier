@@ -426,6 +426,62 @@ impl Multibody {
         &mut self.damping
     }
 
+    /// The assembly index (into [`Self::damping`] / [`Self::generalized_velocity`])
+    /// of joint `axis` on the link `link_id`, or `None` when that axis is locked.
+    ///
+    /// `axis` is the spatial-DoF index (`0..DIM` linear, `DIM..SPATIAL_DIM`
+    /// angular), *not* an offset into the assembly vector: locked axes take no
+    /// slot, so the two only coincide when every lower axis is free. Anything
+    /// that wants to touch one DoF of the damping vector has to go through this
+    /// mapping or it will silently write a neighbouring DoF.
+    pub fn damping_index(&self, link_id: usize, axis: usize) -> Option<usize> {
+        let link = self.links.get(link_id)?;
+        let locked = link.joint.data.locked_axes.bits();
+        if (locked >> axis) & 1 != 0 {
+            return None;
+        }
+        let free_linear = link.joint.num_free_lin_dofs();
+        let before = if axis < DIM {
+            // Number of free linear axes below `axis`.
+            (0..axis).filter(|a| (locked >> a) & 1 == 0).count()
+        } else {
+            // All free linear axes, then the free angular axes below `axis`.
+            free_linear + (DIM..axis).filter(|a| (locked >> a) & 1 == 0).count()
+        };
+        Some(link.assembly_id() + before)
+    }
+
+    /// Sets the velocity-proportional damping of one DoF of the joint on
+    /// `link_id`. `axis` follows the spatial layout described on
+    /// [`Self::damping_index`].
+    ///
+    /// Returns `false` for an out-of-range link, a locked axis, an out-of-range
+    /// axis, or a negative/non-finite `damping`.
+    ///
+    /// This is the same quantity `MultibodyJoint::default_damping` seeds with
+    /// `0.1` on every free angular DoF, so a caller can override that default
+    /// per joint instead of living with it.
+    pub fn set_joint_damping(&mut self, link_id: usize, axis: usize, damping: Real) -> bool {
+        if axis >= SPATIAL_DIM || !damping.is_finite() || damping < 0.0 {
+            return false;
+        }
+        let Some(idx) = self.damping_index(link_id, axis) else {
+            return false;
+        };
+        if idx >= self.damping.len() {
+            return false;
+        }
+        self.damping[idx] = damping;
+        true
+    }
+
+    /// The damping currently applied to one DoF of the joint on `link_id`, or
+    /// `None` when the link/axis is invalid or locked.
+    pub fn joint_damping(&self, link_id: usize, axis: usize) -> Option<Real> {
+        let idx = self.damping_index(link_id, axis)?;
+        self.damping.get(idx).copied()
+    }
+
     /// The vector of per-DoF armature (reflected rotor inertia) of this multibody: additional
     /// inertia added directly to the mass matrix, simulating the joint's own weight distribution.
     #[inline]
@@ -623,17 +679,24 @@ impl Multibody {
         // Implicit joint springs: backward-Euler at `q⁺ = q + dt·v⁺` gives `-k·(q − rest) − k·dt·v⁺`,
         // with the `v⁺` part implicit via the `dt²·k` mass-matrix diagonal (see `update_mass_matrix`).
         // Consistency requires BOTH `-k·(q − rest)` and `-k·dt·v` here, else the spring is only semi-implicit.
+        //
+        // The damping coefficient `c` is separate from `k`: the force is
+        // `−k·(q − rest) − c·v⁺`, so the explicit part is `−c·v` and the implicit
+        // part contributes `c·dt` to the mass-matrix diagonal just like `k·dt²`.
+        // With `c = 0` (the default) this is byte-identical to before.
         for li in 0..self.links.len() {
             let mut idx = self.links[li].assembly_id;
             let locked = self.links[li].joint.data.locked_axes.bits();
             for a in 0..SPATIAL_DIM {
                 if (locked >> a) & 1 == 0 {
                     let k = self.links[li].joint.spring_stiffness[a];
-                    if k != 0.0 {
+                    let c = self.links[li].joint.spring_damping[a];
+                    if k != 0.0 || c != 0.0 {
                         let q = self.links[li].joint.coords[a];
                         let rest = self.links[li].joint.spring_ref[a];
                         let spring_pos_force = -k * (q - rest);
-                        self.accelerations[idx] += spring_pos_force - k * dt * self.velocities[idx];
+                        self.accelerations[idx] +=
+                            spring_pos_force - (k + c) * dt * self.velocities[idx];
                         if check_implicit_coriolis_divergence {
                             pos_forces[idx] += spring_pos_force;
                         }
@@ -1045,8 +1108,11 @@ impl Multibody {
             for a in 0..SPATIAL_DIM {
                 if (locked >> a) & 1 == 0 {
                     let k = self.links[li].joint.spring_stiffness[a];
-                    if k != 0.0 {
-                        let d = k * dt2;
+                    let c = self.links[li].joint.spring_damping[a];
+                    if k != 0.0 || c != 0.0 {
+                        // Backward-Euler: the position term contributes `k·dt²`
+                        // and the damping term `c·dt` to the diagonal.
+                        let d = k * dt2 + c * dt;
                         self.acc_augmented_mass[(idx, idx)] += d;
                         self.augmented_mass[(idx, idx)] += d;
                     }
