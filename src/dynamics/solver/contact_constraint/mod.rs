@@ -1,4 +1,6 @@
 pub(crate) use contact_constraint_element::*;
+#[cfg(feature = "dim3")]
+pub(crate) use contact_constraint_element::ContactConstraintRollingPartSlim;
 pub(crate) use contact_constraints_set::{
     ContactConstraintsSet, joint_data_num_constraints, joint_num_constraints,
 };

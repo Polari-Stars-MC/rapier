@@ -228,6 +228,25 @@ pub struct ColliderMaterial {
     pub restitution: Real,
     /// The rule applied to combine the friction coefficients of two colliders in contact.
     pub friction_combine_rule: CoefficientCombineRule,
+    /// The rolling-resistance coefficient of this collider.
+    ///
+    /// Rolling resistance is the torque that opposes *rolling* (rotation about an
+    /// axis lying in the contact tangent plane), as opposed to Coulomb friction,
+    /// which opposes sliding at the contact point. A ball or cylinder rolling
+    /// without slipping has zero slip velocity, so Coulomb friction alone never
+    /// stops it; this coefficient does.
+    ///
+    /// Dimensionless, like a friction coefficient: the resisting torque budget is
+    /// `μ_r · N · r_eff`, where `N` is the accumulated normal impulse. Typical
+    /// values are small — roughly `0.001` for steel-on-steel (rail wheels),
+    /// `0.01`–`0.03` for tire-on-asphalt. `0.0` (the default) disables the
+    /// constraint, which keeps the solver on its existing fast path and is
+    /// bit-identical to the previous behaviour.
+    ///
+    /// Should be `>= 0`.
+    pub rolling_resistance: Real,
+    /// The rule applied to combine the rolling-resistance coefficients of two colliders.
+    pub rolling_resistance_combine_rule: CoefficientCombineRule,
     /// The rule applied to combine the restitution coefficients of two colliders.
     pub restitution_combine_rule: CoefficientCombineRule,
 }
@@ -249,6 +268,8 @@ impl Default for ColliderMaterial {
             friction: 1.0,
             restitution: 0.0,
             friction_combine_rule: CoefficientCombineRule::default(),
+            rolling_resistance: 0.0,
+            rolling_resistance_combine_rule: CoefficientCombineRule::default(),
             restitution_combine_rule: CoefficientCombineRule::default(),
         }
     }

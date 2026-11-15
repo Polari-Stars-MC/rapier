@@ -764,6 +764,22 @@ pub struct ContactManifoldData {
     /// The effective restitution coefficient of this manifold's contacts.
     #[cfg_attr(feature = "serde-serialize", serde(default))]
     pub restitution: Real,
+    /// The effective rolling-resistance coefficient of this manifold's contacts
+    /// (combined from both colliders' materials, like `friction`).
+    ///
+    /// `0.0` means no rolling constraint is generated for this manifold, so
+    /// scenes that never set it keep the pre-existing solver path exactly.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub rolling_resistance: Real,
+    /// The physical lever arm (metres) that turns `rolling_resistance` into a
+    /// torque budget: the smaller of the two colliders' bounding radii.
+    ///
+    /// It must not be derived from the manifold's contact points: a ball resting
+    /// on a plane has a single contact point, whose distance to the friction
+    /// center is zero, which would cancel the budget exactly when rolling
+    /// resistance is the only thing that can stop the body.
+    #[cfg_attr(feature = "serde-serialize", serde(default))]
+    pub rolling_arm: Real,
 }
 
 /// A single solver contact.
@@ -988,6 +1004,8 @@ impl ContactManifoldData {
             user_data: 0,
             friction: 0.0,
             restitution: 0.0,
+            rolling_resistance: 0.0,
+            rolling_arm: 0.0,
         }
     }
 

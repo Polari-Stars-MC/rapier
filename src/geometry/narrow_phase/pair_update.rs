@@ -72,6 +72,24 @@ pub(super) const OUTCOME_CLEARED_IN_GRAPH: u8 = 6;
 /// zeroing `graph_pos`. That orphans the pair's existing graph entries: incremental
 /// reconciliation diffs against `graph_pos`, so it can neither see nor evict them and
 /// inserts duplicates instead. A drop in this count across an update detects the wipe.
+/// Bounding radius of a collider's shape, used as the rolling-resistance lever
+/// arm.
+///
+/// The arm must be a physical length: a ball on a plane has one contact point,
+/// whose distance to the friction center is zero, so deriving the arm from the
+/// manifold would cancel the rolling budget exactly when it is the only thing
+/// that can stop the body. The shape's local AABB half-diagonal is a safe upper
+/// bound for every shape type and needs no per-shape dispatch.
+///
+/// Returns `None` for a degenerate (zero-extent) shape, so the caller can collapse
+/// the budget to zero instead of dividing by it.
+fn collider_bounding_radius(collider: &crate::geometry::Collider) -> Option<Real> {
+    let aabb = collider.shape().compute_local_aabb();
+    let half = (aabb.maxs - aabb.mins) * 0.5;
+    let radius = half.length();
+    (radius.is_finite() && radius > 0.0).then_some(radius)
+}
+
 fn num_in_solver_graph(pair: &ContactPair) -> usize {
     pair.solver_manifolds()
         .iter()
@@ -406,6 +424,38 @@ pub(super) fn process_pair(
             co1.material.restitution_combine_rule,
             co2.material.restitution_combine_rule,
         );
+        // Rolling resistance combines like the other material coefficients. It is
+        // usually set on one side only (the ground), with the other side at the
+        // `Average` default; `Min`/`Multiply` would then silently halve or zero it,
+        // so scene authors who want that should say so explicitly.
+        let rolling_resistance = CoefficientCombineRule::combine(
+            co1.material.rolling_resistance,
+            co2.material.rolling_resistance,
+            co1.material.rolling_resistance_combine_rule,
+            co2.material.rolling_resistance_combine_rule,
+        );
+        // The lever arm that turns `μ_r` into a torque budget must be a physical
+        // length of the contact, not the spread of the manifold points (a ball on
+        // a plane has a single point, whose distance to the friction center is
+        // zero). Use the smaller of the two colliders' bounding radii: that is
+        // the radius the rolling body turns about, and it is well-defined for
+        // every shape.
+        let rolling_arm = if rolling_resistance > 0.0 {
+            let r1 = collider_bounding_radius(co1);
+            let r2 = collider_bounding_radius(co2);
+            // A world-attached/fixed side contributes no rolling body; using the
+            // finite radius of the moving side is the correct arm in that case.
+            let arm = match (r1, r2) {
+                (Some(a), Some(b)) => a.min(b),
+                (Some(a), None) | (None, Some(a)) => a,
+                (None, None) => 0.0,
+            };
+            // Collapse to zero when the arm is degenerate so the solver's clamp is
+            // an exact no-op instead of producing NaN through `μ_r · N · 0 / 0`.
+            if arm.is_finite() && arm > 0.0 { arm } else { 0.0 }
+        } else {
+            0.0
+        };
 
         /*
          *
@@ -536,6 +586,8 @@ pub(super) fn process_pair(
                 manifold.data.solver_flags = solver_flags;
                 manifold.data.friction = friction;
                 manifold.data.restitution = restitution;
+                manifold.data.rolling_resistance = rolling_resistance;
+                manifold.data.rolling_arm = rolling_arm;
                 manifold.data.relative_dominance =
                     dominance1.effective_group(&rb_type1) - dominance2.effective_group(&rb_type2);
                 manifold.data.normal = world_pos1.rotation * manifold.local_n1;
@@ -567,6 +619,8 @@ pub(super) fn process_pair(
             manifold.data.solver_flags = solver_flags;
             manifold.data.friction = friction;
             manifold.data.restitution = restitution;
+            manifold.data.rolling_resistance = rolling_resistance;
+            manifold.data.rolling_arm = rolling_arm;
             manifold.data.relative_dominance =
                 dominance1.effective_group(&rb_type1) - dominance2.effective_group(&rb_type2);
             manifold.data.normal = world_pos1.rotation * manifold.local_n1;

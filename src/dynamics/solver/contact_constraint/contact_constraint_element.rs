@@ -755,6 +755,93 @@ impl<N: ScalarType> ContactConstraintTwistPartSlim<N> {
     }
 }
 
+/// Rolling-resistance part of a contact constraint (3D only).
+///
+/// `ContactConstraintTwistPartSlim` resists rotation *about the contact normal*
+/// (spin in the tangent plane). It says nothing about rotation *about an axis in
+/// the tangent plane*, which is exactly the degree of freedom a ball or a
+/// cylinder uses to roll. Without this part a sphere on a plane rolls forever:
+/// the Coulomb/twist constraints bound the slip at the contact point, and rolling
+/// has no slip at that point.
+///
+/// Two scalar constraints, one per tangent axis (`t1`, `t2`), each bounded by a
+/// rolling-resistance *torque* budget. The bound is
+/// `μ_r · Σ normal_impulse` (a length cancels against the lever arm, so this is
+/// dimensionally a torque impulse), matching the standard rigid-body model where
+/// rolling resistance is a torque proportional to the normal load, independent of
+/// contact area and of the rolling speed's direction.
+#[cfg(feature = "dim3")]
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct ContactConstraintRollingPartSlim<N: ScalarType> {
+    pub rhs: [N; 2],
+    pub impulse: [N; 2],
+    pub impulse_accumulator: [N; 2],
+    pub r: [N; 2],
+}
+
+#[cfg(feature = "dim3")]
+impl<N: ScalarType> ContactConstraintRollingPartSlim<N> {
+    #[inline]
+    pub fn zero() -> Self {
+        Self {
+            rhs: [N::zero(); 2],
+            impulse: [N::zero(); 2],
+            impulse_accumulator: [N::zero(); 2],
+            r: [N::zero(); 2],
+        }
+    }
+
+    /// Total impulse applied over the step, per tangent axis.
+    #[inline]
+    pub fn total_impulse(&self) -> [N; 2] {
+        [
+            self.impulse_accumulator[0] + self.impulse[0],
+            self.impulse_accumulator[1] + self.impulse[1],
+        ]
+    }
+
+    #[inline]
+    pub fn warmstart(
+        &mut self,
+        roll_axes: [&N::AngVector; 2],
+        ii1: &N::AngInertia,
+        ii2: &N::AngInertia,
+        solver_vel1: &mut SolverVel<N>,
+        solver_vel2: &mut SolverVel<N>,
+    ) {
+        for k in 0..2 {
+            let ii_axis1 = ii1.transform_vector(*roll_axes[k]);
+            let ii_axis2 = ii2.transform_vector(*roll_axes[k]);
+            solver_vel1.angular += ii_axis1 * self.impulse[k];
+            solver_vel2.angular -= ii_axis2 * self.impulse[k];
+        }
+    }
+
+    #[inline]
+    pub fn solve(
+        &mut self,
+        roll_axes: [&N::AngVector; 2],
+        ii1: &N::AngInertia,
+        ii2: &N::AngInertia,
+        limit: N,
+        solver_vel1: &mut SolverVel<N>,
+        solver_vel2: &mut SolverVel<N>,
+    ) where
+        N::AngVector: DotProduct<N::AngVector, Result = N>,
+    {
+        for k in 0..2 {
+            let ii_axis1 = ii1.transform_vector(*roll_axes[k]);
+            let ii_axis2 = ii2.transform_vector(*roll_axes[k]);
+            let dvel = roll_axes[k].gdot(solver_vel1.angular - solver_vel2.angular) + self.rhs[k];
+            let new_impulse = (self.impulse[k] - self.r[k] * dvel).simd_clamp(-limit, limit);
+            let dlambda = new_impulse - self.impulse[k];
+            self.impulse[k] = new_impulse;
+            solver_vel1.angular += ii_axis1 * dlambda;
+            solver_vel2.angular -= ii_axis2 * dlambda;
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

@@ -292,6 +292,34 @@ impl Collider {
         self.material.restitution
     }
 
+    /// The rolling-resistance coefficient (resistance to *rolling*, not sliding).
+    ///
+    /// See [`ColliderMaterial::rolling_resistance`] for the model and typical
+    /// values. `0.0` (the default) means the rolling constraint is inactive.
+    pub fn rolling_resistance(&self) -> Real {
+        self.material.rolling_resistance
+    }
+
+    /// Sets the rolling-resistance coefficient.
+    ///
+    /// Distinct from [`Self::set_friction`]: friction opposes slip at the contact
+    /// point, rolling resistance opposes rotation about an axis in the contact
+    /// tangent plane. A ball with friction but no rolling resistance rolls
+    /// forever.
+    pub fn set_rolling_resistance(&mut self, coefficient: Real) {
+        self.material.rolling_resistance = coefficient
+    }
+
+    /// The combine rule used for rolling resistance between two colliders.
+    pub fn rolling_resistance_combine_rule(&self) -> CoefficientCombineRule {
+        self.material.rolling_resistance_combine_rule
+    }
+
+    /// Sets the rolling-resistance combine rule.
+    pub fn set_rolling_resistance_combine_rule(&mut self, rule: CoefficientCombineRule) {
+        self.material.rolling_resistance_combine_rule = rule;
+    }
+
     /// Sets the restitution coefficient (bounciness).
     ///
     /// Controls how much velocity is preserved after impact. Higher values = more bounce.
@@ -703,6 +731,13 @@ pub struct ColliderBuilder {
     pub friction_combine_rule: CoefficientCombineRule,
     /// The restitution coefficient of the collider to be built.
     pub restitution: Real,
+    /// The rolling-resistance coefficient of the collider to be built.
+    ///
+    /// See [`ColliderMaterial::rolling_resistance`]. `0.0` (default) disables the
+    /// rolling constraint.
+    pub rolling_resistance: Real,
+    /// The rule used to combine two rolling-resistance coefficients.
+    pub rolling_resistance_combine_rule: CoefficientCombineRule,
     /// The rule used to combine two restitution coefficients.
     pub restitution_combine_rule: CoefficientCombineRule,
     /// The position of this collider.
@@ -743,12 +778,14 @@ impl ColliderBuilder {
             mass_properties: ColliderMassProps::default(),
             friction: Self::default_friction(),
             restitution: 0.0,
+            rolling_resistance: 0.0,
             position: Pose::IDENTITY,
             is_sensor: false,
             user_data: 0,
             collision_groups: InteractionGroups::all(),
             solver_groups: InteractionGroups::all(),
             friction_combine_rule: CoefficientCombineRule::Average,
+            rolling_resistance_combine_rule: CoefficientCombineRule::Average,
             restitution_combine_rule: CoefficientCombineRule::Average,
             active_collision_types: ActiveCollisionTypes::default(),
             active_hooks: ActiveHooks::empty(),
@@ -1519,6 +1556,21 @@ impl ColliderBuilder {
         self
     }
 
+    /// Sets the rolling-resistance coefficient for this collider.
+    ///
+    /// Opposes *rolling* (rotation about a tangent-plane axis), not sliding. See
+    /// [`ColliderMaterial::rolling_resistance`]. Default is `0.0` (disabled).
+    pub fn rolling_resistance(mut self, coefficient: Real) -> Self {
+        self.rolling_resistance = coefficient;
+        self
+    }
+
+    /// Sets the rule used to combine two rolling-resistance coefficients.
+    pub fn rolling_resistance_combine_rule(mut self, rule: CoefficientCombineRule) -> Self {
+        self.rolling_resistance_combine_rule = rule;
+        self
+    }
+
     /// Sets the density (mass per unit volume) of this collider.
     ///
     /// Mass will be computed as: `density × volume`. Common densities:
@@ -1668,6 +1720,8 @@ impl ColliderBuilder {
             friction: self.friction,
             restitution: self.restitution,
             friction_combine_rule: self.friction_combine_rule,
+            rolling_resistance: self.rolling_resistance,
+            rolling_resistance_combine_rule: self.rolling_resistance_combine_rule,
             restitution_combine_rule: self.restitution_combine_rule,
         };
         let flags = ColliderFlags {

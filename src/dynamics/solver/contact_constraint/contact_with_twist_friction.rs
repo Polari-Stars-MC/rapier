@@ -2,6 +2,8 @@ use super::{
     ContactConstraintNormalPartSlim, ContactConstraintTangentPartSlim,
     ContactConstraintTwistPartSlim,
 };
+#[cfg(feature = "dim3")]
+use super::ContactConstraintRollingPartSlim;
 #[cfg(feature = "block-solver")]
 use crate::dynamics::solver::contact_constraint::BLOCK_SOLVER_MIN_CONDITION;
 use crate::dynamics::solver::manifold_store::ManifoldStore;
@@ -138,6 +140,11 @@ impl ContactWithTwistFrictionBuilder<SimdReal> {
         // Friction/restitution are per-manifold (see `ContactManifoldData`).
         let friction = SimdReal::from(array![|ii| manifolds[ii].data.friction]);
         let restitution = SimdReal::from(array![|ii| manifolds[ii].data.restitution]);
+        // Rolling resistance is optional: a flat `0.0` (the default) keeps every
+        // rolling lane inert below, so unrelated scenes are unaffected.
+        let rolling_resistance =
+            SimdReal::from(array![|ii| manifolds[ii].data.rolling_resistance]);
+        let rolling_arm = SimdReal::from(array![|ii| manifolds[ii].data.rolling_arm]);
 
         let manifold_points = array![|ii| &manifolds[ii].data.solver_contacts[..counts[ii]]];
 
@@ -309,6 +316,15 @@ impl ContactWithTwistFrictionBuilder<SimdReal> {
         out_constraint.twist_part.impulse =
             twist_warmstart.select(counts_simd.simd_gt(SimdReal::splat(1.0)), SimdReal::zero());
         out_constraint.twist_part.impulse_accumulator = -out_constraint.twist_part.impulse;
+        // Rolling resistance is not warm-started: it is a resistance constraint
+        // reconstructed from the current normal impulses each step, and its
+        // state is a pure output (`impulse_accumulator` for diagnostics). Starting
+        // from zero guarantees that a `μ_r = 0` scene is unaffected even when the
+        // buffer is recycled from a previous profile.
+        #[cfg(feature = "dim3")]
+        {
+            out_constraint.rolling_part = ContactConstraintRollingPartSlim::zero();
+        }
 
         out_builder.local_friction_center1 = poses1.inverse_transform_point(friction_center);
         out_builder.local_friction_center2 = poses2.inverse_transform_point(friction_center2);
@@ -333,6 +349,40 @@ impl ContactWithTwistFrictionBuilder<SimdReal> {
             out_constraint.twist_part.r =
                 utils::simd_inv(ii_twist_dir1.gdot(force_dir1) + ii_twist_dir2.gdot(-force_dir1));
             out_constraint.twist_dists = twist_dists;
+        }
+
+        // Rolling-resistance part (3D). Rotation about a tangent-plane axis — the
+        // degree of freedom a ball uses to roll. The twist part above only covers
+        // rotation about the *normal*, so slipping is bounded but rolling is not.
+        //
+        // Effective mass per axis: `1 / (axisᵀ (I₁⁻¹ + I₂⁻¹) axis)`, the same
+        // Jacobian the twist part uses with the axis swapped. `rhs` stays zero:
+        // this constraint is pure resistance (no bias term), so it only removes
+        // angular velocity and cannot inject energy.
+        #[cfg(feature = "dim3")]
+        {
+            for k in 0..2 {
+                let axis = tangents1[k];
+                let ii_axis1 = poses1.ii.transform_vector(axis);
+                let ii_axis2 = poses2.ii.transform_vector(axis);
+                let denom = ii_axis1.gdot(axis) + ii_axis2.gdot(axis);
+                // A body with zero inertia along this axis projects to a zero
+                // effective mass; `simd_inv(0)` is +∞, which would produce NaN
+                // impulses. Guard it to zero instead — the constraint then no-ops.
+                let inv_denom = utils::simd_inv(denom);
+                out_constraint.rolling_part.r[k] =
+                    inv_denom.select(denom.simd_gt(SimdReal::zero()), SimdReal::zero());
+                out_constraint.rolling_part.rhs[k] = SimdReal::zero();
+            }
+            // The torque budget is `μ_r · Σ normal_impulse · r`. Here `r` must be a
+            // *physical* length, not the spread of the contact points: a ball
+            // resting on a plane produces a one-point manifold, whose
+            // friction-center-to-point distance is zero by construction, which
+            // would make the budget vanish exactly when rolling resistance
+            // matters most. The narrow phase therefore computes it from the
+            // colliders' bounding radii and stores it on the manifold.
+            out_constraint.rolling_resistance = rolling_resistance;
+            out_constraint.rolling_arm = rolling_arm;
         }
 
         // Tangent part.
@@ -516,6 +566,14 @@ impl ContactWithTwistFrictionBuilder<SimdReal> {
             tangent_part.impulse *= warmstart_coeff;
             twist_part.impulse_accumulator += twist_part.impulse;
             twist_part.impulse *= warmstart_coeff;
+            #[cfg(feature = "dim3")]
+            {
+                let rolling_part = &mut constraint.rolling_part;
+                for k in 0..2 {
+                    rolling_part.impulse_accumulator[k] += rolling_part.impulse[k];
+                    rolling_part.impulse[k] *= warmstart_coeff;
+                }
+            }
         }
 
         constraint.cfm_factor = cfm_factor;
@@ -621,6 +679,19 @@ pub(crate) struct ContactWithTwistFriction<N: ScalarType> {
     pub twist_part: ContactConstraintTwistPartSlim<N>,
     // Distances between the friction center and the contact point.
     pub twist_dists: [N; MAX_MANIFOLD_POINTS],
+    // Rolling resistance (angular-only, in the tangent plane). Zero torque budget
+    // when neither collider sets `rolling_resistance`, so the constraint solves to
+    // a no-op and costs no accuracy.
+    #[cfg(feature = "dim3")]
+    pub rolling_part: ContactConstraintRollingPartSlim<N>,
+    // `μ_r` of the pair, already combined. Kept so `update` can re-derive the
+    // budget when the normal impulses change.
+    #[cfg(feature = "dim3")]
+    pub rolling_resistance: N,
+    // Lever arm used to turn `μ_r · Σ N` into a torque impulse: the distance
+    // from the friction center to the furthest contact point.
+    #[cfg(feature = "dim3")]
+    pub rolling_arm: N,
 
     pub solver_vel1: [u32; SIMD_WIDTH],
     pub solver_vel2: [u32; SIMD_WIDTH],
@@ -666,6 +737,20 @@ impl ContactWithTwistFriction<SimdReal> {
         if self.num_contacts > 1 {
             self.twist_part.warmstart(
                 &self.dir1,
+                &self.ii1,
+                &self.ii2,
+                &mut solver_vel1,
+                &mut solver_vel2,
+            );
+        }
+        // Rolling resistance needs a single contact point too: a ball resting on a
+        // plane with one contact point still rolls. Unlike the twist part, do not
+        // gate this on `num_contacts > 1`.
+        #[cfg(feature = "dim3")]
+        {
+            let roll_axes = [&self.tangent1, &self.dir1.gcross(self.tangent1)];
+            self.rolling_part.warmstart(
+                roll_axes,
                 &self.ii1,
                 &self.ii2,
                 &mut solver_vel1,
@@ -774,6 +859,34 @@ impl ContactWithTwistFriction<SimdReal> {
                 &mut solver_vel1,
                 &mut solver_vel2,
             );
+
+            // Rolling resistance last, after the slip constraints have settled the
+            // tangent-plane velocities: its bound is derived from the *final*
+            // normal impulses, and it acts purely on angular velocity, so it
+            // cannot undo the normal/slip solves.
+            #[cfg(feature = "dim3")]
+            {
+                let mut normal_total = SimdReal::zero();
+                for normal_part in normal_parts.iter() {
+                    normal_total += normal_part.impulse;
+                }
+                // `μ_r · Σ N · r` is a torque impulse; a zero coefficient (the
+                // default) collapses the clamp to `[-0, 0]`, so the constraint
+                // writes nothing and the pre-existing behaviour is preserved
+                // bit-for-bit.
+                let rolling_limit = self.rolling_resistance * normal_total * self.rolling_arm;
+                if rolling_limit.simd_gt(SimdReal::zero()).any() {
+                    let roll_axes = [&self.tangent1, &self.dir1.gcross(self.tangent1)];
+                    self.rolling_part.solve(
+                        roll_axes,
+                        &self.ii1,
+                        &self.ii2,
+                        rolling_limit,
+                        &mut solver_vel1,
+                        &mut solver_vel2,
+                    );
+                }
+            }
         }
 
         bodies.scatter_vels(self.solver_vel1, solver_vel1);
