@@ -12,8 +12,6 @@ pub use self::collider_components::*;
 pub use self::collider_handle::ColliderHandle;
 #[cfg(feature = "alloc")]
 pub use self::collider_set::{ColliderSet, ModifiedColliders};
-#[cfg(all(feature = "alloc", feature = "serde-serialize"))]
-pub use self::compound_baker::BakedCompound;
 #[cfg(feature = "alloc")]
 pub(crate) use self::contact_pair::ContactRecycleState;
 #[cfg(feature = "alloc")]
@@ -316,8 +314,6 @@ mod broad_phase_pair_event;
 mod collider;
 #[cfg(feature = "alloc")]
 mod collider_set;
-#[cfg(all(feature = "alloc", feature = "serde-serialize"))]
-mod compound_baker;
 #[cfg(feature = "alloc")]
 mod mesh_converter;
 

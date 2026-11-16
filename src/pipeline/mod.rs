@@ -43,8 +43,3 @@ mod physics_world;
 mod query_pipeline;
 #[cfg(feature = "alloc")]
 mod user_changes;
-
-#[cfg(all(feature = "alloc", feature = "serde-serialize"))]
-mod recorder;
-#[cfg(all(feature = "alloc", feature = "serde-serialize"))]
-pub use recorder::{WorldFrame, WorldPlayer, WorldRecorder};
