@@ -2694,9 +2694,13 @@ fn dir_scaled(v: Vector, s: Real) -> Vector {
 // These are free functions (not methods) so the solver can mutate particle
 // positions directly without borrow fights. All arithmetic is plain `f64`
 // four-operations on glam `Vector`s — bit-identical under IEEE-754, which is
-// what makes XPBD reproducible for `enhanced-determinism` (no `linalg` matrix
-// solve is needed for position-based projection; `linalg` is reserved for the
-// optional implicit-FEM comparison path in a later sub-phase).
+// what makes XPBD reproducible for `enhanced-determinism`. Position-based
+// projection needs no matrix solve at all.
+//
+// (A hand-rolled `src/linalg.rs` used to live in this fork for the optional
+// implicit-FEM comparison path. It was never wired up — zero call sites — and
+// has been deleted; upstream v0.36 gets determinism from glam's scalar core
+// plus `libm`-pinned transcendentals instead. See docs/rapier-fork-delta.md.)
 
 /// Signed volume of the tetrahedron `(p0, p1, p2, p3)`:
 /// `V = ((p1−p0) × (p2−p0)) · (p3−p0) / 6`.
