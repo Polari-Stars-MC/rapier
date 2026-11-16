@@ -451,6 +451,43 @@ impl Multibody {
         Some(link.assembly_id() + before)
     }
 
+    /// The generalized velocity of one DoF of the joint on `link_id` [m/s or
+    /// rad/s], or `None` when the link/axis is invalid or locked.
+    ///
+    /// This is the authoritative velocity of a multibody-driven body: the
+    /// solver writes `bodies.vels` from these generalized velocities at the end
+    /// of every step, so reading a body's `angvel` to feed a torque envelope
+    /// gives stale or overwritten numbers. Anything computing
+    /// `torque_at_speed(ω)` for a multibody joint must read ω here.
+    ///
+    /// Distinct from [`Self::joint_velocity`], which returns the whole
+    /// generalized-velocity slice for a link.
+    pub fn joint_axis_velocity(&self, link_id: usize, axis: usize) -> Option<Real> {
+        let idx = self.damping_index(link_id, axis)?;
+        self.velocities.get(idx).copied()
+    }
+
+    /// Caps the total spring effort of one DoF of the joint on `link_id` to
+    /// `max_force` [N or N·m], or `false` when the link/axis is invalid or
+    /// locked.
+    ///
+    /// Convenience wrapper over [`MultibodyJoint::set_spring_max_force`] that
+    /// resolves the link for the caller; see that method for what the cap does.
+    pub fn set_joint_max_force(&mut self, link_id: usize, axis: usize, max_force: Real) -> bool {
+        let Some(link) = self.links.get_mut(link_id) else {
+            return false;
+        };
+        link.joint.set_spring_max_force(axis, max_force)
+    }
+
+    /// The spring effort cap currently applied to one DoF of the joint on
+    /// `link_id`, or `None` when the link/axis is invalid or locked.
+    pub fn joint_max_force(&self, link_id: usize, axis: usize) -> Option<Real> {
+        self.damping_index(link_id, axis)?;
+        let link = self.links.get(link_id)?;
+        Some(link.joint.spring_max_force(axis))
+    }
+
     /// Sets the velocity-proportional damping of one DoF of the joint on
     /// `link_id`. `axis` follows the spatial layout described on
     /// [`Self::damping_index`].
@@ -684,6 +721,11 @@ impl Multibody {
         // `−k·(q − rest) − c·v⁺`, so the explicit part is `−c·v` and the implicit
         // part contributes `c·dt` to the mass-matrix diagonal just like `k·dt²`.
         // With `c = 0` (the default) this is byte-identical to before.
+        //
+        // `max_force` clamps the **sum** of the position and damping terms. The
+        // cap is applied to the force, not to the resulting acceleration,
+        // because that is what a motor rating means: a torque limit is a
+        // property of the machine, not of the load it happens to drive.
         for li in 0..self.links.len() {
             let mut idx = self.links[li].assembly_id;
             let locked = self.links[li].joint.data.locked_axes.bits();
@@ -695,8 +737,13 @@ impl Multibody {
                         let q = self.links[li].joint.coords[a];
                         let rest = self.links[li].joint.spring_ref[a];
                         let spring_pos_force = -k * (q - rest);
-                        self.accelerations[idx] +=
+                        let mut total =
                             spring_pos_force - (k + c) * dt * self.velocities[idx];
+                        let cap = self.links[li].joint.spring_max_force[a];
+                        if cap < Real::MAX {
+                            total = total.clamp(-cap, cap);
+                        }
+                        self.accelerations[idx] += total;
                         if check_implicit_coriolis_divergence {
                             pos_forces[idx] += spring_pos_force;
                         }

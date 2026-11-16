@@ -47,6 +47,22 @@ pub struct MultibodyJoint {
     ///
     /// Zero by default, which reproduces the pre-existing behaviour exactly.
     pub(crate) spring_damping: SpatialVector,
+    /// Per-DoF force/torque cap on the spring's total effort [N or N·m].
+    ///
+    /// The spring produces the generalized force `−k·(q − rest) − c·v`; this
+    /// clamps the **sum** to `±max_force` before it reaches the solver, which is
+    /// the joint-level equivalent of `JointMotor::max_force` on the impulse-joint
+    /// side.
+    ///
+    /// Without it a multibody joint can only be told "hold this angle", never
+    /// "hold it with at most this much torque" — and a real motor's available
+    /// torque is a function of speed, so a caller cannot represent one by
+    /// picking a stiffness and hoping. With it, a caller computes its torque
+    /// envelope however it likes and passes it in each step.
+    ///
+    /// `Real::MAX` by default (effectively unlimited), so the pre-existing
+    /// behaviour is preserved bit-for-bit.
+    pub(crate) spring_max_force: SpatialVector,
 }
 
 impl MultibodyJoint {
@@ -60,6 +76,7 @@ impl MultibodyJoint {
             spring_stiffness: Default::default(),
             spring_ref: Default::default(),
             spring_damping: Default::default(),
+            spring_max_force: [Real::MAX; SPATIAL_DIM],
         }
     }
 
@@ -98,6 +115,34 @@ impl MultibodyJoint {
     /// [`Self::set_spring_damping`]. `0` when unset.
     pub fn spring_damping(&self, axis: usize) -> Real {
         self.spring_damping[axis]
+    }
+
+    /// Caps the total spring effort on `axis` to `max_force` [N or N·m].
+    ///
+    /// The spring's generalized force `−k·(q − rest) − c·v` is clamped to
+    /// `±max_force` before it reaches the solver. This is what lets a caller
+    /// express a *real motor*: available torque is a function of speed, so it
+    /// has to be recomputed and written each step rather than baked into the
+    /// stiffness.
+    ///
+    /// `max_force` must be finite and `>= 0`. `Real::MAX` (the default) means
+    /// "uncapped". A cap of `0` makes the axis produce no spring force at all
+    /// while leaving the spring parameters intact, which is cheaper than
+    /// tearing the spring down and rebuilding it.
+    ///
+    /// Returns `false` for a non-finite or negative cap (leaving the previous
+    /// value untouched).
+    pub fn set_spring_max_force(&mut self, axis: usize, max_force: Real) -> bool {
+        if axis >= SPATIAL_DIM || !max_force.is_finite() || max_force < 0.0 {
+            return false;
+        }
+        self.spring_max_force[axis] = max_force;
+        true
+    }
+
+    /// The spring effort cap on `axis` [N or N·m]. `Real::MAX` when uncapped.
+    pub fn spring_max_force(&self, axis: usize) -> Real {
+        self.spring_max_force[axis]
     }
 
     /// The joint's current generalized coordinate along `axis`, in the same
