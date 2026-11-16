@@ -42,11 +42,6 @@ pub use self::force_containers::*;
 
 // Soft-body (deformable body) support — this fork's own implementation. Kept
 // under its own module name because upstream v0.36 shipped an independent
-// soft-body system as `dynamics::soft_body` (below); the two must not share a
-// module name (`soft_body.rs` vs `soft_body/mod.rs` is a hard error) and must
-// not both glob-export `SoftBody` into `dynamics`.
-#[cfg(all(feature = "alloc", feature = "dim3"))]
-pub mod soft_body_fork;
 
 // Fluid-body (SPH) support — Phase 0 foundation. Independent of the SoA SIMD
 // solver boundary (roadmap history lives in the project's planning docs).
