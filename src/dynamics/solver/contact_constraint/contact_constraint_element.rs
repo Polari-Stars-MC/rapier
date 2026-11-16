@@ -791,15 +791,6 @@ impl<N: ScalarType> ContactConstraintRollingPartSlim<N> {
         }
     }
 
-    /// Total impulse applied over the step, per tangent axis.
-    #[inline]
-    pub fn total_impulse(&self) -> [N; 2] {
-        [
-            self.impulse_accumulator[0] + self.impulse[0],
-            self.impulse_accumulator[1] + self.impulse[1],
-        ]
-    }
-
     #[inline]
     pub fn warmstart(
         &mut self,
